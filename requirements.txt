@@ -1,0 +1,17 @@
+h5py>=3.0.0
+matplotlib>=3.5.0
+numpy>=1.21.0
+rdkit>=2022.9.1
+pyscf>=2.0.0
+geometric
+# GPU support (uncomment one pair based on your CUDA version):
+# For CUDA 11.x:
+# gpu4pyscf-cuda11x
+# cutensor-cu11==2.2.0
+# cupy-cuda11x==13.4.1
+# For CUDA 12.x:
+# gpu4pyscf-cuda12x
+# cupy-cuda12x==13.4.1
+# cutensor-cu12==2.2.0"
+plotly>=5.0.0
+scikit-learn>=1.0.0
