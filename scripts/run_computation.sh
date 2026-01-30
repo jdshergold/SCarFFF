@@ -362,6 +362,13 @@ else
             echo "  --- Molecule $MOL_NUM ---"
         fi
 
+        # Skip molecules that have no form factor results (e.g. TD-DFT failed).
+        if [ ! -d "$MOL_DIR/$METHOD" ]; then
+            echo "  No form factor results found for molecule $MOL_NUM, skipping."
+            echo ""
+            continue
+        fi
+
         # Determine which transitions to plot.
         TRANSITIONS_TO_PLOT=()
         if [ "${TRANSITION_INDICES,,}" = "all" ]; then

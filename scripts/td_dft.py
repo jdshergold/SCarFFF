@@ -97,6 +97,8 @@ def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1"):
         print("No conformers generated, retrying with relaxed parameters.")
         params.useRandomCoords = True
         params.useBasicKnowledge = False
+        params.useExpTorsionAnglePrefs = True
+        params.useSmallRingTorsions = True
         cids = AllChem.EmbedMultipleConfs(molecule, numConfs=30, params=params)
 
     # Optimise all of the conformers and find the one with lowest energy.
@@ -783,18 +785,29 @@ def main():
             writer.writerow([mol_num, smiles, args.basis])
 
         # Run the TD-DFT analysis for this molecule.
-        run_td_dft_analysis(
-            smiles=smiles,
-            basis=args.basis,
-            nstates=args.nstates,
-            ntrans=args.ntrans,
-            output_directory=mol_output_dir,
-            ring_flatten=args.ring_flatten,
-            use_gpu=args.use_gpu,
-            dft_optimisation=args.dft_optimisation,
-            precision=args.precision,
-            plot_molecule_3d=args.plot_molecule_3d,
-        )
+        try:
+            run_td_dft_analysis(
+                smiles=smiles,
+                basis=args.basis,
+                nstates=args.nstates,
+                ntrans=args.ntrans,
+                output_directory=mol_output_dir,
+                ring_flatten=args.ring_flatten,
+                use_gpu=args.use_gpu,
+                dft_optimisation=args.dft_optimisation,
+                precision=args.precision,
+                plot_molecule_3d=args.plot_molecule_3d,
+            )
+        except Exception as e:
+            # Write a failure marker with the error message for downstream scripts and user diagnostics.
+            failed_file = os.path.join(mol_output_dir, ".tddft_failed")
+            with open(failed_file, 'w') as f:
+                f.write(f"molecule: {smiles}\n")
+                f.write(f"error: {e}\n")
+
+            print(f"\nTD-DFT calculation failed for molecule {mol_num} ({smiles}): {e}")
+            print(f"Failure recorded in {failed_file}. Skipping molecule {mol_num} and continuing.\n")
+            continue
 
         print(f"\nMolecule {mol_num} complete!\n")
 

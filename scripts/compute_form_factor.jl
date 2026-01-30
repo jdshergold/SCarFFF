@@ -218,11 +218,22 @@ function main()
         println("="^50)
         println()
 
+        # Check if the TD-DFT calculation failed for this molecule.
+        failed_marker = joinpath(mol_output_dir, ".tddft_failed")
+        if isfile(failed_marker)
+            @warn "TD-DFT was marked as failed for molecule $mol_num. Skipping."
+            continue
+        end
+
         # Check if TD-DFT results exist.
         if !isfile(td_h5)
             @warn "No TD-DFT results found at $(td_h5). Skipping molecule $mol_num."
             continue
         end
+
+        # Wrap the form factor computation in a try/catch so that a single molecule failing
+        # (e.g. due to missing or corrupt data) does not crash the entire batch.
+        try
 
         # Parse the transition indices.
         transition_indices = parse_transition_indices(transition_indices_str, td_h5)
@@ -497,6 +508,11 @@ function main()
             end
         else
             error("Invalid method '$(method)'. Supported methods are 'spherical', 'fft', and 'cartesian'.")
+        end
+
+        catch e
+            @warn "Form factor computation failed for molecule $mol_num: $e. Skipping."
+            continue
         end
 
         println("\nMolecule $mol_num complete!\n")
