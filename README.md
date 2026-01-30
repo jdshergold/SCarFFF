@@ -6,8 +6,8 @@ Computation of form factors for scattering on molecules.
 1. **Clone the repository:**
 
    ```bash
-    git clone https://github.com/jdshergold/dark_molecules.git
-    cd dark_molecules
+    git clone https://github.com/jdshergold/SCarFFF.git
+    cd SCarFFF
     ```
 
 2. **Setup python environment and install dependencies:**
