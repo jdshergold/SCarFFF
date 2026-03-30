@@ -1,4 +1,4 @@
-# This module provides functions to compute probabilist's Hermite polynomials He_n(x) from n = 0 up to 6.
+# This module provides functions to compute probabilist's Hermite polynomials He_n(x) up to the requested order.
 
 module ProbabilistsHermite
 
@@ -18,7 +18,7 @@ export fill_hermite_vector!
 
     # Arguments:
     - He::Vector{T}: Pre-allocated buffer to store the results.
-    - max_order::Int: The maximum polynomial order to compute, which must be less than or equal to 6.
+    - max_order::Int: The maximum polynomial order to compute, which must be less than or equal to 12.
     - x::T: The point at which to evaluate the polynomials.
 
     # Returns:
@@ -33,7 +33,7 @@ export fill_hermite_vector!
     end
 
     # Now use the recurrence relation for the remaining polynomials.
-    for n in 1:min(max_order-1, 5)
+    for n in 1:min(max_order-1, 11)
         He[n+2] = x * He[n+1] - n * He[n]
     end
 

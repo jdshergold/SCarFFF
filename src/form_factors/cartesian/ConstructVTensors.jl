@@ -76,8 +76,8 @@ function construct_V_tensors(
     V_z = Array{Complex{T}}(undef, n_q_z, n_pairs)
 
     # Pre-allocate Hermite polynomial buffers for each thread to avoid allocations in the inner loop.
-    # As we go up to at most f-orbitals, we need buffers of size 7.
-    He_buffers = [Vector{T}(undef, 7) for _ in 1:nthreads()]
+    # As we go up to at most i-orbitals, max Cartesian power is 12, so we need buffers of size 13.
+    He_buffers = [Vector{T}(undef, 13) for _ in 1:nthreads()]
 
     # Now we loop over the non-thresholded pairs and compute the V tensors.
     @threads for pair_idx in 1:n_pairs

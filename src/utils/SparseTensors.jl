@@ -5,11 +5,11 @@ module SparseTensors
 export SparseGauntArray, SparseATensor, SparseDTensor, SparseWTensor, lambda_mu_key, uvw_key
 
 # Precompute the (λ, μ) and (u, v, w) keys, and store them as constant arrays for speed.
-# We go up to at u = v = w = λ = 6 here, corresponding to f-orbitals.
+# We go up to u = v = w = λ = 12 here, corresponding to i-orbitals.
 # These are slightly too large for StaticArrays to be useful.
 # Second axis indexes μ via the offset μ + λ, which matches how we look up bins.
-const lambda_mu_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:6, mu_offset in 0:12]
-const uvw_key = Int[binomial(u + v + w + 2, 3) + (u * (u + v + w + 1) - (u * (u - 1)) ÷ 2 + v) + 1 for u in 0:6, v in 0:6, w in 0:6]
+const lambda_mu_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:12, mu_offset in 0:24]
+const uvw_key = Int[binomial(u + v + w + 2, 3) + (u * (u + v + w + 1) - (u * (u - 1)) ÷ 2 + v) + 1 for u in 0:12, v in 0:12, w in 0:12]
 
 struct SparseGauntArray{T<:AbstractFloat}
     """
@@ -61,8 +61,8 @@ struct SparseATensor{T<:AbstractFloat}
     The first term the number of triplets for all n' < n. The square bracketed term comes from as
     follows. At fixed n and u, v can take values {0, ..., n - u}. Then for a given u, the total
     number of (u, v) pairs before that value of u is ∑_{u'=0}^{u-1} (n - u' + 1) = u(n+1) - u(u-1)/2.
-    The +v then picks out the value of v wthin that set. For n = 6, this key shrinks the number of bins
-    from the naive 343 to 84. We can also recycle it for the D tensor.
+    The +v then picks out the value of v wthin that set. For n = 12, this key shrinks the number of bins
+    from the naive 2197 to 455. We can also recycle it for the D tensor.
 
     The n bins provide an additional level of indexing to speed up the contractions with u + v + w = n
     """

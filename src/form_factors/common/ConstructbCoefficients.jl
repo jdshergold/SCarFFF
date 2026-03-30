@@ -8,8 +8,8 @@ using ..ReadBasisSet: MoleculeData
 
 export construct_b_coefficients
 
-# Precompute binomial coefficients for up to n = 6, corresponding to f-orbitals, for speed.
-const binomial_cache = SMatrix{7, 7, Int}(binomial(n, k) for n in 0:6, k in 0:6)
+# Precompute binomial coefficients for up to n = 12, corresponding to i-orbitals, for speed.
+const binomial_cache = SMatrix{13, 13, Int}(binomial(n, k) for n in 0:12, k in 0:12)
 
 @inline function get_b_ij_A(A::Int, a_i::Int, a_j::Int, X_ij::T, x_i::T, x_j::T)::T where {T<:AbstractFloat}
     """

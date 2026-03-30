@@ -180,7 +180,7 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
         3) |μ| ≤ u + v, which arises from the fact that only x and y components increment μ, up to a maximum of u + v.
         4) μ ≡ u + v (mod 2), as μ changes by ±1 for each x or y component.
 
-    We know that for e.g. f-orbitals, n_max = 6, so we can precompute the full A tensor by just speicifying n_max.
+    We know that for e.g. i-orbitals, n_max = 12, so we can precompute the full A tensor by just speicifying n_max.
 
     # Arguments:
     - n_max::Int: Maximum degree of our monomials.

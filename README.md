@@ -39,6 +39,43 @@ Computation of form factors for scattering on molecules.
 
    This will perform the TD-DFT calculation, compute the molecular form factors, and generate plots. These will be saved in the `runs/[run_name]/[molecule_number]/` directory structure.
 
+## Supported Basis Sets
+
+The following basis sets are available. Set the alias string as `BASIS` in `run_computation.sh`.
+
+### Pople
+
+| Alias |
+| --- |
+| `6-31g*` |
+| `6-31g**` |
+| `6-31+g*` |
+| `6-31+g**` |
+
+### Dunning
+
+| Alias |
+| --- |
+| `ccpvdz` |
+| `ccpvtz` |
+| `ccpvqz` |
+
+### Ahlrichs (def2)
+
+| Alias |
+| --- |
+| `def2-sv(p)` |
+| `def2-svp` |
+| `def2-svpd` |
+| `def2-tzvp` |
+| `def2-tzvpd` |
+| `def2-tzvpp` |
+| `def2-tzvppd` |
+| `def2-qzvp` |
+| `def2-qzvpd` |
+| `def2-qzvpp` |
+| `def2-qzvppd` |
+
 ## File Structure
 
 ```text
@@ -90,9 +127,8 @@ SCarFFF/
 │   │       └── PerformFFT.jl                # Performs the FFT of the transition density.
 │   │
 │   └── data/                  # Precomputed data. Basis set files, Gaunt coefficients, A tensors.
-│       ├── basis_sets/        # Gaussian basis set definitions.
-│       │   ├── 6-31g_st.gbs
-│       │   └── cc-pVDZ.gbs
+│       ├── basis_sets/        # Gaussian basis set definitions (HDF5).
+│       │   └── {basis_set_name}.h5
 │       ├── gaunt_coefficients/ # Precomputed Gaunt coefficients (HDF5).
 │       │   └── gaunt_coefficients_*.h5
 │       └── A_tensors/         # Precomputed A tensors (HDF5).

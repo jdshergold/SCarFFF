@@ -12,7 +12,7 @@ using ...SparseTensors: SparseDTensor, uvw_key
 
 export construct_D_tensor
 
-const factorial_cache = SVector{7, Int}(factorial(n) for n in 0:6)
+const factorial_cache = SVector{13, Int}(factorial(n) for n in 0:12)
 
 @inline function get_C_ij_u(
         u::Int,

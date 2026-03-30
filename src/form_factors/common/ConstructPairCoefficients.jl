@@ -112,8 +112,8 @@ end
 
         M_{ij} = (d_i * d_j) * (k_i * k_j)* σ_{ij}^3 * exp(-r_{ij}^2 / (2 * σb_{ij}^2)),
 
-    where d_i, N_i and k_i are the primitive prefactor, primitive normalisation constant, and 
-    Cartesian prefactor for Cartesian term i, respectively.
+    where d_i and d_j are the fully normalised primitive prefactors and k_i and k_j are the
+    Cartesian prefactors for Cartesian terms i and j, respectively.
 
     # Arguments:
     - d_i::T: Normalised primitive prefactor for Cartesian term i.

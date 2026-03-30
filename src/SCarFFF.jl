@@ -86,7 +86,7 @@ end
             # Precompute Gaunt and A tensors, and save them to temporary files.
             gaunt_path = joinpath(tmp_dir, "gaunt_precompile.h5")
             A_tensor_path = joinpath(tmp_dir, "A_tensor_precompile.h5")
-            lambda_max = 4
+            lambda_max = 12
             l_max = 6
             SphericalFormFactor.PrecomputeGaunt.precompute_gaunt_coefficients(lambda_max, l_max + lambda_max, l_max, gaunt_path, T)
             SphericalFormFactor.PrecomputeATensor.precompute_A_tensor(lambda_max, A_tensor_path, T)

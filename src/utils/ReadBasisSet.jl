@@ -4,8 +4,9 @@ using HDF5
 
 export get_molecular_data, MoleculeData
 
-# Create a map from real spherical harmonic labels, e.g. x^2 - y^2 to m.
-# For now only up to f-orbitals are supported.
+# Create a map from real spherical harmonic labels to m.
+# For p and d orbitals the labels are named (e.g. "x", "z^2"); for f and above they are
+# integer strings matching the m value (e.g. "-3", "0", "3").
 const REAL_HARMONIC_MAP = Dict{String, Int}(
     # p-orbitals.
     "y" => -1,
@@ -17,54 +18,158 @@ const REAL_HARMONIC_MAP = Dict{String, Int}(
     "z^2" => 0,
     "xz" => 1,
     "x2-y2" => 2,
-    # f-orbitals.
-    "-3" => -3,
-    "-2" => -2,
-    "-1" => -1,
+    # f and above: labels are integer strings matching the m value (e.g. "-3", "0", "3").
+    "-6" => -6, "-5" => -5, "-4" => -4, "-3" => -3, "-2" => -2, "-1" => -1,
     "0" => 0,
-    "1" => 1,
-    "2" => 2,
-    "3" => 3,
+    "1" => 1, "2" => 2, "3" => 3, "4" => 4, "5" => 5, "6" => 6,
 )
 
-# Create a map from spherical harmonic labels to their Cartesian expansion.
-# For example, "z^2" maps to [(0,0,2,2.0), (2,0,0,-1.0), (0,2,0,-1.0)] representing 2z^2 - x^2 - y^2.
-# PySCF writes 3z^2 - r^2 = 2z^2 - x^2 - y^2 as "z^2", so we include that here.
-# Only up to f-orbitals are supported for now.
-const CARTESIAN_EXPANSION_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
-    # p-orbitals.
+# Per-l Cartesian expansion maps.
+# Each entry maps a spherical harmonic label to a list of (a, b, c, prefactor) tuples
+# representing the Cartesian monomials x^a y^b z^c that sum to that harmonic.
+# Note: f and above use integer string labels (e.g. "-3", "0") so each l needs its own map
+# to avoid key collisions between orbital types with overlapping m ranges.
+const CARTESIAN_EXPANSION_P_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
     "y" => [(0, 1, 0, 1.0)],
     "z" => [(0, 0, 1, 1.0)],
     "x" => [(1, 0, 0, 1.0)],
-    # d-orbitals.
-    "xy" => [(1, 1, 0, 1.0)],
-    "yz" => [(0, 1, 1, 1.0)],
-    "z^2" => [(0, 0, 2, 2.0), (2, 0, 0, -1.0), (0, 2, 0, -1.0)], # 2z^2 - x^2 - y^2.
-    "xz" => [(1, 0, 1, 1.0)],
-    "x2-y2" => [(2, 0, 0, 1.0), (0, 2, 0, -1.0)], # x^2 - y^2.
-    # f-orbitals.
-    "-3" => [(2, 1, 0, 3.0), (0, 3, 0, -1.0)], # 3x^2 y - y^3.
-    "-2" => [(1, 1, 1, 1.0)], # xyz.
-    "-1" => [(2, 1, 0, -1.0), (0, 3, 0, -1.0), (0, 1, 2, 4.0)], # y(5z^2 - r^2).
-    "0" => [(2, 0, 1, -3.0), (0, 2, 1, -3.0), (0, 0, 3, 2.0)], # 5z^3 - 3zr^2.
-    "1" => [(3, 0, 0, -1.0), (1, 2, 0, -1.0), (1, 0, 2, 4.0)], # x(5z^2 - r^2).
-    "2" => [(2, 0, 1, 1.0), (0, 2, 1, -1.0)], # z(x^2 - y^2).
-    "3" => [(3, 0, 0, 1.0), (1, 2, 0, -3.0)], # x(x^2 - 3y^2).
 )
 
+const CARTESIAN_EXPANSION_D_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
+    "xy"    => [(1, 1, 0, 1.0)],
+    "yz"    => [(0, 1, 1, 1.0)],
+    "z^2"   => [(0, 0, 2, 2.0), (2, 0, 0, -1.0), (0, 2, 0, -1.0)], # 2z^2 - x^2 - y^2.
+    "xz"    => [(1, 0, 1, 1.0)],
+    "x2-y2" => [(2, 0, 0, 1.0), (0, 2, 0, -1.0)], # x^2 - y^2.
+)
+
+const CARTESIAN_EXPANSION_F_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
+    "-3" => [(2, 1, 0, 3.0), (0, 3, 0, -1.0)],                    # 3x^2 y - y^3.
+    "-2" => [(1, 1, 1, 1.0)],                                       # xyz.
+    "-1" => [(2, 1, 0, -1.0), (0, 3, 0, -1.0), (0, 1, 2, 4.0)],   # y(5z^2 - r^2).
+    "0"  => [(2, 0, 1, -3.0), (0, 2, 1, -3.0), (0, 0, 3, 2.0)],   # 5z^3 - 3zr^2.
+    "1"  => [(3, 0, 0, -1.0), (1, 2, 0, -1.0), (1, 0, 2, 4.0)],   # x(5z^2 - r^2).
+    "2"  => [(2, 0, 1, 1.0), (0, 2, 1, -1.0)],                     # z(x^2 - y^2).
+    "3"  => [(3, 0, 0, 1.0), (1, 2, 0, -3.0)],                     # x(x^2 - 3y^2).
+)
+
+const CARTESIAN_EXPANSION_G_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
+    "-4" => [(3, 1, 0, 1.0), (1, 3, 0, -1.0)],
+    "-3" => [(2, 1, 1, 3.0), (0, 3, 1, -1.0)],
+    "-2" => [(3, 1, 0, -1.0), (1, 3, 0, -1.0), (1, 1, 2, 6.0)],
+    "-1" => [(2, 1, 1, -3.0), (0, 3, 1, -3.0), (0, 1, 3, 4.0)],
+    "0"  => [(4, 0, 0, 3.0), (2, 2, 0, 6.0), (0, 4, 0, 3.0), (2, 0, 2, -24.0), (0, 2, 2, -24.0), (0, 0, 4, 8.0)],
+    "1"  => [(3, 0, 1, -3.0), (1, 2, 1, -3.0), (1, 0, 3, 4.0)],
+    "2"  => [(4, 0, 0, -1.0), (0, 4, 0, 1.0), (2, 0, 2, 6.0), (0, 2, 2, -6.0)],
+    "3"  => [(3, 0, 1, 1.0), (1, 2, 1, -3.0)],
+    "4"  => [(4, 0, 0, 1.0), (2, 2, 0, -6.0), (0, 4, 0, 1.0)],
+)
+
+const CARTESIAN_EXPANSION_H_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
+    "-5" => [(4, 1, 0, 5.0), (2, 3, 0, -10.0), (0, 5, 0, 1.0)],
+    "-4" => [(3, 1, 1, 1.0), (1, 3, 1, -1.0)],
+    "-3" => [(4, 1, 0, -3.0), (2, 3, 0, -2.0), (0, 5, 0, 1.0), (2, 1, 2, 24.0), (0, 3, 2, -8.0)],
+    "-2" => [(3, 1, 1, -1.0), (1, 3, 1, -1.0), (1, 1, 3, 2.0)],
+    "-1" => [(4, 1, 0, 1.0), (2, 3, 0, 2.0), (0, 5, 0, 1.0), (2, 1, 2, -12.0), (0, 3, 2, -12.0), (0, 1, 4, 8.0)],
+    "0"  => [(4, 0, 1, 15.0), (2, 2, 1, 30.0), (0, 4, 1, 15.0), (2, 0, 3, -40.0), (0, 2, 3, -40.0), (0, 0, 5, 8.0)],
+    "1"  => [(5, 0, 0, 1.0), (3, 2, 0, 2.0), (1, 4, 0, 1.0), (3, 0, 2, -12.0), (1, 2, 2, -12.0), (1, 0, 4, 8.0)],
+    "2"  => [(4, 0, 1, -1.0), (0, 4, 1, 1.0), (2, 0, 3, 2.0), (0, 2, 3, -2.0)],
+    "3"  => [(5, 0, 0, -1.0), (3, 2, 0, 2.0), (1, 4, 0, 3.0), (3, 0, 2, 8.0), (1, 2, 2, -24.0)],
+    "4"  => [(4, 0, 1, 1.0), (2, 2, 1, -6.0), (0, 4, 1, 1.0)],
+    "5"  => [(5, 0, 0, 1.0), (3, 2, 0, -10.0), (1, 4, 0, 5.0)],
+)
+
+const CARTESIAN_EXPANSION_I_MAP = Dict{String, Vector{Tuple{Int, Int, Int, Float64}}}(
+    "-6" => [(5, 1, 0, 3.0), (3, 3, 0, -10.0), (1, 5, 0, 3.0)],
+    "-5" => [(4, 1, 1, 5.0), (2, 3, 1, -10.0), (0, 5, 1, 1.0)],
+    "-4" => [(5, 1, 0, 1.0), (1, 5, 0, -1.0), (3, 1, 2, -10.0), (1, 3, 2, 10.0)],
+    "-3" => [(4, 1, 1, -9.0), (2, 3, 1, -6.0), (0, 5, 1, 3.0), (2, 1, 3, 24.0), (0, 3, 3, -8.0)],
+    "-2" => [(5, 1, 0, 1.0), (3, 3, 0, 2.0), (1, 5, 0, 1.0), (3, 1, 2, -16.0), (1, 3, 2, -16.0), (1, 1, 4, 16.0)],
+    "-1" => [(4, 1, 1, 5.0), (2, 3, 1, 10.0), (0, 5, 1, 5.0), (2, 1, 3, -20.0), (0, 3, 3, -20.0), (0, 1, 5, 8.0)],
+    "0"  => [(6, 0, 0, 5.0), (4, 2, 0, 15.0), (2, 4, 0, 15.0), (0, 6, 0, 5.0), (4, 0, 2, -90.0), (2, 2, 2, -180.0), (0, 4, 2, -90.0), (2, 0, 4, 120.0), (0, 2, 4, 120.0), (0, 0, 6, -16.0)],
+    "1"  => [(5, 0, 1, 5.0), (3, 2, 1, 10.0), (1, 4, 1, 5.0), (3, 0, 3, -20.0), (1, 2, 3, -20.0), (1, 0, 5, 8.0)],
+    "2"  => [(6, 0, 0, 1.0), (4, 2, 0, 1.0), (2, 4, 0, -1.0), (0, 6, 0, -1.0), (4, 0, 2, -16.0), (0, 4, 2, 16.0), (2, 0, 4, 16.0), (0, 2, 4, -16.0)],
+    "3"  => [(5, 0, 1, -3.0), (3, 2, 1, 6.0), (1, 4, 1, 9.0), (3, 0, 3, 8.0), (1, 2, 3, -24.0)],
+    "4"  => [(6, 0, 0, -1.0), (4, 2, 0, 5.0), (2, 4, 0, 5.0), (0, 6, 0, -1.0), (4, 0, 2, 10.0), (2, 2, 2, -60.0), (0, 4, 2, 10.0)],
+    "5"  => [(5, 0, 1, 1.0), (3, 2, 1, -10.0), (1, 4, 1, 5.0)],
+    "6"  => [(6, 0, 0, 1.0), (4, 2, 0, -15.0), (2, 4, 0, 15.0), (0, 6, 0, -1.0)],
+)
+
+@inline function cartesian_map_for_l(l::Int)
+    l == 1 && return CARTESIAN_EXPANSION_P_MAP
+    l == 2 && return CARTESIAN_EXPANSION_D_MAP
+    l == 3 && return CARTESIAN_EXPANSION_F_MAP
+    l == 4 && return CARTESIAN_EXPANSION_G_MAP
+    l == 5 && return CARTESIAN_EXPANSION_H_MAP
+    l == 6 && return CARTESIAN_EXPANSION_I_MAP
+    error("No Cartesian expansion map for l=$l")
+end
+
 # Create a map from angular momentum quantum number labels to their corresponding integer values.
-# For now up to f-orbitals are supported.
 const L_MAP = Dict{Char, Int}(
     'S' => 0,
     'P' => 1,
     'D' => 2,
     'F' => 3,
+    'G' => 4,
+    'H' => 5,
+    'I' => 6,
 )
 
 const AU_TO_ANGSTROM = 0.529177 # For converting Bohr radii to Angstroms.
 
 # For pulling the correct basis set file.
-const basis_map = Dict{String, String}("6-31g*" => "6-31g_st.h5", "ccpvdz" => "cc-pVDZ.h5")
+const basis_map = Dict{String, String}(
+    # Pople basis sets.
+    "6-31g*"    => "6-31g_st.h5",
+    "6-31g**"   => "6-31g_st_st.h5",
+    "6-31+g*"   => "6-31+g_st.h5",
+    "6-31+g**"  => "6-31+g_st_st.h5",
+    # Dunning correlation-consistent basis sets.
+    "ccpvdz"    => "cc-pVDZ.h5",
+    "ccpvtz"    => "cc-pVTZ.h5",
+    "ccpvqz"    => "cc-pVQZ.h5",
+    # Ahlrichs def2 basis sets.
+    "def2-sv(p)"  => "def2-SV(P).h5",
+    "def2-svp"    => "def2-SVP.h5",
+    "def2-svpd"   => "def2-SVPD.h5",
+    "def2-tzvp"   => "def2-TZVP.h5",
+    "def2-tzvpd"  => "def2-TZVPD.h5",
+    "def2-tzvpp"  => "def2-TZVPP.h5",
+    "def2-tzvppd" => "def2-TZVPPD.h5",
+    "def2-qzvp"   => "def2-QZVP.h5",
+    "def2-qzvpd"  => "def2-QZVPD.h5",
+    "def2-qzvpp"  => "def2-QZVPP.h5",
+    "def2-qzvppd" => "def2-QZVPPD.h5",
+)
+
+@inline function parse_ao_label(descriptor::AbstractString)
+    """
+    Parse the atomic-orbital string from a PySCF AO label.
+
+    Supports descriptors like "1s", "2px", "5g-4", "5g+4", "10s", and "10g+4".
+
+    # Returns
+    - n: Principal quantum number.
+    - l: Orbital angular momentum quantum number.
+    - harmonic_label: Harmonic suffix with a leading `+` stripped when present.
+    - m: Magnetic quantum number for the real spherical harmonic.
+    """
+    match_result = match(r"^(\d+)([A-Za-z])(.*)$", descriptor)
+    match_result === nothing && error("Unsupported AO label '$descriptor'.")
+
+    n = parse(Int, match_result.captures[1])
+    l_char = uppercase(only(match_result.captures[2]))
+    haskey(L_MAP, l_char) || error("Unsupported AO angular momentum '$l_char' in label '$descriptor'.")
+    l = L_MAP[l_char]
+
+    harmonic_label = lstrip(match_result.captures[3], '+')
+    m = isempty(harmonic_label) ? 0 : get(REAL_HARMONIC_MAP, harmonic_label) do
+        error("Unsupported AO harmonic label '$harmonic_label' in AO label '$descriptor'.")
+    end
+
+    return (n = n, l = l, harmonic_label = harmonic_label, m = m)
+end
 
 @inline function restore_python_hdf5_order(data::AbstractArray)
     """
@@ -89,9 +194,9 @@ struct MoleculeData{T<:AbstractFloat}
     All primitives and coordinates here are in units of Angstrom to some appropriate power.
     """
     # Primitive data.
-    widths::Vector{T} # Gaussian exponents.
-    coefficients::Vector{T} # Unnormalised coefficients.
-    normalised_coefficients::Vector{T} # Normalised coefficients.
+    widths::Vector{T} # Gaussian widths.
+    coefficients::Vector{T} # Raw contraction coefficients d_μ.
+    normalised_coefficients::Vector{T} # Fully normalised primitive prefactors d_μ ξ_μ N_α.
 
     # Atom coordinates and edges of a cuboid about the molecule.
     atom_coordinates::Array{T, 2} # Coordinates of the atoms in the molecule.
@@ -184,15 +289,11 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
             label = split(strip(label))
             atom_idx = parse(Int, label[1]) + 1 # Atom index, 1-based in Julia, hence we add the 1.
             species = label[2] # Element symbol, e.g. "C", "O".
-            n = parse(Int, label[3][1]) # Principal quantum number.
-            l = L_MAP[uppercase(label[3][2])] # Orbital angular momentum quantum number.
-
-            # Handle m more carefully.
-            if length(label[3]) <= 2
-                m = 0 # Handles s orbitals.
-            else
-                m = REAL_HARMONIC_MAP[label[3][3:end]] # Magnetic quantum number.
-            end
+            parsed_descriptor = parse_ao_label(label[3])
+            n = parsed_descriptor.n
+            l = parsed_descriptor.l
+            harmonic_label = parsed_descriptor.harmonic_label
+            m = parsed_descriptor.m
 
             # Now push to the arrays.
             push!(orbital_to_atom, atom_idx)
@@ -201,14 +302,12 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
             push!(orbital_m, m)
 
             # Get Cartesian expansion terms for this orbital.
-            harmonic_label = ""
             if l == 0
                 # s-orbitals are just (0,0,0) with prefactor 1.
+                harmonic_label = ""
                 cartesian_terms = [(0, 0, 0, 1.0)]
             else
-                # Extract the spherical harmonic part (everything after the angular momentum letter).
-                harmonic_label = label[3][3:end]  # e.g., "x", "z^2", "xy".
-                cartesian_terms = CARTESIAN_EXPANSION_MAP[harmonic_label]
+                cartesian_terms = cartesian_map_for_l(l)[harmonic_label]
             end
 
             # Read the corresponding primitive data from the basis HDF5 file.
@@ -235,11 +334,11 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
             @inbounds for i in 1:n_primitives_for_orbital
                 width = T(orbital_widths[i])
                 coeff = T(orbital_coeffs[i])
-                scaled_coeff = T(orbital_normalised_coeffs[i])
+                normalised_coeff = T(orbital_normalised_coeffs[i])
 
                 push!(widths, width)
-                push!(coefficients, coeff)                    # d_p.
-                push!(normalised_coefficients, scaled_coeff)  # d_p * N_p.
+                push!(coefficients, coeff)                         # d_μ.
+                push!(normalised_coefficients, normalised_coeff)  # d_μ ξ_μ N_α.
                 push!(primitive_to_orbital, orbital_idx)
                 push!(primitive_to_atom, atom_idx)
 

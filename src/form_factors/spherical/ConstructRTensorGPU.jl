@@ -53,7 +53,7 @@ const KEV_TO_INV_ANGSTROM = 1.0 / 1.973269804  # Multiplicative factor to conver
 const INV_FOUR_PI = 1.0 / (4.0 * π)
 const prefactor = 2.0 * sqrt(2) * (2π)^(5 / 2)
 
-const MAX_L_GLOBAL = 96 # The maximum L value we will support globally for spherical Bessel functions. Allows up to l = 90 for f-orbitals.
+const MAX_L_GLOBAL = 96 # The maximum L value we support globally for spherical Bessel functions.
 
 @inline function compute_q_powers(
         q_grid::Vector{T},
