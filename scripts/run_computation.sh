@@ -15,7 +15,7 @@ CSV_FILE=""                 # Path to CSV file containing SMILES strings. Leave 
 SMILES="C1=CC=CC=C1" # SMILES string for the molecule. This is ignored if CSV_FILE is specified.
 
 # ==== TD-DFT parameters. ====
-BASIS="6-31g*"             # Basis set to use. Currently only "6-31g*" and "ccpvdz" are supported.
+BASIS="6-31g*"             # Basis set to use. See README for supported basis sets and aliases.
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
@@ -28,27 +28,27 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
 Q_MAX=10.0                 # Maximum momentum transfer in keV.
-N_Q=201                    # Number of |q| grid points.
-N_THETA=201                # Number of theta (polar angle) grid points.
-N_PHI=201                  # Number of phi (azimuthal angle) grid points.
+N_Q=101                    # Number of |q| grid points.
+N_THETA=101                # Number of theta (polar angle) grid points.
+N_PHI=101                  # Number of phi (azimuthal angle) grid points.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
 COMPUTE_MODE="form_factor"        # What to compute/save for the spherical method. Options: "R_only", "form_factor", "both". If "R_only" is selected, the computation stops before the spherical grid contraction, and only R is saved to disk.
 
 # ==== FFT method parameters. ====
-Q_LIM="25.0,25.0,25.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
-Q_RES="0.125,0.125,0.125"        # q-space resolution in keV, comma-separated (Δqx, Δqy, Δqz).
+Q_LIM="88.0,88.0,88.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
+Q_RES="0.5,0.5,0.5"        # q-space resolution in keV, comma-separated (Δqx, Δqy, Δqz).
 CHECK_PARSEVAL=false       # Set to true to check Parseval's theorem holds.
 
 # ==== Cartesian method parameters. ====
-QX_GRID="-15,15,51"       # qx grid specification (min,max,N) in keV.
-QY_GRID="-15,15,51"       # qy grid specification (min,max,N) in keV.
-QZ_GRID="-15,15,51"       # qz grid specification (min,max,N) in keV.
+QX_GRID="-15,15,201"       # qx grid specification (min,max,N) in keV.
+QY_GRID="-15,15,201"       # qy grid specification (min,max,N) in keV.
+QZ_GRID="-15,15,201"       # qz grid specification (min,max,N) in keV.
 CARTESIAN_COMPUTE_MODE="form_factor"  # What to compute/save for the Cartesian method. Options: "V_only", "form_factor", "both". If "V_only" is selected, the computation stops before the grid contraction, and only V tensors are saved to disk.
 
 # ==== Computation parameters. ====
-TRANSITION_INDICES="2"       # Which electronic transitions to compute. Can be "all" or a comma-separated list like "1,2,3,4". The first excited state is index 1.
+TRANSITION_INDICES="all"       # Which electronic transitions to compute. Can be "all" or a comma-separated list like "1,2,3,4". The first excited state is index 1.
 THRESHOLD=1e-6             # Threshold for dropping small tensor values. For spherical: |W/W_max| < THRESHOLD. For Cartesian: |M_ij/M_max| < THRESHOLD. Set to 0.0 to disable. Around 1e-6 is recommended for both accuracy and performance.
 JULIA_THREADS="auto"       # Number of threads to use for the Julia part of the code. Set to "auto" to use all available threads.
 PRECISION="float32"       # Floating point precision for form factor computation. On CPU this has negligible impact on performance, but cuts down on file size by ~2. May produce 'fuzzy looking' Re/Im plots when the values are effectively zero in float32.
@@ -56,8 +56,8 @@ USE_GPU=false              # Set to true to enable GPU acceleration for the DFT 
 
 # ==== Control flags. ====
 SKIP_TDDFT=true            # Set to true to skip the TD-DFT calculation. Will not be skipped if the results do not already exist.
-SKIP_FORM_FACTOR=true     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
-SKIP_2D_PLOTS=false         # Set to true to skip 2D slice plot generation.
+SKIP_FORM_FACTOR=false     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
+SKIP_2D_PLOTS=false        # Set to true to skip 2D slice plot generation.
 SKIP_3D_PLOTS=true         # Set to true to skip 3D isosurface plot generation.
 FORCE_RECOMPUTATION=false  # Set to true to force recomputation of A and Gaunt coefficients in the form factor computation.
 BENCHMARK=false            # Set to true to run benchmark after form factor computation. Testing only.
@@ -71,11 +71,11 @@ USE_TEX=true              # Set to true to use TeX for text rendering in plots (
 PLOT_TRANSITION_DENSITY=true  # Set to true to plot the transition density (FFT method only, will be ignored for the spherical method).
 
 # 2D plotting parameters.
-PLOT_PLANES=("xy" "xz" "yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
+PLOT_PLANES=("xy xz yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
 PLOT_MODES=("modsq" "Re" "Im")  # What to plot. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each option will be plotted as row, in the same order as provided.
 
 # 3D plotting parameters.
-PLOT_3D_MODES=("modsq")  # Modes for 3D plots. Options: modsq (|f_S|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
+PLOT_3D_MODES=("modsq" "Re" "Im")  # Modes for 3D plots. Options: modsq (|f_S|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
 PLOT_3D_MIN_FRACTION=0.15 # Minimum isosurface level as a fraction of maximum.
 PLOT_3D_MAX_FRACTION=0.95 # Maximum isosurface level as a fraction of maximum.
 PLOT_3D_GRID_SIZE=75      # Target grid (x,y,z) size for downsampling. Setting this too large will make the plots laggy.

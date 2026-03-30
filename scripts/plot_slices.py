@@ -369,17 +369,17 @@ def extract_domain_data(data, mode):
         # The form factor is complex-valued and dimensionless.
         if mode == "modsq":
             plot_data = np.abs(data) ** 2
-            label = r"$|f_S(\mathbf{q})|^2$"
+            label = r"$|f_s(\mathbf{q})|^2$"
             cmap = "viridis"
             symmetric = False
         elif mode == "Im":
             plot_data = np.imag(data)
-            label = r"$\mathrm{Im}[f_S(\mathbf{q})]$"
+            label = r"$\mathrm{Im}[f_s(\mathbf{q})]$"
             cmap = "RdBu_r"
             symmetric = True
         elif mode == "Re":
             plot_data = np.real(data)
-            label = r"$\mathrm{Re}[f_S(\mathbf{q})]$"
+            label = r"$\mathrm{Re}[f_s(\mathbf{q})]$"
             cmap = "RdBu_r"
             symmetric = True
         else:
