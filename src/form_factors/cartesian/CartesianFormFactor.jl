@@ -33,7 +33,7 @@ function compute_cartesian_form_factor(
     use_gpu::Bool = false,
     need_grid::Bool = true,
     need_V::Bool = true
-)::Tuple{Union{Nothing, Tuple{Array{Complex{T}, 3}, Array{Complex{T}, 3}, Array{Complex{T}, 3}}}, Union{Nothing, Array{Complex{T}, 4}}, Vector{T}} where {T<:AbstractFloat}
+)::Tuple{Union{Nothing, Tuple{Array{Complex{T}, 2}, Array{Complex{T}, 2}, Array{Complex{T}, 2}}}, Union{Nothing, Array{Complex{T}, 4}}, Vector{T}} where {T<:AbstractFloat}
     """
     Compute the Cartesian form factor f_s(q_x, q_y, q_z) on a Cartesian grid using the
     separable tensor contraction method.
@@ -50,7 +50,7 @@ function compute_cartesian_form_factor(
     - need_V::Bool: Whether to save and return the V tensors (default: true).
 
     # Returns:
-    - V_tensors::Union{Nothing, Tuple{Array{Complex{T}, 3}, Array{Complex{T}, 3}, Array{Complex{T}, 3}}}: The V_x, V_y, V_z tensors if need_V is true, otherwise nothing.
+    - V_tensors::Union{Nothing, Tuple{Array{Complex{T}, 2}, Array{Complex{T}, 2}, Array{Complex{T}, 2}}}: The V_x, V_y, V_z tensors if need_V is true, otherwise nothing.
     - f_s::Union{Nothing, Array{Complex{T}, 4}}: The form factor on the (q_x, q_y, q_z) grid with shape (n_transitions, n_qx, n_qy, n_qz) if need_grid is true, otherwise nothing.
     - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
     """
@@ -83,7 +83,7 @@ function compute_cartesian_form_factor(
     f_s = nothing
     if need_grid
         if use_gpu
-            f_s = contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold)
+            f_s = Array(contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold))
         else
             f_s = contract_cartesian_grid(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold)
         end
