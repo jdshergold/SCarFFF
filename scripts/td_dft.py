@@ -122,13 +122,14 @@ def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1"):
 
     return coordinates, ring_indices
 
-def get_dft_optimised_geometry(coords, basis="6-31g*", use_gpu=False):
+def get_dft_optimised_geometry(coords, basis="6-31g*", xc="b3lyp", use_gpu=False):
     """
     Use PySCF to generate optimised molecular geometry for a given SMILES string.
 
     # Arguments:
     - coords::list: List of atom symbols and their coordinates, which should already be optimised by RDKit.
     - basis::str: Basis set for the calculation (default: '6-31g*').
+    - xc::str: Exchange-correlation functional to use (default: 'b3lyp').
     - use_gpu::bool: Whether to run the DFT calculation on a GPU (default: False).
 
     # Returns:
@@ -138,7 +139,7 @@ def get_dft_optimised_geometry(coords, basis="6-31g*", use_gpu=False):
     # Create the PySCF molecule.
     mol = create_pyscf_mol(coords, basis=basis)
     mf = dft.RKS(mol)
-    mf.xc = "b3lyp"
+    mf.xc = xc
     mf = mf.density_fit()
 
     # Silence this part. It's very noisy. This includes error messages, which aren't actually errors from geometric.
@@ -439,18 +440,19 @@ def print_excited_states(td):
         print(f"{i+1:3d}     {energy_ev:8.4f}      {oscillator_strength:8.4f}")
 
 
-def calculate_excited_states(mol, nstates=10, use_gpu=False):
+def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False):
     """Run TD-DFT calculation to find excited states.
 
     # Arguments:
     - mol::Mole: The PySCF molecule object.
     - nstates::Int: The number of excited states to calculate (default: 10).
+    - xc::str: Exchange-correlation functional to use (default: 'b3lyp').
     - use_gpu::bool: Whether to run the DFT and TD-DFT calculations on a GPU (default: False).
     """
 
-    # First run DFT calculation with B3LYP functional.
+    # First run DFT calculation.
     mf = dft.RKS(mol)
-    mf.xc = "b3lyp"
+    mf.xc = xc
 
     # Move to GPU if requested.
     if use_gpu:
@@ -532,6 +534,7 @@ def get_tdm(tdobj, state=1):
 def run_td_dft_analysis(
     smiles="C1=CC=CC=C1",
     basis="6-31g*",
+    xc="b3lyp",
     nstates=5,
     ntrans=3,
     output_directory=".",
@@ -546,6 +549,7 @@ def run_td_dft_analysis(
     Arguments:
         smiles::str: SMILES string representing the molecule (default: benzene).
         basis::str: Basis set for the calculation (default: '6-31g*').
+        xc::str: Exchange-correlation functional to use (default: 'b3lyp').
         nstates::int: Number of excited states to calculate (default: 5).
         ntrans::int: Number of transitions to compute transitiom matrices for (default: 3).
         output_directory::str: Directory path to save the results (default: '.').
@@ -563,7 +567,7 @@ def run_td_dft_analysis(
 
     if dft_optimisation:
         print("Further optimising geometry with PySCF DFT.")
-        coords = get_dft_optimised_geometry(coords0, basis=basis, use_gpu=use_gpu)
+        coords = get_dft_optimised_geometry(coords0, basis=basis, xc=xc, use_gpu=use_gpu)
     else:
         coords = coords0
 
@@ -582,7 +586,7 @@ def run_td_dft_analysis(
     print("Molecule created.")
 
     print("Running TD-DFT calculation for excited states.")
-    mf, td = calculate_excited_states(mol, nstates=nstates, use_gpu=use_gpu)
+    mf, td = calculate_excited_states(mol, nstates=nstates, xc=xc, use_gpu=use_gpu)
     if mf is None:
         print("Calculation failed. Exiting.")
         return coords, mol, None, None, None
@@ -629,6 +633,7 @@ def run_td_dft_analysis(
         # Store the molecule metadata as attributes.
         f.attrs["species"] = smiles
         f.attrs["basis"] = basis
+        f.attrs["xc"] = xc
 
         # Store the geometry.
         atom_symbols = [atom[0] for atom in geometry]
@@ -674,6 +679,11 @@ def parse_cli_arguments():
         "--basis",
         default="6-31g*",
         help="Basis set label to use for PySCF.",
+    )
+    parser.add_argument(
+        "--xc",
+        default="b3lyp",
+        help="Exchange-correlation functional to use for PySCF (default: b3lyp).",
     )
     parser.add_argument(
         "--nstates",
@@ -764,7 +774,7 @@ def main():
     metadata_file = os.path.join(run_directory, "metadata.csv")
     with open(metadata_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['folder', 'smiles', 'basis'])
+        writer.writerow(['folder', 'smiles', 'basis', 'xc'])
 
     # Start timing the computation.
     computation_start = time.perf_counter()
@@ -782,13 +792,14 @@ def main():
         # Append to metadata.
         with open(metadata_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([mol_num, smiles, args.basis])
+            writer.writerow([mol_num, smiles, args.basis, args.xc])
 
         # Run the TD-DFT analysis for this molecule.
         try:
             run_td_dft_analysis(
                 smiles=smiles,
                 basis=args.basis,
+                xc=args.xc,
                 nstates=args.nstates,
                 ntrans=args.ntrans,
                 output_directory=mol_output_dir,

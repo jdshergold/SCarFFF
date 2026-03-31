@@ -16,6 +16,7 @@ SMILES="C1=CC=CC=C1" # SMILES string for the molecule. This is ignored if CSV_FI
 
 # ==== TD-DFT parameters. ====
 BASIS="6-31g*"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
@@ -34,17 +35,17 @@ N_PHI=101                  # Number of phi (azimuthal angle) grid points.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODE="form_factor"        # What to compute/save for the spherical method. Options: "R_only", "form_factor", "both". If "R_only" is selected, the computation stops before the spherical grid contraction, and only R is saved to disk.
+COMPUTE_MODE="both"        # What to compute/save for the spherical method. Options: "R_only", "form_factor", "both". If "R_only" is selected, the computation stops before the spherical grid contraction, and only R is saved to disk.
 
 # ==== FFT method parameters. ====
-Q_LIM="88.0,88.0,88.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
-Q_RES="0.5,0.5,0.5"        # q-space resolution in keV, comma-separated (Δqx, Δqy, Δqz).
+Q_LIM="15.0,15.0,15.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
+Q_RES="0.075,0.075,0.075"        # q-space resolution in keV, comma-separated (Δqx, Δqy, Δqz).
 CHECK_PARSEVAL=false       # Set to true to check Parseval's theorem holds.
 
 # ==== Cartesian method parameters. ====
-QX_GRID="-15,15,201"       # qx grid specification (min,max,N) in keV.
-QY_GRID="-15,15,201"       # qy grid specification (min,max,N) in keV.
-QZ_GRID="-15,15,201"       # qz grid specification (min,max,N) in keV.
+QX_GRID="-15,15,101"       # qx grid specification (min,max,N) in keV.
+QY_GRID="-15,15,101"       # qy grid specification (min,max,N) in keV.
+QZ_GRID="-15,15,101"       # qz grid specification (min,max,N) in keV.
 CARTESIAN_COMPUTE_MODE="form_factor"  # What to compute/save for the Cartesian method. Options: "V_only", "form_factor", "both". If "V_only" is selected, the computation stops before the grid contraction, and only V tensors are saved to disk.
 
 # ==== Computation parameters. ====
@@ -71,7 +72,7 @@ USE_TEX=true              # Set to true to use TeX for text rendering in plots (
 PLOT_TRANSITION_DENSITY=true  # Set to true to plot the transition density (FFT method only, will be ignored for the spherical method).
 
 # 2D plotting parameters.
-PLOT_PLANES=("xy xz yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
+PLOT_PLANES=("xy" "xz" "yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
 PLOT_MODES=("modsq" "Re" "Im")  # What to plot. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each option will be plotted as row, in the same order as provided.
 
 # 3D plotting parameters.
@@ -170,6 +171,7 @@ if [ "$SKIP_TDDFT" = true ] && [ -f "$RUN_DIR/metadata.csv" ]; then
     echo ""
 else
     echo "  Basis: $BASIS"
+    echo "  XC functional: $XC_FUNCTIONAL"
     echo "  Number of states: $NSTATES"
     echo "  Number of transitions: $NTRANS"
     echo ""
@@ -177,7 +179,7 @@ else
     cd "$SCRIPT_DIR"
 
     # Build the td_dft command.
-    TD_DFT_CMD="$PYTHON_BIN td_dft.py --basis \"$BASIS\" --nstates $NSTATES --ntrans $NTRANS --precision $PRECISION --output-dir \"$RUN_DIR\""
+    TD_DFT_CMD="$PYTHON_BIN td_dft.py --basis \"$BASIS\" --xc \"$XC_FUNCTIONAL\" --nstates $NSTATES --ntrans $NTRANS --precision $PRECISION --output-dir \"$RUN_DIR\""
 
     # Add the input to the command.
     if [ -n "$CSV_FILE" ]; then
