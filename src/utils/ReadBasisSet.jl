@@ -118,30 +118,18 @@ const L_MAP = Dict{Char, Int}(
 
 const AU_TO_ANGSTROM = 0.529177 # For converting Bohr radii to Angstroms.
 
-# For pulling the correct basis set file.
-const basis_map = Dict{String, String}(
-    # Pople basis sets.
-    "6-31g*"    => "6-31g_st.h5",
-    "6-31g**"   => "6-31g_st_st.h5",
-    "6-31+g*"   => "6-31+g_st.h5",
-    "6-31+g**"  => "6-31+g_st_st.h5",
-    # Dunning correlation-consistent basis sets.
-    "ccpvdz"    => "cc-pVDZ.h5",
-    "ccpvtz"    => "cc-pVTZ.h5",
-    "ccpvqz"    => "cc-pVQZ.h5",
-    # Ahlrichs def2 basis sets.
-    "def2-sv(p)"  => "def2-SV(P).h5",
-    "def2-svp"    => "def2-SVP.h5",
-    "def2-svpd"   => "def2-SVPD.h5",
-    "def2-tzvp"   => "def2-TZVP.h5",
-    "def2-tzvpd"  => "def2-TZVPD.h5",
-    "def2-tzvpp"  => "def2-TZVPP.h5",
-    "def2-tzvppd" => "def2-TZVPPD.h5",
-    "def2-qzvp"   => "def2-QZVP.h5",
-    "def2-qzvpd"  => "def2-QZVPD.h5",
-    "def2-qzvpp"  => "def2-QZVPP.h5",
-    "def2-qzvppd" => "def2-QZVPPD.h5",
-)
+@inline function canonical_basis_name(name::AbstractString)
+    return replace(lowercase(strip(name)), "*" => "s", r"[-_\s\(\)]" => "")
+end
+
+function resolve_basis_set_path(basis_set_name::AbstractString)
+    basis_dir = joinpath(@__DIR__, "..", "data", "basis_sets")
+    basis_filename = "$(canonical_basis_name(basis_set_name)).h5"
+    basis_path = joinpath(basis_dir, basis_filename)
+    isfile(basis_path) && return basis_path
+
+    error("Precomputed basis set file not found for basis '$basis_set_name' at $basis_path")
+end
 
 @inline function parse_ao_label(descriptor::AbstractString)
     """
@@ -435,7 +423,7 @@ function get_molecular_data(
 
     # Construct the path to the precomputed basis set HDF5 file.
     basis_set_name = h5_data["basis"]
-    basis_set_path = joinpath(@__DIR__, "..", "data", "basis_sets", basis_map[basis_set_name])
+    basis_set_path = resolve_basis_set_path(basis_set_name)
 
     # Construct the molecular data using the TD-DFT HDF5 data and precomputed basis set.
     molecule_data = construct_molecular_data(h5_data, basis_set_path; precision=precision)

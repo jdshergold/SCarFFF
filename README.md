@@ -41,40 +41,25 @@ Computation of form factors for scattering on molecules.
 
 ## Supported Basis Sets
 
-The following basis sets are available. Set the alias string as `BASIS` in `run_computation.sh`.
+All PySCF orbital basis sets with angular momentum up to l = 6 (i-orbitals) are supported.
+Set the basis set name as `BASIS` in `run_computation.sh`.
 
-### Pople
+### Naming convention
 
-| Alias |
-| --- |
-| `6-31g*` |
-| `6-31g**` |
-| `6-31+g*` |
-| `6-31+g**` |
+The `BASIS` string is matched to a precomputed HDF5 file by a canonical transformation:
+lowercase, replace `*` with `s`, strip `-`, `_`, spaces, and parentheses. Common
+variant spellings all resolve to the same file:
 
-### Dunning
+| You write | Resolves to |
+| --- | --- |
+| `cc-pVDZ` | `ccpvdz.h5` |
+| `6-31G*` | `631gs.h5` |
+| `def2-TZVP` | `def2tzvp.h5` |
+| `aug-cc-pVTZ` | `augccpvtz.h5` |
 
-| Alias |
-| --- |
-| `ccpvdz` |
-| `ccpvtz` |
-| `ccpvqz` |
-
-### Ahlrichs (def2)
-
-| Alias |
-| --- |
-| `def2-sv(p)` |
-| `def2-svp` |
-| `def2-svpd` |
-| `def2-tzvp` |
-| `def2-tzvpd` |
-| `def2-tzvpp` |
-| `def2-tzvppd` |
-| `def2-qzvp` |
-| `def2-qzvpd` |
-| `def2-qzvpp` |
-| `def2-qzvppd` |
+Pople polarisation and diffuse variants follow PySCF's extended naming scheme —
+e.g. `6-31g(2d,2p)` canonicalises to `631gpolarization2d`. Use the canonical form
+or pass the PySCF filename stem directly.
 
 ## File Structure
 
