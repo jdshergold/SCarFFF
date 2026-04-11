@@ -453,6 +453,7 @@ def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False):
     # First run DFT calculation.
     mf = dft.RKS(mol)
     mf.xc = xc
+    mf = mf.density_fit()
 
     # Move to GPU if requested.
     if use_gpu:
