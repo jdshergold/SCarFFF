@@ -8,19 +8,19 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="benzene_spherical"      # Name for this run.
+RUN_NAME="flmsq_test"     # Name for this run.
 CSV_FILE=""                 # Path to CSV file containing SMILES strings. Leave this empty for a single molecule run.
 
 # Molecule specification.
 SMILES="C1=CC=CC=C1" # SMILES string for the molecule. This is ignored if CSV_FILE is specified.
 
 # ==== TD-DFT parameters. ====
-BASIS="6-31g*"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="def2-svpd"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
-DFT_OPTIMISATION=false    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
+DFT_OPTIMISATION=true    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
 PLOT_MOLECULE_3D=false    # Set to true to generate interactive 3D molecule plot from TD-DFT.
 
 # ==== Form factor computation parameters. ====
@@ -28,14 +28,14 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
-Q_MAX=10.0                 # Maximum momentum transfer in keV.
-N_Q=101                    # Number of |q| grid points.
-N_THETA=101                # Number of theta (polar angle) grid points.
-N_PHI=101                  # Number of phi (azimuthal angle) grid points.
+Q_MAX=20.0                 # Maximum momentum transfer in keV.
+N_Q=201                    # Number of |q| grid points.
+N_THETA=201                # Number of theta (polar angle) grid points.
+N_PHI=201                  # Number of phi (azimuthal angle) grid points.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODE="both"        # What to compute/save for the spherical method. Options: "R_only", "form_factor", "both". If "R_only" is selected, the computation stops before the spherical grid contraction, and only R is saved to disk.
+COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
 
 # ==== FFT method parameters. ====
 Q_LIM="15.0,15.0,15.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
@@ -57,7 +57,7 @@ USE_GPU=false              # Set to true to enable GPU acceleration for the DFT 
 
 # ==== Control flags. ====
 SKIP_TDDFT=true            # Set to true to skip the TD-DFT calculation. Will not be skipped if the results do not already exist.
-SKIP_FORM_FACTOR=false     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
+SKIP_FORM_FACTOR=true     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
 SKIP_2D_PLOTS=false        # Set to true to skip 2D slice plot generation.
 SKIP_3D_PLOTS=true         # Set to true to skip 3D isosurface plot generation.
 FORCE_RECOMPUTATION=false  # Set to true to force recomputation of A and Gaunt coefficients in the form factor computation.
@@ -68,12 +68,12 @@ CHECK_OSCILLATOR_STRENGTH=false  # Set to true to compute and compare oscillator
 Q_MAX_FIT=0.05                  # Maximum q value in keV for fitting the oscillator strength. You should ensure that at least 2 points sit below this value. It is highly recommended to set this to 0.2 keV or lower, the lower the better.
 
 # ==== Plotting parameters. ====
-USE_TEX=true              # Set to true to use TeX for text rendering in plots (requires TeX installation).
 PLOT_TRANSITION_DENSITY=true  # Set to true to plot the transition density (FFT method only, will be ignored for the spherical method).
 
 # 2D plotting parameters.
 PLOT_PLANES=("xy" "xz" "yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
 PLOT_MODES=("modsq" "Re" "Im")  # What to plot. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each option will be plotted as row, in the same order as provided.
+PLOT_FLM_MODES=true           # Set to true to plot dominant f^2_{lm}(q) modes (spherical method only, requires f_lm_tensor in COMPUTE_MODES).
 
 # 3D plotting parameters.
 PLOT_3D_MODES=("modsq" "Re" "Im")  # Modes for 3D plots. Options: modsq (|f_S|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
@@ -270,7 +270,8 @@ else
         JULIA_CMD="$JULIA_CMD --N-phi $N_PHI"
         JULIA_CMD="$JULIA_CMD --l-max $L_MAX"
         JULIA_CMD="$JULIA_CMD --threshold $THRESHOLD"
-        JULIA_CMD="$JULIA_CMD --compute-mode $COMPUTE_MODE"
+        COMPUTE_MODE_ARG=$(IFS=','; echo "${COMPUTE_MODES[*]}")
+        JULIA_CMD="$JULIA_CMD --compute-mode \"$COMPUTE_MODE_ARG\""
 
         if [ "$FORCE_RECOMPUTATION" = true ]; then
             JULIA_CMD="$JULIA_CMD --force-recomputation"
@@ -341,8 +342,8 @@ echo "Step 3: Plot generation..."
 if [ "$SKIP_2D_PLOTS" = true ] && [ "$SKIP_3D_PLOTS" = true ]; then
     echo "  Skipping all plot generation."
     echo ""
-elif [ "$METHOD" = "spherical" ] && [ "${COMPUTE_MODE,,}" = "r_only" ]; then
-    echo "  Skipping plot generation (only R tensor was computed, no form factor grid available)."
+elif [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; then
+    echo "  Skipping plot generation (no form factor or f_lm tensor computed)."
     echo ""
 elif [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; then
     echo "  Skipping plot generation (only V tensors were computed, no form factor grid available)."
@@ -413,12 +414,12 @@ else
                 PLOT_CMD="$PLOT_CMD --modes ${PLOT_MODES[@]}"
             fi
 
-            if [ "$USE_TEX" = true ]; then
-                PLOT_CMD="$PLOT_CMD --use-tex"
-            fi
-
             if [ "$PLOT_TRANSITION_DENSITY" = true ]; then
                 PLOT_CMD="$PLOT_CMD --plot-transition-density"
+            fi
+
+            if [ "$PLOT_FLM_MODES" = true ]; then
+                PLOT_CMD="$PLOT_CMD --plot-flm-modes"
             fi
 
             # Add plot range limits if specified.
@@ -568,11 +569,11 @@ if [ $FORM_FACTOR_TIME -gt 0 ]; then
     echo "    │           └── fs_grid${PRECISION_SUFFIX}.h5"
 fi
 
-if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && [ "${COMPUTE_MODE,,}" = "r_only" ]; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
+if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
     echo "    │           └── form_factor_*.png"
 fi
 
-if [ "$SKIP_3D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && [ "${COMPUTE_MODE,,}" = "r_only" ]; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
+if [ "$SKIP_3D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
     echo "    │           └── form_factor_3d_*.html"
 fi
 

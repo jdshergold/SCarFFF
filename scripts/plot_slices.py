@@ -75,11 +75,6 @@ def parse_cli_args():
         help="What to plot. The options are modsq (|f_S|^2), Im (Im(f_S)), Re (Re (f_S)). Default: modsq.",
     )
     parser.add_argument(
-        "--use-tex",
-        action="store_true",
-        help="Use TeX for text rendering (requires TeX installation). Default is False.",
-    )
-    parser.add_argument(
         "--qx-range",
         type=str,
         default=None,
@@ -101,6 +96,11 @@ def parse_cli_args():
         "--plot-transition-density",
         action="store_true",
         help="Whether to plot the transition density (FFT method only).",
+    )
+    parser.add_argument(
+        "--plot-flm-modes",
+        action="store_true",
+        help="Whether to plot dominant f^2_{lm}(q) modes (spherical method only).",
     )
     parser.add_argument(
         "--x-range",
@@ -490,6 +490,50 @@ def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=N
     return coord1, coord2, plane_data, xlim, ylim
 
 
+
+def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
+    """
+    Plot the top N f^2_{lm}(q) modes by integrated absolute area on a single set of axes.
+    Lines are grouped by l (same colour) with distinct linestyles for different m.
+
+    # Arguments:
+    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - q_grid::np.ndarray: The |q| grid in keV.
+    - output_dir::Path: Directory to save the output plot.
+    - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
+    """
+    n_keys = f_lm.shape[1]
+    l_max = int(np.sqrt(n_keys)) - 1
+    areas = {}
+    for l in range(l_max + 1):
+        for m in range(-l, l + 1):
+            key = l * l + (l + m) + 1
+            areas[(l, m)] = np.trapz(np.abs(f_lm[:, key - 1]), q_grid)
+    top_modes = sorted(areas, key=areas.get, reverse=True)[:top_n]
+
+    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1)), (0, (3, 1, 1, 1, 1, 1))]
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    for i, (l, m) in enumerate(sorted(top_modes)):
+        key = l * l + (l + m) + 1
+        color = colors[i % len(colors)]
+        ls = linestyles[i % len(linestyles)]
+        label = rf"$({l},\,{m})$"
+        ax.plot(q_grid, f_lm[:, key - 1], lw=1.2, ls=ls, color=color, label=label)
+
+    ax.axhline(0, color="k", lw=0.8, ls="--")
+    ax.set_xlabel(r"$q\ [\mathrm{keV}]$")
+    ax.set_ylabel(r"$f^2_{\ell m}(q)$")
+    ax.set_xlim(q_grid[0], q_grid[-1])
+    ax.legend(fontsize=8, ncol=2, title=r"Dominant modes: $(\ell,\,m)$", title_fontsize=8)
+    fig.tight_layout()
+
+    fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     # Parse the command line arguments.
     args = parse_cli_args()
@@ -509,9 +553,10 @@ def main():
     # Set plotting parameters.
     mpl.rcParams.update(
         {
-            "text.usetex": args.use_tex,
-            "font.family": "serif",
-            "font.size": 11,
+            "font.family":      "serif",
+            "font.serif":       ["STIXGeneral", "Times New Roman", "DejaVu Serif"],
+            "mathtext.fontset": "stix",
+            "font.size":        11,
         }
     )
 
@@ -544,15 +589,27 @@ def main():
         # Read the form factor data from HDF5 file.
         with h5py.File(input_path, "r") as ff_file:
             if args.method == "spherical":
-                f_s = ff_file["f_s"][()]
-                theta_grid = ff_file["theta_grid"][()]
-                phi_grid = ff_file["phi_grid"][()]
                 q_grid = ff_file["q_grid"][()]
 
-                # Julia writes f_s with shape (n_q, n_theta, n_phi).
-                # Due to column-major/row-major differences, HDF5 reverses dimensions.
-                # Python reads as (n_phi, n_theta, n_q), so transpose to (n_theta, n_phi, n_q).
-                f_s = np.transpose(f_s, (1, 0, 2))
+                f_s = None
+                theta_grid = None
+                phi_grid = None
+                if "f_s" in ff_file:
+                    f_s = ff_file["f_s"][()]
+                    theta_grid = ff_file["theta_grid"][()]
+                    phi_grid = ff_file["phi_grid"][()]
+
+                    # Julia writes f_s with shape (n_q, n_theta, n_phi).
+                    # Due to column-major/row-major differences, HDF5 reverses dimensions.
+                    # Python reads as (n_phi, n_theta, n_q), so transpose to (n_theta, n_phi, n_q).
+                    f_s = np.transpose(f_s, (1, 0, 2))
+
+                # Load f_lm if requested, and transpose because of the usual Julia vs Python nonsense.
+                f_lm = None
+                if args.plot_flm_modes and "f_lm" in ff_file:
+                    f_lm = ff_file["f_lm"][()].T
+                elif args.plot_flm_modes:
+                    print(f"  Warning: f_lm not found for transition {tidx}. Was f_lm_tensor included in COMPUTE_MODES?")
                 
             elif args.method == "fft":
                 # Load form factor data.
@@ -593,7 +650,7 @@ def main():
 
         # Return data needed for plotting without re-reading from disk.
         if args.method == "spherical":
-            return [f_s, theta_grid, phi_grid, q_grid, output_dir]
+            return [f_s, theta_grid, phi_grid, q_grid, output_dir, f_lm if args.plot_flm_modes else None]
         elif args.method == "fft":
             return [None, None, None, None, form_factor, q_lim, output_dir, transition_density if args.plot_transition_density else None, r_lim if args.plot_transition_density else None]
         else:
@@ -604,6 +661,8 @@ def main():
 
     if args.method == "spherical":
         plots_to_generate.append(("form_factor", False))
+        if args.plot_flm_modes:
+            plots_to_generate.append(("flm_modes", False))
     elif args.method == "fft":
         plots_to_generate.append(("form_factor", False))
         if args.plot_transition_density:
@@ -621,10 +680,24 @@ def main():
         output_dir = run_outputs[4] if args.method == "spherical" else run_outputs[6]
 
         for plot_type, is_transition_density in plots_to_generate:
+            # Skip form factor plot if f_s wasn't computed.
+            if plot_type == "form_factor" and args.method == "spherical" and run_outputs[0] is None:
+                completed += 1
+                continue
+
             # Determine which modes to plot.
             if is_transition_density:
                 # We only plot the transition density, no modes.
                 modes_to_plot = [None]  # Single plot, no mode label.
+
+            # Plot the f_lm^2 coefficients.
+            elif plot_type == "flm_modes":
+                if run_outputs[5] is not None:
+                    plot_flm_modes(run_outputs[5], run_outputs[3], output_dir)
+                completed += 1
+                print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
+                continue
+
             else:
                 # For the form factor, plot the selected modes.
                 modes_to_plot = args.modes

@@ -5,10 +5,12 @@ module SparseTensors
 export SparseGauntArray, SparseATensor, SparseDTensor, SparseWTensor, lambda_mu_key, uvw_key
 
 # Precompute the (λ, μ) and (u, v, w) keys, and store them as constant arrays for speed.
-# We go up to u = v = w = λ = 12 here, corresponding to i-orbitals.
+# lambda_mu_key goes to λ = 30 (second axis covers μ offset up to 60) so that the f_lm
+# Gaunt precomputation, which uses λ up to l_max, works for l_max up to 30.
+# uvw_key goes to λ = 12 (i-orbitals), corresponding to i-orbitals.
 # These are slightly too large for StaticArrays to be useful.
 # Second axis indexes μ via the offset μ + λ, which matches how we look up bins.
-const lambda_mu_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:12, mu_offset in 0:24]
+const lambda_mu_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:30, mu_offset in 0:60]
 const uvw_key = Int[binomial(u + v + w + 2, 3) + (u * (u + v + w + 1) - (u * (u - 1)) ÷ 2 + v) + 1 for u in 0:12, v in 0:12, w in 0:12]
 
 struct SparseGauntArray{T<:AbstractFloat}

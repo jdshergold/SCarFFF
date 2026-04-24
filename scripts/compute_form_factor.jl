@@ -61,8 +61,8 @@ function parse_commandline()::Dict{String, Any}
             arg_type = Float64
             default = 1e-6
         "--compute-mode"
-            help = "What to compute/save. For spherical: R_only, form_factor, both. For Cartesian: V_only, form_factor, both."
-            default = "both"
+            help = "Comma-separated list of outputs to compute/save. Spherical options: form_factor, R_tensor, f_lm_tensor. Cartesian options: V_only, form_factor, both."
+            default = "form_factor,R_tensor"
         "--q-lim"
             help = "q-space limits in keV, comma-separated (e.g. 10,10,10) (FFT method)."
             default = "10,10,10"
@@ -250,17 +250,17 @@ function main()
             N_phi = args["N-phi"]
             l_max = args["l-max"]
             threshold_val = T(args["threshold"])
-            compute_mode_str = lowercase(args["compute-mode"])
-            # Determine what to compute based on compute_mode_str.
-            if compute_mode_str == "r_only"
-                need_grid, need_R = false, true
-            elseif compute_mode_str == "form_factor"
-                need_grid, need_R = true, false
-            elseif compute_mode_str == "both"
-                need_grid, need_R = true, true
-            else
-                error("Invalid compute-mode $(args["compute-mode"]). The options are \"form_factor\", \"R_only\", and \"both\".")
+            # Parse the compute-mode as a comma-separated list of outputs to compute/save.
+            valid_spherical_modes = Set(["form_factor", "R_tensor", "f_lm_tensor"])
+            compute_modes = Set(strip.(split(args["compute-mode"], ",")))
+            for mode in compute_modes
+                if !(mode in valid_spherical_modes)
+                    error("Invalid compute-mode '$(mode)'. Valid spherical options are: form_factor, R_tensor, f_lm_tensor.")
+                end
             end
+            need_grid = "form_factor" in compute_modes
+            need_R = "R_tensor" in compute_modes
+            need_flm = "f_lm_tensor" in compute_modes
 
             # Define the momentum grid.
             q_grid = collect(range(typed_zero, T(q_max), length=N_q))
@@ -283,7 +283,7 @@ function main()
             println("      φ ∈ [0, 2π] with $(N_phi) points.")
 
             # Compute the spherical form factor.
-            R_tensor, f_s, transition_energies_eV = compute_spherical_form_factor(
+            R_tensor, f_s, f_lm, transition_energies_eV = compute_spherical_form_factor(
                 q_grid,
                 theta_grid,
                 phi_grid,
@@ -294,7 +294,8 @@ function main()
                 threshold=threshold_val,
                 use_gpu=use_gpu,
                 need_grid=need_grid,
-                need_R=need_R
+                need_R=need_R,
+                need_flm=need_flm
             )
 
             # Run the benchmark. Testing only.
@@ -311,7 +312,8 @@ function main()
                     threshold=$threshold_val,
                     use_gpu=$use_gpu,
                     need_grid=$need_grid,
-                    need_R=$need_R
+                    need_R=$need_R,
+                    need_flm=$need_flm
                 )
             end
 
@@ -336,6 +338,10 @@ function main()
                     if R_tensor !== nothing
                         R_slice = R_tensor[batch_idx, :, :]
                         write(io, "R_tensor", R_slice)
+                    end
+                    if f_lm !== nothing
+                        f_lm_slice = f_lm[batch_idx, :, :]
+                        write(io, "f_lm", f_lm_slice)
                     end
                     write(io, "q_grid", q_grid)
                     write(io, "transition_index", transition_idx)

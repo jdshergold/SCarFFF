@@ -13,6 +13,7 @@ include("ConstructRTensor.jl")
 include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
+include("ConstructFLMTensor.jl")
 
 using CUDA
 using .ReadBasisSet: get_molecular_data, MoleculeData
@@ -90,7 +91,8 @@ function compute_spherical_form_factor(
         use_gpu::Bool = false,
         need_grid::Bool = true,
         need_R::Bool = true,
-    )::Tuple{Union{Array{Complex{T}, 3}, Nothing}, Union{Array{Complex{T}, 4}, Nothing}, Vector{T}} where {T<:AbstractFloat}
+        need_flm::Bool = true,
+    )::Tuple{Union{Array{Complex{T}, 3}, Nothing}, Union{Array{Complex{T}, 4}, Nothing}, Union{Array{T, 3}, Nothing}, Vector{T}} where {T<:AbstractFloat}
     """
     Compute the spherical form factor f_s(q, θ, ϕ) on a spherical grid up to some angular mode ℓ_max.
 
@@ -106,10 +108,12 @@ function compute_spherical_form_factor(
     - use_gpu::Bool: Whether to use the GPU for steps beyond the W tensor (default: false).
     - need_grid::Bool: Whether to contract the R tensor to compute the form factor on the grid (default: true).
     - need_R::Bool: Whether to save the R tensor (default: true).
+    - need_flm::Bool: Whether to compute the f_lm tensor (default: false).
 
     # Returns:
     - R_tensor::Union{Array{Complex{T}, 3}, Nothing}: The prefactored R tensor keyed by ℓ^2 + (ℓ + m) + 1, or nothing if not requested for saving.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The form factor on the (q, θ, ϕ) grid with shape (n_transitions, n_q, n_θ, n_ϕ), or nothing if not requested.
+    - f_lm::Union{Array{Complex{T}, 3}, Nothing}: The f_lm tensor, the ``squared'' verision of the R tensor, with shape (n_transitions, n_q, n_flm_keys), or nothing if not requested.
     - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
     """
 
@@ -136,6 +140,14 @@ function compute_spherical_form_factor(
         precompute_A_tensor(lambda_max, A_tensor_path, T)
     end
 
+    # Precompute Gaunt coefficients for the f_lm tensor if requested and if they do not already exist.
+    if need_flm
+        gaunt_flm_path = joinpath(data_dir, "gaunt_coefficients", "gaunt_coefficients_flm_lmax$(l_max)$(type_suffix).h5")
+        if force_recomputation || !isfile(gaunt_flm_path)
+            precompute_gaunt_coefficients(l_max, l_max, l_max, gaunt_flm_path, T)
+        end
+    end
+
     # Construct pair coefficients.
     M_ij, sigma_ij, R_ij, R_ij_mod, R_ij_hat = construct_pair_coefficients(mol)
 
@@ -154,6 +166,7 @@ function compute_spherical_form_factor(
 
     R_lm = nothing
     f_s = nothing
+    f_lm = nothing
 
     if use_gpu
         # Now construct the R tensor on the GPU.
@@ -210,16 +223,22 @@ function compute_spherical_form_factor(
             f_s = contract_spherical_grid(R_lm, theta_grid, phi_grid)
         end
 
+        if need_flm
+            # Construct the f_lm tensor.
+            f_lm = ConstructFLMTensor.construct_f_lm_tensor(R_lm, gaunt_flm_path)
+        end
+
         # Unset R_lm if we don't want to save it.
         if !need_R
             R_lm = nothing
         end
+        
     end
 
     # Extract the transition energies for the requested transitions.
     transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
 
-    return R_lm, f_s, transition_energies_eV
+    return R_lm, f_s, f_lm, transition_energies_eV
 end
 
 end
