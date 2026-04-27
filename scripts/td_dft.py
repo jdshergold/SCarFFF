@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import h5py
 import numpy as np
 import os
+import psutil
 from sklearn.cluster import MeanShift
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
@@ -403,6 +404,15 @@ def plot_molecule_3d_interactive(coordinates, output_directory="."):
     print(f"3D molecule plot saved to {output_directory}/molecule_3d.html.")
 
 
+def get_max_memory_mb():
+    # In a Slurm job, SLURM_MEM_PER_NODE is the allocated memory in MB — use 90% of it.
+    slurm_mem = os.environ.get("SLURM_MEM_PER_NODE")
+    if slurm_mem:
+        return int(int(slurm_mem) * 0.9)
+    # Otherwise use 80% of currently available system memory.
+    return int(psutil.virtual_memory().available / 1024**2 * 0.8)
+
+
 def create_pyscf_mol(coordinates, basis="ccpvdz"):
     """Create a PySCF molecule object with the optimised geometry.
 
@@ -418,6 +428,7 @@ def create_pyscf_mol(coordinates, basis="ccpvdz"):
     mol.atom = coordinates
     mol.basis = basis
     mol.symmetry = False  # True
+    mol.max_memory = get_max_memory_mb()
     mol.build()
     return mol
 
