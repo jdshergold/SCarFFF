@@ -195,8 +195,18 @@ function compute_spherical_form_factor(
             CUDA.unsafe_free!(f_s_gpu)
         end
 
-        if need_R
+        if need_R || need_flm
             R_lm = combine_gpu_R_tensor(R_lm_pos, R_lm_neg, l_max)
+        end
+
+        if need_flm
+            # Construct the f_lm tensor on the CPU from the combined R tensor.
+            f_lm = ConstructFLMTensor.construct_f_lm_tensor(R_lm, gaunt_flm_path)
+        end
+
+        # Unset R_lm if we only needed it as an intermediate for f_lm.
+        if !need_R
+            R_lm = nothing
         end
 
         CUDA.unsafe_free!(R_lm_pos)
