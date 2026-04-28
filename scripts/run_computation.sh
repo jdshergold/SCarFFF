@@ -127,6 +127,13 @@ format_time() {
     fi
 }
 
+lowercase() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+CARTESIAN_COMPUTE_MODE_LC="$(lowercase "$CARTESIAN_COMPUTE_MODE")"
+TRANSITION_INDICES_LC="$(lowercase "$TRANSITION_INDICES")"
+
 # Remove any CUDA entries from paths so that julia stops complaining.
 strip_cuda_from_path_var() {
     local var_name=$1
@@ -356,7 +363,7 @@ if [ "$SKIP_2D_PLOTS" = true ] && [ "$SKIP_3D_PLOTS" = true ]; then
 elif [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; then
     echo "  Skipping plot generation (no form factor or f_lm tensor computed)."
     echo ""
-elif [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; then
+elif [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; then
     echo "  Skipping plot generation (only V tensors were computed, no form factor grid available)."
     echo ""
 else
@@ -385,7 +392,7 @@ else
 
         # Determine which transitions to plot.
         TRANSITIONS_TO_PLOT=()
-        if [ "${TRANSITION_INDICES,,}" = "all" ]; then
+        if [ "$TRANSITION_INDICES_LC" = "all" ]; then
             for dir in "$MOL_DIR/$METHOD"/transition_*; do
                 [ -d "$dir" ] || continue
                 tidx=$(basename "$dir" | cut -d'_' -f2)
@@ -533,7 +540,7 @@ fi
 
 # Ensure that the transition list is populated for any downstream steps.
 if [ ${#TRANSITIONS_TO_PLOT[@]} -eq 0 ]; then
-    if [ "${TRANSITION_INDICES,,}" = "all" ]; then
+    if [ "$TRANSITION_INDICES_LC" = "all" ]; then
         # Use molecule 1's directory to find the transitions.
         for dir in "$RUN_DIR/1/$METHOD"/transition_*; do
             [ -d "$dir" ] || continue
@@ -584,11 +591,11 @@ if [ $FORM_FACTOR_TIME -gt 0 ]; then
     echo "    │           └── fs_grid${PRECISION_SUFFIX}.h5"
 fi
 
-if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
+if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
     echo "    │           └── form_factor_*.png"
 fi
 
-if [ "$SKIP_3D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; } && ! { [ "$METHOD" = "cartesian" ] && [ "${CARTESIAN_COMPUTE_MODE,,}" = "v_only" ]; }; then
+if [ "$SKIP_3D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
     echo "    │           └── form_factor_3d_*.html"
 fi
 
