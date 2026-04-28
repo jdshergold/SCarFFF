@@ -54,7 +54,7 @@ def parse_cli_args():
         type=str,
         default="modsq",
         choices=["modsq", "Re", "Im"],
-        help="What to plot. The options are modsq (|f_S|^2), Im (Im(f_S)), Re (Re(f_S)). Default: modsq.",
+        help="What to plot. The options are modsq (|f_s|^2), Im (Im(f_s)), Re (Re(f_s)). Default: modsq.",
     )
     parser.add_argument(
         "--min-fraction",
@@ -386,17 +386,17 @@ def extract_domain_data(data, mode, is_transition_density):
     else:
         if mode == "modsq":
             plot_data = np.abs(data) ** 2
-            label = "|f_S(q)|^2"
+            label = "|f_s(q)|^2"
             colorscale = "Viridis"
             symmetric = False
         elif mode == "Im":
             plot_data = np.imag(data)
-            label = "Im[f_S(q)]"
+            label = "Im[f_s(q)]"
             colorscale = "RdBu_r"
             symmetric = True
         elif mode == "Re":
             plot_data = np.real(data)
-            label = "Re[f_S(q)]"
+            label = "Re[f_s(q)]"
             colorscale = "RdBu_r"
             symmetric = True
         else:
@@ -500,7 +500,7 @@ def create_isosurface_plot(coord1_mesh, coord2_mesh, coord3_mesh, data, label, c
                 **shared_kwargs,
             )
         )
-    else:  # For |f_S|^2.
+    else:  # For |f_s|^2.
 
         # Set up the levels to plot.
         max_level = data_max * max_fraction

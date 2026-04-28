@@ -92,9 +92,9 @@ function check_parseval_theorem(
     """
     Check that Parseval's theorem holds for the FFT. That is, we check that:
 
-        ∫ |ρ(r)|^2 d^3r = (1/(2π)³) ∫ |f_S(q)|^2 d^3q,
+        ∫ |ρ(r)|^2 d^3r = (1/(2π)³) ∫ |f_s(q)|^2 d^3q,
 
-    holds where ρ(r) is the transition density and f_S(q) is the form factor.
+    holds where ρ(r) is the transition density and f_s(q) is the form factor.
 
     # Arguments:
     - transition_density::Array{T, 3}: The transition density.

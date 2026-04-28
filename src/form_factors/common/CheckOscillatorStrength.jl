@@ -74,7 +74,7 @@ end
     """
     Perform the angular average of the squared form factor |f_s(q, θ, ϕ)|^2 over the spherical angles θ and ϕ:
 
-        <|f_s(q)|^2>_Ω = (1/4π) ∫_0^{2π} dϕ ∫_0^π dθ sin(θ) |f_S|^2.
+        <|f_s(q)|^2>_Ω = (1/4π) ∫_0^{2π} dϕ ∫_0^π dθ sin(θ) |f_s|^2.
 
     We do this in place to avoid allocating the output array.
 
@@ -267,7 +267,7 @@ function compute_oscillator_strength(h5_file_path::String, q_max_fit::Real; meth
         end
 
         # Compute the angular averaged form factor squared for the first q-points up to q_max_fit using Simpson's rule.
-        # First allocate an array to hold |f_S|^2 for the subset of q values.
+        # First allocate an array to hold |f_s|^2 for the subset of q values.
         n_theta = size(f_s, 2)
         n_phi = size(f_s, 3)
         f_s_sq_subset = Array{T, 3}(undef, n_q, n_theta, n_phi)

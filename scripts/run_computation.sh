@@ -15,12 +15,12 @@ CSV_FILE=""                 # Path to CSV file containing SMILES strings. Leave 
 SMILES="C1=CC=CC=C1" # SMILES string for the molecule. This is ignored if CSV_FILE is specified.
 
 # ==== TD-DFT parameters. ====
-BASIS="def2-svpd"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="def2-svp"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
-DFT_OPTIMISATION=true    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
+DFT_OPTIMISATION=false    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
 PLOT_MOLECULE_3D=false    # Set to true to generate interactive 3D molecule plot from TD-DFT.
 
 # ==== Form factor computation parameters. ====
@@ -29,13 +29,18 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
 Q_MAX=20.0                 # Maximum momentum transfer in keV.
-N_Q=201                    # Number of |q| grid points.
-N_THETA=201                # Number of theta (polar angle) grid points.
-N_PHI=201                  # Number of phi (azimuthal angle) grid points.
+N_Q=101                    # Number of |q| grid points.
+N_THETA=101                # Number of theta (polar angle) grid points.
+N_PHI=101                  # Number of phi (azimuthal angle) grid points.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
 COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
+
+# ==== Rate computation parameters (spherical method only). ====
+COMPUTE_RATES=true        # Set to true to compute DM scattering rates after the spherical form factor.
+M_GRID="1.0,1000.0,50"   # DM mass grid to use, in the form min_MeV,max_MeV,N (log-spaced). Only used if COMPUTE_RATES=true.
+N_ROTATIONS="12,6,12"     # Number of detector rotations to consider (n_alpha,n_beta,n_gamma). Only used if COMPUTE_RATES=true.
 
 # ==== FFT method parameters. ====
 Q_LIM="15.0,15.0,15.0"           # q-space limits in keV, comma-separated (qx_max, qy_max, qz_max).
@@ -57,7 +62,7 @@ USE_GPU=false              # Set to true to enable GPU acceleration for the DFT 
 
 # ==== Control flags. ====
 SKIP_TDDFT=true            # Set to true to skip the TD-DFT calculation. Will not be skipped if the results do not already exist.
-SKIP_FORM_FACTOR=true     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
+SKIP_FORM_FACTOR=false     # Set to true to skip the form factor computation. Will not be skipped if the results do not already exist.
 SKIP_2D_PLOTS=false        # Set to true to skip 2D slice plot generation.
 SKIP_3D_PLOTS=true         # Set to true to skip 3D isosurface plot generation.
 FORCE_RECOMPUTATION=false  # Set to true to force recomputation of A and Gaunt coefficients in the form factor computation.
@@ -76,7 +81,7 @@ PLOT_MODES=("modsq" "Re" "Im")  # What to plot. Options: modsq (|f_s|^2), Re (re
 PLOT_FLM_MODES=true           # Set to true to plot dominant f^2_{lm}(q) modes (spherical method only, requires f_lm_tensor in COMPUTE_MODES).
 
 # 3D plotting parameters.
-PLOT_3D_MODES=("modsq" "Re" "Im")  # Modes for 3D plots. Options: modsq (|f_S|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
+PLOT_3D_MODES=("modsq" "Re" "Im")  # Modes for 3D plots. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
 PLOT_3D_MIN_FRACTION=0.15 # Minimum isosurface level as a fraction of maximum.
 PLOT_3D_MAX_FRACTION=0.95 # Maximum isosurface level as a fraction of maximum.
 PLOT_3D_GRID_SIZE=75      # Target grid (x,y,z) size for downsampling. Setting this too large will make the plots laggy.
@@ -273,6 +278,12 @@ else
         COMPUTE_MODE_ARG=$(IFS=','; echo "${COMPUTE_MODES[*]}")
         JULIA_CMD="$JULIA_CMD --compute-mode \"$COMPUTE_MODE_ARG\""
 
+        if [ "$COMPUTE_RATES" = true ]; then
+            JULIA_CMD="$JULIA_CMD --compute-rates"
+            JULIA_CMD="$JULIA_CMD --m-grid $M_GRID"
+            JULIA_CMD="$JULIA_CMD --N-rotations $N_ROTATIONS"
+        fi
+
         if [ "$FORCE_RECOMPUTATION" = true ]; then
             JULIA_CMD="$JULIA_CMD --force-recomputation"
         fi
@@ -420,6 +431,10 @@ else
 
             if [ "$PLOT_FLM_MODES" = true ]; then
                 PLOT_CMD="$PLOT_CMD --plot-flm-modes"
+            fi
+
+            if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+                PLOT_CMD="$PLOT_CMD --plot-rates"
             fi
 
             # Add plot range limits if specified.

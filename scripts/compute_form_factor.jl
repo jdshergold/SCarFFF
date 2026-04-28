@@ -9,7 +9,7 @@ using DataFrames
 using CUDA
 
 # Import everything that we need from SCarFFF.
-using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor
+using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates
 
 function parse_commandline()::Dict{String, Any}
     """
@@ -98,6 +98,15 @@ function parse_commandline()::Dict{String, Any}
             action = :store_true
         "--output-dir"
             help = "Output directory for this run (e.g., ../runs/run_name). If not specified, defaults to ../runs/{smiles} for a single molecule."
+            default = nothing
+        "--compute-rates"
+            help = "Whether to compute DM scattering rates after the spherical form factor (spherical method only). Requires f_lm_tensor to be available."
+            action = :store_true
+        "--m-grid"
+            help = "DM mass grid for rate computation: 'min_MeV,max_MeV,N' (log-spaced). E.g. '1.0,1000.0,100'."
+            default = "1.0,1000.0,100"
+        "--N-rotations"
+            help = "Number of detector rotations (n_alpha,n_beta,n_gamma) for rate computation. E.g. '12,6,12'. If omitted, uses identity rotation only."
             default = nothing
     end
 
@@ -261,6 +270,10 @@ function main()
             need_grid = "form_factor" in compute_modes
             need_R = "R_tensor" in compute_modes
             need_flm = "f_lm_tensor" in compute_modes
+            compute_rates_flag = args["compute-rates"]
+            if compute_rates_flag
+                need_flm = true  # f_lm tensor is required for rate computation.
+            end
 
             # Define the momentum grid.
             q_grid = collect(range(typed_zero, T(q_max), length=N_q))
@@ -297,6 +310,27 @@ function main()
                 need_R=need_R,
                 need_flm=need_flm
             )
+
+            rate_results = nothing
+
+            # Compute DM scattering rates if requested.
+            if compute_rates_flag && f_lm !== nothing
+                m_vals_str = split(args["m-grid"], ",")
+                m_min = parse(Float64, m_vals_str[1])
+                m_max = parse(Float64, m_vals_str[2])
+                n_masses = parse(Int, m_vals_str[3])
+                m_grid = T.(10 .^ range(log10(m_min), log10(m_max), n_masses))
+
+                N_rotations_arg = args["N-rotations"]
+                N_rotations = if N_rotations_arg !== nothing
+                    n = parse.(Int, split(N_rotations_arg, ","))
+                    (n[1], n[2], n[3])
+                else
+                    nothing
+                end
+
+                rate_results = compute_rates(f_lm, q_grid, m_grid, T.(transition_energies_eV), N_rotations)
+            end
 
             # Run the benchmark. Testing only.
             if run_benchmark
@@ -346,6 +380,26 @@ function main()
                     write(io, "q_grid", q_grid)
                     write(io, "transition_index", transition_idx)
                     write(io, "transition_energy_eV", transition_energy)
+                end
+            end
+
+            if rate_results !== nothing
+                spherical_output_dir = joinpath(mol_output_dir, "spherical")
+                mkpath(spherical_output_dir)
+
+                mchi_vals = T[row.mchi_MeV for row in rate_results]
+                rate_max_vals = T[row.rate_max for row in rate_results]
+                rate_min_vals = T[row.rate_min for row in rate_results]
+                rate_mean_vals = T[row.rate_mean for row in rate_results]
+                qmax_keV = q_grid[end]
+
+                rates_h5_path = joinpath(spherical_output_dir, "scattering_rates$(type_suffix).h5")
+                h5open(rates_h5_path, "w") do io
+                    write(io, "mchi_MeV", mchi_vals)
+                    write(io, "rate_max", rate_max_vals)
+                    write(io, "rate_min", rate_min_vals)
+                    write(io, "rate_mean", rate_mean_vals)
+                    write(io, "qmax_keV", qmax_keV)
                 end
             end
         elseif method == "fft"

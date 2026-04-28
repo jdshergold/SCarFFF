@@ -14,6 +14,7 @@ include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
 include("ConstructFLMTensor.jl")
+include("ComputeRates.jl")
 
 using CUDA
 using .ReadBasisSet: get_molecular_data, MoleculeData
@@ -26,9 +27,11 @@ using .ConstructWTensor: construct_W_tensor
 using .ConstructRTensor: construct_R_tensor
 using .ContractSphericalGrid: contract_spherical_grid
 
+using .ComputeRates: compute_rates
+
 using BenchmarkTools
 
-export compute_spherical_form_factor
+export compute_spherical_form_factor, compute_rates
 
 @inline function combine_gpu_R_tensor(R_pos, R_neg, l_max::Int)
     """

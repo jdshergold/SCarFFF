@@ -72,7 +72,7 @@ def parse_cli_args():
         nargs="+",
         default=["modsq"],
         choices=["modsq", "Im", "Re"],
-        help="What to plot. The options are modsq (|f_S|^2), Im (Im(f_S)), Re (Re (f_S)). Default: modsq.",
+        help="What to plot. The options are modsq (|f_s|^2), Im (Im(f_s)), Re (Re (f_s)). Default: modsq.",
     )
     parser.add_argument(
         "--qx-range",
@@ -101,6 +101,11 @@ def parse_cli_args():
         "--plot-flm-modes",
         action="store_true",
         help="Whether to plot dominant f^2_{lm}(q) modes (spherical method only).",
+    )
+    parser.add_argument(
+        "--plot-rates",
+        action="store_true",
+        help="Whether to plot DM scattering rates (spherical method only).",
     )
     parser.add_argument(
         "--x-range",
@@ -369,17 +374,17 @@ def extract_domain_data(data, mode):
         # The form factor is complex-valued and dimensionless.
         if mode == "modsq":
             plot_data = np.abs(data) ** 2
-            label = r"$|f_S(\mathbf{q})|^2$"
+            label = r"$|f_s(\mathbf{q})|^2$"
             cmap = "viridis"
             symmetric = False
         elif mode == "Im":
             plot_data = np.imag(data)
-            label = r"$\mathrm{Im}[f_S(\mathbf{q})]$"
+            label = r"$\mathrm{Im}[f_s(\mathbf{q})]$"
             cmap = "RdBu_r"
             symmetric = True
         elif mode == "Re":
             plot_data = np.real(data)
-            label = r"$\mathrm{Re}[f_S(\mathbf{q})]$"
+            label = r"$\mathrm{Re}[f_s(\mathbf{q})]$"
             cmap = "RdBu_r"
             symmetric = True
         else:
@@ -534,6 +539,52 @@ def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
     plt.close(fig)
 
 
+def plot_scattering_rates(spherical_dir):
+    """
+    Plot the DM scattering rates as a function of DM mass.
+
+    # Arguments:
+    - spherical_dir::Path: Directory containing the scattering_rates HDF5 file.
+    """
+    input_path = None
+    for candidate in [
+        spherical_dir / "scattering_rates_f64.h5",
+        spherical_dir / "scattering_rates_f32.h5",
+    ]:
+        if candidate.exists():
+            input_path = candidate
+            break
+
+    if input_path is None:
+        print("  Warning: scattering rates not found. Was COMPUTE_RATES=true?")
+        return False
+
+    with h5py.File(input_path, "r") as rate_file:
+        mchi = rate_file["mchi_MeV"][()]
+        rate_max = rate_file["rate_max"][()]
+        rate_min = rate_file["rate_min"][()]
+        rate_mean = rate_file["rate_mean"][()]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    ax.plot(mchi, rate_max, lw=1.2, ls="-",  color=colors[0], label=r"Maximum")
+    ax.plot(mchi, rate_min, lw=1.2, ls="--", color=colors[1], label=r"Minimum")
+    ax.plot(mchi, rate_mean, lw=1.2, ls="-.", color=colors[2], label=r"Mean")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$m_\chi\ [\mathrm{MeV}]$")
+    ax.set_ylabel(r"Dimensionless rate")
+    ax.set_xlim(mchi[0], mchi[-1])
+    ax.legend(fontsize=8, ncol=3)
+    fig.tight_layout()
+
+    fig.savefig(spherical_dir / "scattering_rates.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def main():
     # Parse the command line arguments.
     args = parse_cli_args()
@@ -670,8 +721,16 @@ def main():
     elif args.method == "cartesian":
         plots_to_generate.append(("form_factor", False))
     
-    total_plots = len(plots_to_generate) * len(transitions_to_plot)
+    plot_rates = args.method == "spherical" and args.plot_rates
+    total_plots = len(plots_to_generate) * len(transitions_to_plot) + int(plot_rates)
     completed = 0
+
+    if plot_rates:
+        if plot_scattering_rates(runs_dir / args.method):
+            completed += 1
+            print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
+        else:
+            total_plots -= 1
 
     for tidx in transitions_to_plot:
         run_outputs = plot_transition(tidx)
