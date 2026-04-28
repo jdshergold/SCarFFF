@@ -5,12 +5,76 @@ module ComputeRates
 using Base.Threads
 using VectorSpaceDarkMatter
 using Quaternionic
+import LinearAlgebra: mul!
 import Logging: NullLogger, with_logger
 
 include("../../utils/DMModels.jl")
 using .DMModels: spherical_halo, v_max
 
 const VSDM = VectorSpaceDarkMatter
+const G_CACHE = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
+
+function precompute_G_cache(R_arr, l_max::Int)
+    """
+    Precompute the real spherical harmonic rotation matrices used by VSDM. Each
+    column is the flattened G matrix for one detector orientation.
+
+    # Arguments:
+    - R_arr: The detector rotation grid.
+    - l_max::Int: The maximum angular momentum.
+
+    # Returns:
+    - G_cache::Matrix{Float64}: The cached G matrices with dimensions (N_G, N_rotations).
+    """
+
+    # Preallocate the cache arrays.
+    N_rotations = length(R_arr)
+    N_G = VSDM.WignerDsize(l_max)
+    G_cache = Matrix{Float64}(undef, N_G, N_rotations)
+    N_tasks = min(nthreads(), N_rotations) # Set the number of threads to use.
+    null_logger = NullLogger()
+
+    # Compute the G matrix for each rotation once, then reuse it for all masses.
+    # Use the logger to suppress SphericalFunctions warnings.
+    with_logger(null_logger) do
+        @threads for task_idx in 1:N_tasks
+            # Allocate a different vector for each thread since they are modified in place.
+            D = VSDM.D_prep(l_max)
+            G = zeros(Float64, N_G)
+
+            @inbounds for rotation_idx in task_idx:N_tasks:N_rotations
+                VSDM.D_matrices!(D, R_arr[rotation_idx])
+                VSDM.G_matrices!(G, D)
+                for G_idx in eachindex(G)
+                    G_cache[G_idx, rotation_idx] = G[G_idx]
+                end
+            end
+        end
+    end
+
+    return G_cache
+end
+
+function get_G_cache(R_arr, l_max::Int)
+    """
+    Get the cached G matrices for a rotation grid. The cache is shared across
+    molecules in the same Julia process.
+
+    # Arguments:
+    - R_arr: The detector rotation grid.
+    - l_max::Int: The maximum angular momentum.
+
+    # Returns:
+    - G_cache::Matrix{Float64}: The cached G matrices with dimensions (N_G, N_rotations).
+    """
+
+    # In a batch run, all molecules use the same l_max and rotation grid.
+    if G_CACHE[] === nothing
+        G_CACHE[] = precompute_G_cache(R_arr, l_max)
+    end
+
+    return G_CACHE[]
+end
 
 function to_tophat(flm::Array{T, 3}) where {T<:AbstractFloat}
     """
@@ -114,6 +178,9 @@ function compute_rates(
         R_arr = vec([from_euler_angles(α, β, γ) for α in α_vals, β in β_vals, γ in γ_vals])
     end
 
+    # Get the cached G matrices, or compute them for the first time.
+    G_cache = get_G_cache(R_arr, l_max)
+
     # Construct the projected form factor objects that VSDM expects.
     lm = VSDM.LM_vals(l_max)
     fs_list = Vector{VSDM.ProjectedF{Float64, typeof(q_basis)}}(undef, N_transitions)
@@ -125,12 +192,13 @@ function compute_rates(
     # Here n_v is the number of tophat bins, so VSDM wants n_max = n_v - 1.
     v_tophat = VSDM.ProjectF(model,(n_v-1,l_max),v_basis)
 
-    # Compute dimensionless the scattering rate here using VSDM.
+    # Compute the dimensionless scattering rate here using VSDM.
     # The orientation is a single physical crystal orientation, so rates from
-    # all transitions are summed at each R before taking the max.
+    # all transitions are summed for each R before taking the max.
     mSM = VSDM.mElec
     N_rotations = length(R_arr)
     inv_N_rotations = inv(Float64(N_rotations))
+    G_cache_transpose = transpose(G_cache)
     transition_energies_eV = Float64.(transition_energies)
     null_logger = NullLogger()
     results = Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}(undef, length(m_grid))
@@ -145,7 +213,8 @@ function compute_rates(
         with_logger(null_logger) do
             for transition_idx in 1:N_transitions
                 dm_model = VSDM.ModelDMSM(0, mchi, mSM, transition_energies_eV[transition_idx] * VSDM.eV)
-                total_rate .+= VSDM.rate(R_arr, dm_model, v_tophat, fs_list[transition_idx])
+                mcK = VSDM.get_mcalK(dm_model, v_tophat, fs_list[transition_idx]; use_measurements=false)
+                mul!(total_rate, G_cache_transpose, mcK.K, 1.0, 1.0)
             end
         end
 
@@ -172,117 +241,3 @@ end
 
 
 end
-
-"""
-# Testing.
-
-if abspath(PROGRAM_FILE) == @__FILE__
-    using HDF5
-    using Quaternionic
-    using VectorSpaceDarkMatter
-    import Logging: with_logger, NullLogger
-
-    const VSDM = VectorSpaceDarkMatter
-
-    # Collect all transition directories under runs/flmsq_test/1/spherical/.
-    project_root = normpath(joinpath(@__DIR__, "..", "..", ".."))
-    default_spherical_dir = joinpath(project_root, "runs", "flmsq_test", "1", "spherical")
-    spherical_dir = isempty(ARGS) ? default_spherical_dir : ARGS[1]
-
-    transition_paths = sort(filter(
-        p -> isfile(joinpath(p, "fs_grid_f32.h5")),
-        readdir(spherical_dir, join=true),
-    ))
-    isempty(transition_paths) && error("No transition directories found in spherical_dir")
-    println("Found (length(transition_paths)) transitions.")
-
-    # Load all transition form factors and convert to tophat.
-    pfq_list = ProjectedF[]
-    transition_energies = Float64[]
-
-    for tpath in transition_paths
-        f_lm, q_grid, dE = h5open(joinpath(tpath, "fs_grid_f32.h5"), "r") do file
-            read(file["f_lm"]), read(file["q_grid"]), read(file["transition_energy_eV"])
-        end
-        f_lm_tensor = ndims(f_lm) == 2 ? reshape(f_lm, 1, size(f_lm, 1), size(f_lm, 2)) : f_lm
-        tophat = ComputeRates.to_tophat(f_lm_tensor)
-
-        # Drop transition index for now.
-        tophat = reshape(tophat, size(tophat, 2), size(tophat, 3))
-
-        q_max = q_grid[end] * VSDM.keV # In keV.
-        local lmax = sqrt(size(f_lm_tensor, 3)) - 1
-        x_grid = q_grid ./ q_grid[end]
-
-        q_basis = VSDM.Tophat(x_grid, q_max)
-        lm = VSDM.LM_vals(Int(lmax))
-
-        push!(pfq_list, VSDM.ProjectedF(Float64.(tophat), lm, q_basis))
-        push!(transition_energies, Float64(dE))
-    end
-
-    mSM = VSDM.mElec
-
-    # Spherical halo model definition here:
-
-    v0 = 220.0 * VSDM.km_s
-    ve = 230.0 * VSDM.km_s
-    v_max = 960.0 * VSDM.km_s
-
-    function shm(v0, ve)
-        return VSDM.GaussianF(1.0, [ve, 0.0, 0.0], v0 / sqrt(2))
-    end
-
-    # Get the gchi tophat functions here using VSDM.
-    n_v = size(pfq_list[1].fnlm, 1)
-    lmax = maximum(lm[1] for pf in pfq_list for lm in pf.lm)
-    v_grid = collect(range(0.0, 1.0, n_v + 1))
-    v_basis = VSDM.Tophat(v_grid, v_max)
-    pfv = VSDM.ProjectF(shm(v0, ve), (n_v - 1, lmax), v_basis)
-
-    # Compute dimensionless scattering rate here using VSDM.
-    # Sweep over orientations using ZYZ Euler angles (α, β, γ).
-    # The orientation is a single physical crystal orientation, so rates from
-    # all transitions are summed at each R before taking the max.
-    n_α, n_β, n_γ = 12, 6, 12
-    α_vals = range(0, 2π, n_α + 1)[1:end-1]
-    β_vals = range(0, π,  n_β + 1)[1:end-1]
-    γ_vals = range(0, 2π, n_γ + 1)[1:end-1]
-    R_arr = vec([from_euler_angles(α, β, γ)
-                 for α in α_vals, β in β_vals, γ in γ_vals])
-
-    # Sweep over DM masses. For each mass, sum rates over all transitions at
-    # each orientation, then record the max/min/mean over orientations.
-    # Each mass point is independent so the outer loop is threaded.
-    mχ_vals_MeV = 10 .^ range(log10(1.0), log10(1000.0), 100)
-    results = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, length(mχ_vals_MeV))
-
-    Threads.@threads for i in eachindex(mχ_vals_MeV)
-        mχ_MeV = mχ_vals_MeV[i]
-        mχ = mχ_MeV * VSDM.MeV
-        Γ_total = zeros(length(R_arr))
-        for (pfq, dE) in zip(pfq_list, transition_energies)
-            model = VSDM.ModelDMSM(0, mχ, mSM, dE * VSDM.eV)
-            Γ_total .+= with_logger(NullLogger()) do
-                VSDM.rate(R_arr, model, pfv, pfq)
-            end
-        end
-        results[i] = (mχ_MeV, maximum(Γ_total), minimum(Γ_total),
-                      sum(Γ_total) / length(Γ_total))
-        println("mχ = (round(mχ_MeV, digits=2)) MeV  Γ_max = (results[i][2])")
-    end
-
-    # Save to CSV.
-    output_path = joinpath(spherical_dir, "max_rates.csv")
-    open(output_path, "w") do io
-        println(io, "# vmax_c=(v_max),qmax_eV=(pfq_list[1].radial_basis.umax)")
-        println(io, "mchi_MeV,rate_max,rate_min,rate_mean")
-        for (mχ_MeV, r_max, r_min, r_mean) in results
-            println(io, "mχ_MeV,r_max,r_min,r_mean")
-        end
-    end
-    println("Saved to output_path")
-
-
-end
-"""
