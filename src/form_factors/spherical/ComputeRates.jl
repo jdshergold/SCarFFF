@@ -128,14 +128,14 @@ function to_tophat(flm::Array{T, 3}) where {T<:AbstractFloat}
     return tophat
 end
 
-function compute_rates(
+function compute_rates_by_orientation(
         flm::Array{T,3},
         q_grid::Vector{T},
         m_grid::Vector{T},
         transition_energies::Vector{T},
         N_rotations::Union{Nothing,Tuple{Int,Int,Int}}=nothing,
         model=spherical_halo(),
-    ) where {T<:AbstractFloat}
+    )::Array{T, 2} where {T<:AbstractFloat}
     """
     Compute the DM scattering rate using VSDM for a set of detector orientations. Currently
     uses one tophat wavelet per q-value, and the same number of velocity values.
@@ -149,7 +149,7 @@ function compute_rates(
     - model::Function: The DM velocity model function (default: spherical_halo).
 
     # Returns:
-    - results::Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}: The dimensionless rates for each DM mass, after summing over transitions and taking the max/min/mean over orientations.
+    - rate_grid::Array{T, 2}: The dimensionless rate for each DM mass and detector orientation.
     """
 
     # Get the stuff needed to setup VSDM.
@@ -193,21 +193,18 @@ function compute_rates(
     v_tophat = VSDM.ProjectF(model,(n_v-1,l_max),v_basis)
 
     # Compute the dimensionless scattering rate here using VSDM.
-    # The orientation is a single physical crystal orientation, so rates from
-    # all transitions are summed for each R before taking the max.
     mSM = VSDM.mElec
-    N_rotations = length(R_arr)
-    inv_N_rotations = inv(Float64(N_rotations))
+    n_rotation_vals = length(R_arr)
     G_cache_transpose = transpose(G_cache)
     transition_energies_eV = Float64.(transition_energies)
     null_logger = NullLogger()
-    results = Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}(undef, length(m_grid))
+    rate_grid = zeros(T, length(m_grid), n_rotation_vals)
 
     # Sweep over DM masses. For each mass, sum rates over all transitions at
-    # each orientation, then record the max/min/mean over orientations.
+    # each orientation.
     @threads for i in eachindex(m_grid)
         mchi = Float64(m_grid[i]) * VSDM.MeV
-        total_rate = zeros(Float64, N_rotations)
+        total_rate = zeros(Float64, n_rotation_vals)
 
         # Use the logger to suppress SpecialFunctions warnings.
         with_logger(null_logger) do
@@ -218,16 +215,43 @@ function compute_rates(
             end
         end
 
-        # Store the rates.
+        rate_grid[i, :] .= T.(total_rate)
+    end
+
+    return rate_grid
+end
+
+function reduce_rate_grid(rate_grid::Array{T, 2}, m_grid::Vector{T}) where {T<:AbstractFloat}
+    """
+    Reduce a rate grid to max/min/mean statistics per DM mass.
+
+    # Arguments:
+    - rate_grid::Array{T, 2}: The rate grid with dimensions (n_masses, n_rotations).
+    - m_grid::Vector{T}: The DM mass grid in MeV.
+
+    # Returns:
+    - results::Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}: The dimensionless rates for each DM mass.
+    """
+
+    N_rotations = size(rate_grid, 2)
+    inv_N_rotations = inv(Float64(N_rotations))
+    results = Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}(undef, length(m_grid))
+
+    @threads for i in eachindex(m_grid)
+        # Look at each mass slice.
+        total_rate = @view rate_grid[i, :]
+
         rate_max = -Inf
         rate_min = Inf
         rate_sum = 0.0
         @inbounds for rate in total_rate
+            # Compute the max/min/mean over orientations.
             rate_max = max(rate_max, rate)
             rate_min = min(rate_min, rate)
             rate_sum += rate
         end
 
+        # Store the rates.
         results[i] = (
             mchi_MeV = m_grid[i],
             rate_max = T(rate_max),
@@ -237,6 +261,65 @@ function compute_rates(
     end
 
     return results
+end
+
+function compute_rates(
+        flm::Array{T,3},
+        q_grid::Vector{T},
+        m_grid::Vector{T},
+        transition_energies::Vector{T},
+        N_rotations::Union{Nothing,Tuple{Int,Int,Int}}=nothing,
+        model=spherical_halo(),
+    ) where {T<:AbstractFloat}
+    """
+    Compute the DM scattering rate using VSDM for a set of detector orientations. Currently
+    uses one tophat wavelet per q-value, and the same number of velocity values.
+
+    # Arguments:
+    - flm::Array{T, 3}: The f^2_{ℓm} tensor with dimensions (n_transitions, n_q, n_keys), keyed by key(ℓ, m) = ℓ^2 + (ℓ + m) + 1.
+    - q_grid::Vector{T}: The momentum transfer grid in keV.
+    - m_grid::Vector{T}: The DM mass grid in MeV.
+    - transition_energies::Vector{T}: The transition energies in eV.
+    - N_rotations::Tuple{Int,Int,Int}: The number of (α,β,γ) detector rotations to consider. If unset, considers only the identity.
+    - model::Function: The DM velocity model function (default: spherical_halo).
+
+    # Returns:
+    - results::Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}: The dimensionless rates for each DM mass, after summing over transitions and taking the max/min/mean over orientations.
+    """
+
+    rate_grid = compute_rates_by_orientation(
+        flm,
+        q_grid,
+        m_grid,
+        transition_energies,
+        N_rotations,
+        model,
+    )
+    # Reduce to mean/min/max for saving.
+    return reduce_rate_grid(rate_grid, m_grid)
+end
+
+function combine_crystal_rate_grids(rate_grids::Vector{Array{T, 2}}, occupancies::Vector{T}, m_grid::Vector{T}) where {T<:AbstractFloat}
+    """
+    Combine conformer-set rate grids into a total crystal rate.
+
+    # Arguments:
+    - rate_grids::Vector{Array{T, 2}}: The rate grid for each conformer set.
+    - occupancies::Vector{T}: The occupancy weight for each conformer set.
+    - m_grid::Vector{T}: The DM mass grid in MeV.
+
+    # Returns:
+    - results::Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}: The occupancy-weighted rates for each DM mass.
+    """
+
+    # Initialise the total rate grid.
+    total_rate_grid = zeros(T, size(rate_grids[1]))
+    for (rate_grid, occupancy) in zip(rate_grids, occupancies)
+        total_rate_grid .+= occupancy .* rate_grid
+    end
+
+    # Reduce to mean/min/max for saving.
+    return reduce_rate_grid(total_rate_grid, m_grid)
 end
 
 

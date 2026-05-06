@@ -44,6 +44,12 @@ def parse_cli_args():
         help="Form factor computation method. Must match the method used in compute_form_factor.jl.",
     )
     parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Relative results directory under runs/<run-name>/<molecule-number>/. Defaults to the method directory.",
+    )
+    parser.add_argument(
         "--transition-indices",
         type=str,
         default="1",
@@ -152,7 +158,10 @@ def parse_cli_args():
     runs_dir = project_root / "runs" / parsed_args.run_name / str(parsed_args.molecule_number)
 
     # Set the output directory.
-    parsed_args.output_dir = runs_dir / parsed_args.method
+    if parsed_args.results_dir is not None:
+        parsed_args.output_dir = runs_dir / parsed_args.results_dir
+    else:
+        parsed_args.output_dir = runs_dir / parsed_args.method
 
     if parsed_args.method not in ["spherical", "fft", "cartesian"]:
         print(f"Error: Invalid method '{parsed_args.method}'. Must be 'spherical', 'fft', or 'cartesian'.")
@@ -571,8 +580,12 @@ def main():
         # Returns:
         - ::tuple: Loaded data, containing e.g. form factor, transition density, and grid data.
         """
-        # All three methods now use the same directory.
-        tdir = Path(args.output_dir / f"transition_{tidx}")
+        numeric_dir = Path(args.output_dir / str(tidx))
+        transition_dir = Path(args.output_dir / f"transition_{tidx}")
+        if numeric_dir.exists():
+            tdir = numeric_dir
+        else:
+            tdir = transition_dir
         base = "fs_grid"
         input_path = None
 

@@ -14,6 +14,7 @@ include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
 include("ConstructFLMTensor.jl")
+include("ConstructCrystalTensor.jl")
 include("ComputeRates.jl")
 
 using CUDA
@@ -26,12 +27,13 @@ using .PrecomputeATensor: precompute_A_tensor
 using .ConstructWTensor: construct_W_tensor
 using .ConstructRTensor: construct_R_tensor
 using .ContractSphericalGrid: contract_spherical_grid
+using .ConstructCrystalTensor: construct_crystal_f_lm_tensors
 
-using .ComputeRates: compute_rates
+using .ComputeRates: compute_rates, compute_rates_by_orientation, combine_crystal_rate_grids
 
 using BenchmarkTools
 
-export compute_spherical_form_factor, compute_rates
+export compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
 
 @inline function combine_gpu_R_tensor(R_pos, R_neg, l_max::Int)
     """

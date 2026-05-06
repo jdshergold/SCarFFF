@@ -53,6 +53,12 @@ def parse_cli_args():
         help="Form factor computation method. Must match the method used in compute_form_factor.jl.",
     )
     parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Relative results directory under runs/<run-name>/<molecule-number>/. Defaults to the method directory, or crystal/ for top-level crystal spherical plots.",
+    )
+    parser.add_argument(
         "--transition-indices",
         type=str,
         default="1",
@@ -166,7 +172,20 @@ def parse_cli_args():
         sys.exit(1)
 
     # Set the output directory.
+    has_crystal_metadata = (runs_dir / "crystal_metadata.json").exists()
+    if parsed_args.results_dir is not None:
+        parsed_args.results_root = runs_dir / parsed_args.results_dir
+    elif parsed_args.method == "spherical" and has_crystal_metadata:
+        parsed_args.results_root = runs_dir / "crystal"
+    else:
+        parsed_args.results_root = runs_dir / parsed_args.method
+
     parsed_args.output = runs_dir
+    parsed_args.crystal_mode = (
+        parsed_args.method == "spherical"
+        and has_crystal_metadata
+        and parsed_args.results_root == runs_dir / "crystal"
+    )
 
     return parsed_args
 
@@ -495,6 +514,86 @@ def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=N
     return coord1, coord2, plane_data, xlim, ylim
 
 
+def get_top_flm_modes(f_lm, q_grid, top_n=8):
+    """
+    Get the dominant f^2_{lm}(q) modes ranked by integrated absolute area.
+
+    # Arguments:
+    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - q_grid::np.ndarray: The |q| grid in keV.
+    - top_n::int: Number of top modes to return (default: 8).
+
+    # Returns:
+    - top_modes::list: The dominant (l, m) modes.
+    """
+    n_keys = f_lm.shape[1]
+    l_max = int(np.sqrt(n_keys)) - 1
+    areas = {}
+    for l in range(l_max + 1):
+        for m in range(-l, l + 1):
+            key = l * l + (l + m) + 1
+            areas[(l, m)] = np.trapezoid(np.abs(f_lm[:, key - 1]), q_grid)
+    top_modes = sorted(areas, key=areas.get, reverse=True)[:top_n]
+    return top_modes
+
+def build_flm_style_map(modes):
+    """
+    Build a consistent line-style map for a collection of f^2_{lm}(q) modes.
+    This ensures that modes keep a consistent style between individual conformers and crystal averages. 
+
+    # Arguments:
+    - modes::list: The (l, m) modes to assign styles to.
+
+    # Returns:
+    - style_map::dict: Mapping from (l, m) to plotting style.
+    """
+    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1)), (0, (3, 1, 1, 1, 1, 1))]
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    style_map = {}
+
+    for idx, mode in enumerate(sorted(set(modes))):
+        style_map[mode] = {
+            "color": colors[idx % len(colors)],
+            "linestyle": linestyles[idx % len(linestyles)],
+        }
+
+    return style_map
+
+
+def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_map=None):
+    """
+    Plot the top N f^2_{lm}(q) modes on a single set of axes.
+
+    # Arguments:
+    - ax::matplotlib.axes.Axes: The axes to plot on.
+    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - q_grid::np.ndarray: The |q| grid in keV.
+    - title::str or None: Optional panel title.
+    - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
+    - top_modes::list or None: Optional list of (l, m) modes to plot.
+    - style_map::dict or None: Optional style map keyed by (l, m).
+    """
+    # Find the top modes if not provided.
+    if top_modes is None:
+        top_modes = get_top_flm_modes(f_lm, q_grid, top_n=top_n)
+    if style_map is None:
+        style_map = build_flm_style_map(top_modes)
+
+    # Plot each of the top modes.
+    for l, m in sorted(top_modes):
+        key = l * l + (l + m) + 1
+        style = style_map[(l, m)]
+        label = rf"$({l},\,{m})$"
+        ax.plot(q_grid, f_lm[:, key - 1], lw=1.2, ls=style["linestyle"], color=style["color"], label=label)
+
+    ax.axhline(0, color="k", lw=0.8, ls="--")
+    ax.set_xlabel(r"$q\ [\mathrm{keV}]$")
+    ax.set_ylabel(r"$f^2_{\ell m}(q)$")
+    ax.set_xlim(q_grid[0], q_grid[-1])
+    ax.legend(fontsize=8, ncol=2, title=r"Dominant modes: $(\ell,\,m)$", title_fontsize=8)
+    if title is not None:
+        ax.set_title(title)
+
 
 def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
     """
@@ -507,49 +606,68 @@ def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
     - output_dir::Path: Directory to save the output plot.
     - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
     """
-    n_keys = f_lm.shape[1]
-    l_max = int(np.sqrt(n_keys)) - 1
-    areas = {}
-    for l in range(l_max + 1):
-        for m in range(-l, l + 1):
-            key = l * l + (l + m) + 1
-            areas[(l, m)] = np.trapz(np.abs(f_lm[:, key - 1]), q_grid)
-    top_modes = sorted(areas, key=areas.get, reverse=True)[:top_n]
-
-    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1)), (0, (3, 1, 1, 1, 1, 1))]
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-
     fig, ax = plt.subplots(figsize=(7, 4))
-
-    for i, (l, m) in enumerate(sorted(top_modes)):
-        key = l * l + (l + m) + 1
-        color = colors[i % len(colors)]
-        ls = linestyles[i % len(linestyles)]
-        label = rf"$({l},\,{m})$"
-        ax.plot(q_grid, f_lm[:, key - 1], lw=1.2, ls=ls, color=color, label=label)
-
-    ax.axhline(0, color="k", lw=0.8, ls="--")
-    ax.set_xlabel(r"$q\ [\mathrm{keV}]$")
-    ax.set_ylabel(r"$f^2_{\ell m}(q)$")
-    ax.set_xlim(q_grid[0], q_grid[-1])
-    ax.legend(fontsize=8, ncol=2, title=r"Dominant modes: $(\ell,\,m)$", title_fontsize=8)
+    plot_flm_panel(ax, f_lm, q_grid, top_n=top_n)
     fig.tight_layout()
 
     fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_scattering_rates(spherical_dir):
+def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, output_dir, top_n=8):
+    """
+    Plot the aggregate crystal f^2_{lm}(q) modes together with each conformer contribution.
+
+    # Arguments:
+    - f_lm::np.ndarray: The aggregate crystal f_lm tensor with shape (n_q, n_keys).
+    - conformer_f_lm::np.ndarray: The conformer tensors with shape (n_conformers, n_q, n_keys).
+    - conformer_titles::list: The conformer panel titles.
+    - q_grid::np.ndarray: The |q| grid in keV.
+    - output_dir::Path: Directory to save the output plot.
+    - top_n::int: Number of top modes to plot per panel, ranked by integrated absolute area (default: 8).
+    """
+    # Find the top modes for the whole crystal and each conformer.
+    crystal_top_modes = get_top_flm_modes(f_lm, q_grid, top_n=top_n)
+    conformer_top_modes = [get_top_flm_modes(conformer_f_lm[i], q_grid, top_n=top_n) for i in range(len(conformer_titles))]
+    all_top_modes = list(crystal_top_modes)
+    for top_modes in conformer_top_modes:
+        for mode in top_modes:
+            if mode not in all_top_modes:
+                all_top_modes.append(mode)
+    # Build the style map based on all modes, too keep it consistent between panels.
+    style_map = build_flm_style_map(all_top_modes)
+
+    n_panels = 1 + len(conformer_titles)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 4.5), squeeze=False, sharex=True)
+
+    plot_flm_panel(axes[0, 0], f_lm, q_grid, title="Crystal aggregate", top_n=top_n, top_modes=crystal_top_modes, style_map=style_map)
+    for panel_idx, conformer_title in enumerate(conformer_titles, start=1):
+        plot_flm_panel(
+            axes[0, panel_idx],
+            conformer_f_lm[panel_idx - 1],
+            q_grid,
+            title=conformer_title,
+            top_n=top_n,
+            top_modes=conformer_top_modes[panel_idx - 1],
+            style_map=style_map,
+        )
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_scattering_rates(rates_dir):
     """
     Plot the DM scattering rates as a function of DM mass.
 
     # Arguments:
-    - spherical_dir::Path: Directory containing the scattering_rates HDF5 file.
+    - rates_dir::Path: Directory containing the scattering_rates HDF5 file.
     """
     input_path = None
     for candidate in [
-        spherical_dir / "scattering_rates_f64.h5",
-        spherical_dir / "scattering_rates_f32.h5",
+        rates_dir / "scattering_rates_f64.h5",
+        rates_dir / "scattering_rates_f32.h5",
     ]:
         if candidate.exists():
             input_path = candidate
@@ -580,7 +698,7 @@ def plot_scattering_rates(spherical_dir):
     ax.legend(fontsize=8, ncol=3)
     fig.tight_layout()
 
-    fig.savefig(spherical_dir / "scattering_rates.png", dpi=300, bbox_inches="tight")
+    fig.savefig(rates_dir / "scattering_rates.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -611,6 +729,25 @@ def main():
         }
     )
 
+    crystal_mode = args.crystal_mode
+    results_root = args.results_root
+
+    def get_transition_dir(tidx):
+        numeric_dir = results_root / str(tidx)
+        if numeric_dir.exists():
+            return numeric_dir
+
+        transition_dir = results_root / f"transition_{tidx}"
+        if transition_dir.exists():
+            return transition_dir
+
+        if crystal_mode:
+            return numeric_dir
+        return transition_dir
+
+    def get_rates_dir():
+        return results_root
+
     # Helper to plot one transition without restarting Python.
     def plot_transition(tidx: str):
         """
@@ -619,7 +756,7 @@ def main():
         # Arguments:
         - tidx::str: Transition index to plot.
         """
-        tdir = runs_dir / args.method / f"transition_{tidx}"
+        tdir = get_transition_dir(tidx)
         base = "fs_grid"
         input_path = None
         # Look for the form factor file for this transition, preferring f64 over f32.
@@ -657,8 +794,19 @@ def main():
 
                 # Load f_lm if requested, and transpose because of the usual Julia vs Python nonsense.
                 f_lm = None
+                conformer_f_lm = None
+                conformer_titles = None
                 if args.plot_flm_modes and "f_lm" in ff_file:
                     f_lm = ff_file["f_lm"][()].T
+                    if "conformer_f_lm" in ff_file:
+                        conformer_f_lm = np.transpose(ff_file["conformer_f_lm"][()], (2, 1, 0))
+
+                    # Construct the titles for each conformer.
+                    if "conformer_labels" in ff_file:
+                        conformer_titles = [
+                            f"Conformer {label.decode('utf-8') if isinstance(label, bytes) else str(label)}"
+                            for label in ff_file["conformer_labels"][()]
+                        ]
                 elif args.plot_flm_modes:
                     print(f"  Warning: f_lm not found for transition {tidx}. Was f_lm_tensor included in COMPUTE_MODES?")
                 
@@ -701,7 +849,16 @@ def main():
 
         # Return data needed for plotting without re-reading from disk.
         if args.method == "spherical":
-            return [f_s, theta_grid, phi_grid, q_grid, output_dir, f_lm if args.plot_flm_modes else None]
+            return [
+                f_s,
+                theta_grid,
+                phi_grid,
+                q_grid,
+                output_dir,
+                f_lm if args.plot_flm_modes else None,
+                conformer_f_lm if args.plot_flm_modes else None,
+                conformer_titles if args.plot_flm_modes else None,
+            ]
         elif args.method == "fft":
             return [None, None, None, None, form_factor, q_lim, output_dir, transition_density if args.plot_transition_density else None, r_lim if args.plot_transition_density else None]
         else:
@@ -726,7 +883,7 @@ def main():
     completed = 0
 
     if plot_rates:
-        if plot_scattering_rates(runs_dir / args.method):
+        if plot_scattering_rates(get_rates_dir()):
             completed += 1
             print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
         else:
@@ -752,7 +909,10 @@ def main():
             # Plot the f_lm^2 coefficients.
             elif plot_type == "flm_modes":
                 if run_outputs[5] is not None:
-                    plot_flm_modes(run_outputs[5], run_outputs[3], output_dir)
+                    if run_outputs[6] is not None and run_outputs[7] is not None:
+                        plot_crystal_flm_modes(run_outputs[5], run_outputs[6], run_outputs[7], run_outputs[3], output_dir)
+                    else:
+                        plot_flm_modes(run_outputs[5], run_outputs[3], output_dir)
                 completed += 1
                 print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
                 continue

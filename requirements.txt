@@ -14,4 +14,5 @@ geometric
 # cupy-cuda12x==13.4.1
 # cutensor-cu12==2.2.0"
 plotly>=5.0.0
-scikit-learn>=1.0.0
+scipy>=1.7.0
+pymatgen>=2024.0.0

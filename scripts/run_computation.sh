@@ -8,15 +8,19 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="flmsq_test"     # Name for this run.
-CSV_FILE=""                 # Path to CSV file containing SMILES strings. Leave this empty for a single molecule run.
+RUN_NAME="tstilb09"     # Name for this run.
 
-# Molecule specification.
-SMILES="C1=CC=CC=C1" # SMILES string for the molecule. This is ignored if CSV_FILE is specified.
+# Input specification. Specify exactly one of the following four options.
+# CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
+CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
+SMILES=""        # Single molecule mode. SMILES string for the molecule.
+CIF_FILE="examples/our_favourite_molecules/TSTILB09.cif"  # Single crystal mode. Path to a CIF file.
+CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
+
 
 # ==== TD-DFT parameters. ====
-BASIS="def2-svp"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="sto-3g"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="lda"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
@@ -134,6 +138,11 @@ lowercase() {
 CARTESIAN_COMPUTE_MODE_LC="$(lowercase "$CARTESIAN_COMPUTE_MODE")"
 TRANSITION_INDICES_LC="$(lowercase "$TRANSITION_INDICES")"
 
+CRYSTAL_MODE=false
+if [ -n "$CIF_FILE" ] || [ -n "$CIF_DIR" ]; then
+    CRYSTAL_MODE=true
+fi
+
 # Remove any CUDA entries from paths so that julia stops complaining.
 strip_cuda_from_path_var() {
     local var_name=$1
@@ -156,7 +165,11 @@ echo "Molecular form factor computation"
 echo "=================================="
 echo "Run name: $RUN_NAME"
 echo "Output directory: $PROJECT_ROOT/runs/$RUN_NAME"
-if [ -n "$CSV_FILE" ]; then
+if [ "$CRYSTAL_MODE" = true ] && [ -n "$CIF_DIR" ]; then
+    echo "Running calculation for the list of crystals found in ($CIF_DIR)."
+elif [ "$CRYSTAL_MODE" = true ]; then
+    echo "Running calculation for a single crystal from CIF ($CIF_FILE)."
+elif [ -n "$CSV_FILE" ]; then
     echo "Running calculation for the list of molecules found in ($CSV_FILE)."
 else
     echo "Running calculation for a single molecule with SMILES ($SMILES)."
@@ -194,22 +207,26 @@ else
     TD_DFT_CMD="$PYTHON_BIN td_dft.py --basis \"$BASIS\" --xc \"$XC_FUNCTIONAL\" --nstates $NSTATES --ntrans $NTRANS --precision $PRECISION --output-dir \"$RUN_DIR\""
 
     # Add the input to the command.
-    if [ -n "$CSV_FILE" ]; then
+    if [ "$CRYSTAL_MODE" = true ] && [ -n "$CIF_DIR" ]; then
+        TD_DFT_CMD="$TD_DFT_CMD --cif-dir \"$CIF_DIR\""
+    elif [ "$CRYSTAL_MODE" = true ]; then
+        TD_DFT_CMD="$TD_DFT_CMD --cif-file \"$CIF_FILE\""
+    elif [ -n "$CSV_FILE" ]; then
         TD_DFT_CMD="$TD_DFT_CMD --csv-file \"$CSV_FILE\""
     else
         TD_DFT_CMD="$TD_DFT_CMD --smiles \"$SMILES\""
     fi
 
-    if [ -n "$RING_FLATTEN" ]; then
+    if [ -n "$RING_FLATTEN" ] && [ "$CRYSTAL_MODE" != true ]; then
         TD_DFT_CMD="$TD_DFT_CMD $RING_FLATTEN"
     fi
     if [ "$USE_GPU" = true ]; then
         TD_DFT_CMD="$TD_DFT_CMD --use-gpu"
     fi
-    if [ "$DFT_OPTIMISATION" = true ]; then
+    if [ "$DFT_OPTIMISATION" = true ] && [ "$CRYSTAL_MODE" != true ]; then
         TD_DFT_CMD="$TD_DFT_CMD --dft-optimisation"
     fi
-    if [ "$PLOT_MOLECULE_3D" = true ]; then
+    if [ "$PLOT_MOLECULE_3D" = true ] && [ "$CRYSTAL_MODE" != true ]; then
         TD_DFT_CMD="$TD_DFT_CMD --plot-molecule-3d"
     fi
 
@@ -240,9 +257,13 @@ strip_cuda_from_path_var LD_LIBRARY_PATH
 FORM_FACTOR_TIME=0
 
 # Check if form factor results already exist.
-# We do this by looking for a method directory in molecule 1's folder.
+# We do this by looking for the expected output directory in molecule 1's folder.
 FORM_FACTOR_EXISTS=false
-if [ -d "$RUN_DIR/1/$METHOD" ]; then
+if [ "$CRYSTAL_MODE" = true ]; then
+    if [ -d "$RUN_DIR/1/crystal" ]; then
+        FORM_FACTOR_EXISTS=true
+    fi
+elif [ -d "$RUN_DIR/1/$METHOD" ]; then
     FORM_FACTOR_EXISTS=true
 fi
 
@@ -261,7 +282,11 @@ else
     JULIA_CMD="$JULIA_BIN -t $JULIA_THREADS compute_form_factor.jl --output-dir \"$RUN_DIR\""
 
     # Add the input to the command.
-    if [ -n "$CSV_FILE" ]; then
+    if [ "$CRYSTAL_MODE" = true ] && [ -n "$CIF_DIR" ]; then
+        JULIA_CMD="$JULIA_CMD --cif-dir \"$CIF_DIR\" --crystal-mode"
+    elif [ "$CRYSTAL_MODE" = true ]; then
+        JULIA_CMD="$JULIA_CMD --cif-file \"$CIF_FILE\" --crystal-mode"
+    elif [ -n "$CSV_FILE" ]; then
         JULIA_CMD="$JULIA_CMD --csv-file \"$CSV_FILE\""
     else
         JULIA_CMD="$JULIA_CMD --smiles \"$SMILES\""
@@ -369,6 +394,103 @@ elif [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ];
 else
     cd "$SCRIPT_DIR"
 
+    run_slice_plots() {
+        local mol_num="$1"
+        local results_rel_dir="$2"
+        local include_rates="$3"
+        local plot_cmd="$PYTHON_BIN plot_slices.py --run-name \"$RUN_NAME\" --molecule-number $mol_num --method $METHOD --results-dir \"$results_rel_dir\""
+
+        if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
+            local transition_arg
+            transition_arg=$(IFS=','; echo "${TRANSITIONS_TO_PLOT[*]// /}")
+            plot_cmd="$plot_cmd --transition-indices $transition_arg"
+        fi
+
+        if [ ${#PLOT_PLANES[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --planes ${PLOT_PLANES[@]}"
+        fi
+
+        if [ ${#PLOT_MODES[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --modes ${PLOT_MODES[@]}"
+        fi
+
+        if [ "$PLOT_TRANSITION_DENSITY" = true ]; then
+            plot_cmd="$plot_cmd --plot-transition-density"
+        fi
+
+        if [ "$PLOT_FLM_MODES" = true ]; then
+            plot_cmd="$plot_cmd --plot-flm-modes"
+        fi
+
+        if [ "$include_rates" = true ] && [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+            plot_cmd="$plot_cmd --plot-rates"
+        fi
+
+        if [ ${#PLOT_RANGE_QX[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --qx-range=${PLOT_RANGE_QX[0]},${PLOT_RANGE_QX[1]}"
+        fi
+        if [ ${#PLOT_RANGE_QY[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --qy-range=${PLOT_RANGE_QY[0]},${PLOT_RANGE_QY[1]}"
+        fi
+        if [ ${#PLOT_RANGE_QZ[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --qz-range=${PLOT_RANGE_QZ[0]},${PLOT_RANGE_QZ[1]}"
+        fi
+        if [ ${#PLOT_RANGE_X[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --x-range=${PLOT_RANGE_X[0]},${PLOT_RANGE_X[1]}"
+        fi
+        if [ ${#PLOT_RANGE_Y[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --y-range=${PLOT_RANGE_Y[0]},${PLOT_RANGE_Y[1]}"
+        fi
+        if [ ${#PLOT_RANGE_Z[@]} -gt 0 ]; then
+            plot_cmd="$plot_cmd --z-range=${PLOT_RANGE_Z[0]},${PLOT_RANGE_Z[1]}"
+        fi
+
+        eval $plot_cmd
+    }
+
+    run_3d_plots() {
+        local mol_num="$1"
+        local results_rel_dir="$2"
+
+        for MODE in "${PLOT_3D_MODES[@]}"; do
+            local plot_3d_cmd="$PYTHON_BIN plot_3d.py --run-name \"$RUN_NAME\" --molecule-number $mol_num --method $METHOD --results-dir \"$results_rel_dir\""
+            plot_3d_cmd="$plot_3d_cmd --mode $MODE"
+            if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
+                local transition_arg
+                transition_arg=$(IFS=','; echo "${TRANSITIONS_TO_PLOT[*]// /}")
+                plot_3d_cmd="$plot_3d_cmd --transition-indices $transition_arg"
+            fi
+            plot_3d_cmd="$plot_3d_cmd --min-fraction $PLOT_3D_MIN_FRACTION"
+            plot_3d_cmd="$plot_3d_cmd --max-fraction $PLOT_3D_MAX_FRACTION"
+            plot_3d_cmd="$plot_3d_cmd --grid-size $PLOT_3D_GRID_SIZE"
+
+            if [ "$PLOT_TRANSITION_DENSITY" = true ]; then
+                plot_3d_cmd="$plot_3d_cmd --plot-transition-density"
+            fi
+
+            if [ ${#PLOT_RANGE_QX[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --qx-range=${PLOT_RANGE_QX[0]},${PLOT_RANGE_QX[1]}"
+            fi
+            if [ ${#PLOT_RANGE_QY[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --qy-range=${PLOT_RANGE_QY[0]},${PLOT_RANGE_QY[1]}"
+            fi
+            if [ ${#PLOT_RANGE_QZ[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --qz-range=${PLOT_RANGE_QZ[0]},${PLOT_RANGE_QZ[1]}"
+            fi
+            if [ ${#PLOT_RANGE_X[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --x-range=${PLOT_RANGE_X[0]},${PLOT_RANGE_X[1]}"
+            fi
+            if [ ${#PLOT_RANGE_Y[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --y-range=${PLOT_RANGE_Y[0]},${PLOT_RANGE_Y[1]}"
+            fi
+            if [ ${#PLOT_RANGE_Z[@]} -gt 0 ]; then
+                plot_3d_cmd="$plot_3d_cmd --z-range=${PLOT_RANGE_Z[0]},${PLOT_RANGE_Z[1]}"
+            fi
+
+            eval $plot_3d_cmd
+        done
+    }
+
     # Get the number of molecules from metadata.csv
     METADATA_FILE="$RUN_DIR/metadata.csv"
     NUM_MOLECULES=$(tail -n +2 "$METADATA_FILE" | grep -c .)
@@ -378,13 +500,18 @@ else
     # Loop over each molecule
     for MOL_NUM in $(seq 1 $NUM_MOLECULES); do
         MOL_DIR="$RUN_DIR/$MOL_NUM"
+        if [ "$CRYSTAL_MODE" = true ]; then
+            RESULTS_DIR="$MOL_DIR/crystal"
+        else
+            RESULTS_DIR="$MOL_DIR/$METHOD"
+        fi
 
         if [ $NUM_MOLECULES -gt 1 ]; then
             echo "  --- Molecule $MOL_NUM ---"
         fi
 
         # Skip molecules that have no form factor results (e.g. TD-DFT failed).
-        if [ ! -d "$MOL_DIR/$METHOD" ]; then
+        if [ ! -d "$RESULTS_DIR" ]; then
             echo "  No form factor results found for molecule $MOL_NUM, skipping."
             echo ""
             continue
@@ -393,9 +520,9 @@ else
         # Determine which transitions to plot.
         TRANSITIONS_TO_PLOT=()
         if [ "$TRANSITION_INDICES_LC" = "all" ]; then
-            for dir in "$MOL_DIR/$METHOD"/transition_*; do
+            for dir in "$RESULTS_DIR"/*; do
                 [ -d "$dir" ] || continue
-                tidx=$(basename "$dir" | cut -d'_' -f2)
+                tidx=$(basename "$dir")
                 [[ "$tidx" =~ ^[0-9]+$ ]] && TRANSITIONS_TO_PLOT+=("$tidx")
             done
         else
@@ -415,56 +542,16 @@ else
                 echo "  Generating 2D slice plots..."
             fi
 
-            # Build the plot command for the 2D slice plots.
-            PLOT_CMD="$PYTHON_BIN plot_slices.py --run-name \"$RUN_NAME\" --molecule-number $MOL_NUM --method $METHOD"
-            if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
-                TRANSITION_ARG=$(IFS=','; echo "${TRANSITIONS_TO_PLOT[*]// /}")
-                PLOT_CMD="$PLOT_CMD --transition-indices $TRANSITION_ARG"
+            if [ "$CRYSTAL_MODE" = true ]; then
+                run_slice_plots "$MOL_NUM" "crystal" true
+                for conformer_dir in "$MOL_DIR"/conformers/*; do
+                    [ -d "$conformer_dir" ] || continue
+                    conformer_label=$(basename "$conformer_dir")
+                    run_slice_plots "$MOL_NUM" "conformers/$conformer_label" true
+                done
+            else
+                run_slice_plots "$MOL_NUM" "$METHOD" true
             fi
-
-            # Add the planes to plot.
-            if [ ${#PLOT_PLANES[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --planes ${PLOT_PLANES[@]}"
-            fi
-
-            # Add the modes to plot.
-            if [ ${#PLOT_MODES[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --modes ${PLOT_MODES[@]}"
-            fi
-
-            if [ "$PLOT_TRANSITION_DENSITY" = true ]; then
-                PLOT_CMD="$PLOT_CMD --plot-transition-density"
-            fi
-
-            if [ "$PLOT_FLM_MODES" = true ]; then
-                PLOT_CMD="$PLOT_CMD --plot-flm-modes"
-            fi
-
-            if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
-                PLOT_CMD="$PLOT_CMD --plot-rates"
-            fi
-
-            # Add plot range limits if specified.
-            if [ ${#PLOT_RANGE_QX[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --qx-range=${PLOT_RANGE_QX[0]},${PLOT_RANGE_QX[1]}"
-            fi
-            if [ ${#PLOT_RANGE_QY[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --qy-range=${PLOT_RANGE_QY[0]},${PLOT_RANGE_QY[1]}"
-            fi
-            if [ ${#PLOT_RANGE_QZ[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --qz-range=${PLOT_RANGE_QZ[0]},${PLOT_RANGE_QZ[1]}"
-            fi
-            if [ ${#PLOT_RANGE_X[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --x-range=${PLOT_RANGE_X[0]},${PLOT_RANGE_X[1]}"
-            fi
-            if [ ${#PLOT_RANGE_Y[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --y-range=${PLOT_RANGE_Y[0]},${PLOT_RANGE_Y[1]}"
-            fi
-            if [ ${#PLOT_RANGE_Z[@]} -gt 0 ]; then
-                PLOT_CMD="$PLOT_CMD --z-range=${PLOT_RANGE_Z[0]},${PLOT_RANGE_Z[1]}"
-            fi
-
-            eval $PLOT_CMD
 
             if [ $NUM_MOLECULES -eq 1 ]; then
                 echo "  2D slice plots complete!"
@@ -481,46 +568,18 @@ else
                 echo "  Generating 3D isosurface plots..."
             fi
 
-            # Generate a plot for each mode specified.
-            for MODE in "${PLOT_3D_MODES[@]}"; do
-
-                # Build the plot command for the 3D isosurface plot.
-                PLOT_3D_CMD="$PYTHON_BIN plot_3d.py --run-name \"$RUN_NAME\" --molecule-number $MOL_NUM --method $METHOD"
-                PLOT_3D_CMD="$PLOT_3D_CMD --mode $MODE"
-                if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
-                    TRANSITION_ARG=$(IFS=','; echo "${TRANSITIONS_TO_PLOT[*]// /}")
-                    PLOT_3D_CMD="$PLOT_3D_CMD --transition-indices $TRANSITION_ARG"
+            if [ "$CRYSTAL_MODE" = true ]; then
+                if [ $NUM_MOLECULES -eq 1 ]; then
+                    echo "  Skipping 3D isosurface plot generation for crystal aggregate outputs."
                 fi
-                PLOT_3D_CMD="$PLOT_3D_CMD --min-fraction $PLOT_3D_MIN_FRACTION"
-                PLOT_3D_CMD="$PLOT_3D_CMD --max-fraction $PLOT_3D_MAX_FRACTION"
-                PLOT_3D_CMD="$PLOT_3D_CMD --grid-size $PLOT_3D_GRID_SIZE"
-
-                if [ "$PLOT_TRANSITION_DENSITY" = true ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --plot-transition-density"
-                fi
-
-                # Add the plot range limits if specified.
-                if [ ${#PLOT_RANGE_QX[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --qx-range=${PLOT_RANGE_QX[0]},${PLOT_RANGE_QX[1]}"
-                fi
-                if [ ${#PLOT_RANGE_QY[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --qy-range=${PLOT_RANGE_QY[0]},${PLOT_RANGE_QY[1]}"
-                fi
-                if [ ${#PLOT_RANGE_QZ[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --qz-range=${PLOT_RANGE_QZ[0]},${PLOT_RANGE_QZ[1]}"
-                fi
-                if [ ${#PLOT_RANGE_X[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --x-range=${PLOT_RANGE_X[0]},${PLOT_RANGE_X[1]}"
-                fi
-                if [ ${#PLOT_RANGE_Y[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --y-range=${PLOT_RANGE_Y[0]},${PLOT_RANGE_Y[1]}"
-                fi
-                if [ ${#PLOT_RANGE_Z[@]} -gt 0 ]; then
-                    PLOT_3D_CMD="$PLOT_3D_CMD --z-range=${PLOT_RANGE_Z[0]},${PLOT_RANGE_Z[1]}"
-                fi
-
-                eval $PLOT_3D_CMD
-            done
+                for conformer_dir in "$MOL_DIR"/conformers/*; do
+                    [ -d "$conformer_dir" ] || continue
+                    conformer_label=$(basename "$conformer_dir")
+                    run_3d_plots "$MOL_NUM" "conformers/$conformer_label"
+                done
+            else
+                run_3d_plots "$MOL_NUM" "$METHOD"
+            fi
 
             if [ $NUM_MOLECULES -eq 1 ]; then
                 echo ""
@@ -542,9 +601,14 @@ fi
 if [ ${#TRANSITIONS_TO_PLOT[@]} -eq 0 ]; then
     if [ "$TRANSITION_INDICES_LC" = "all" ]; then
         # Use molecule 1's directory to find the transitions.
-        for dir in "$RUN_DIR/1/$METHOD"/transition_*; do
+        if [ "$CRYSTAL_MODE" = true ]; then
+            RESULTS_DIR="$RUN_DIR/1/crystal"
+        else
+            RESULTS_DIR="$RUN_DIR/1/$METHOD"
+        fi
+        for dir in "$RESULTS_DIR"/*; do
             [ -d "$dir" ] || continue
-            tidx=$(basename "$dir" | cut -d'_' -f2)
+            tidx=$(basename "$dir")
             [[ "$tidx" =~ ^[0-9]+$ ]] && TRANSITIONS_TO_PLOT+=("$tidx")
         done
     else
@@ -556,7 +620,7 @@ if [ ${#TRANSITIONS_TO_PLOT[@]} -eq 0 ]; then
 fi
 
 # Step 4: Verification.
-if [ "$CHECK_OSCILLATOR_STRENGTH" = true ]; then
+if [ "$CHECK_OSCILLATOR_STRENGTH" = true ] && [ "$CRYSTAL_MODE" != true ]; then
     echo "Step 4: Verifying results..."
     echo ""
 
@@ -582,21 +646,69 @@ echo "    ├── 1/  (molecule 1)"
 
 # Only report what was actually computed.
 if [ $TDDFT_TIME -gt 0 ]; then
-    echo "    │   ├── td_dft_results${PRECISION_SUFFIX}.h5"
+    if [ "$CRYSTAL_MODE" = true ]; then
+        echo "    │   ├── crystal_metadata.json"
+        echo "    │   └── conformers/"
+        echo "    │       └── A/"
+        echo "    │           └── td_dft_results${PRECISION_SUFFIX}.h5"
+    else
+        echo "    │   ├── td_dft_results${PRECISION_SUFFIX}.h5"
+    fi
 fi
 
 if [ $FORM_FACTOR_TIME -gt 0 ]; then
-    echo "    │   └── $METHOD/"
-    echo "    │       └── transition_*/"
-    echo "    │           └── fs_grid${PRECISION_SUFFIX}.h5"
+    if [ "$CRYSTAL_MODE" = true ]; then
+        echo "    │   ├── conformers/"
+        echo "    │   │   └── A/"
+        echo "    │   │       ├── 1/"
+        echo "    │   │       │   └── fs_grid${PRECISION_SUFFIX}.h5"
+        if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+            echo "    │   │       └── scattering_rates${PRECISION_SUFFIX}.h5"
+        fi
+        echo "    │   └── crystal/"
+        echo "    │       ├── 1/"
+        echo "    │       │   └── fs_grid${PRECISION_SUFFIX}.h5"
+        if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+            echo "    │       └── scattering_rates${PRECISION_SUFFIX}.h5"
+        fi
+    else
+        echo "    │   └── $METHOD/"
+        echo "    │       └── transition_*/"
+        echo "    │           └── fs_grid${PRECISION_SUFFIX}.h5"
+    fi
 fi
 
 if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
-    echo "    │           └── form_factor_*.png"
+    if [ "$CRYSTAL_MODE" = true ]; then
+        echo "    │   │       └── 1/"
+        if printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; then
+            echo "    │   │           └── form_factor_*.png"
+        fi
+        if [ "$PLOT_FLM_MODES" = true ]; then
+            echo "    │   │           └── flm_modes.png"
+        fi
+        if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+            echo "    │   │       └── scattering_rates.png"
+        fi
+        if [ "$PLOT_FLM_MODES" = true ]; then
+            echo "    │       └── 1/"
+            echo "    │           └── flm_modes.png"
+        fi
+        if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
+            echo "    │       └── scattering_rates.png"
+        fi
+    else
+        echo "    │           └── form_factor_*.png"
+    fi
 fi
 
 if [ "$SKIP_3D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
-    echo "    │           └── form_factor_3d_*.html"
+    if [ "$CRYSTAL_MODE" = true ]; then
+        echo "    │   │       └── 1/"
+        echo "    │   │           └── form_factor_3d_*.html"
+    else
+        echo "    │           └── form_factor_3d_*.html"
+    fi
 fi
 
 echo "    ├── 2/  (molecule 2, if applicable)"
