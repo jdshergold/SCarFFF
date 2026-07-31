@@ -8,23 +8,23 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="tstilb09"     # Name for this run.
+RUN_NAME="benzene_test"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
 CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
-SMILES=""        # Single molecule mode. SMILES string for the molecule.
-CIF_FILE="examples/our_favourite_molecules/TSTILB09.cif"  # Single crystal mode. Path to a CIF file.
+SMILES="C1=CC=CC=C1"        # Single molecule mode. SMILES string for the molecule.
+CIF_FILE=""                 # Single crystal mode. Path to a CIF file.
 CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
 
 
 # ==== TD-DFT parameters. ====
-BASIS="sto-3g"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="lda"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="def2-svp"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
-DFT_OPTIMISATION=false    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
+DFT_OPTIMISATION=true    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
 PLOT_MOLECULE_3D=false    # Set to true to generate interactive 3D molecule plot from TD-DFT.
 
 # ==== Form factor computation parameters. ====
@@ -32,18 +32,18 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
-Q_MAX=20.0                 # Maximum momentum transfer in keV.
-N_Q=101                    # Number of |q| grid points.
-N_THETA=101                # Number of theta (polar angle) grid points.
-N_PHI=101                  # Number of phi (azimuthal angle) grid points.
+Q_MAX=25.0                 # Maximum momentum transfer in keV.
+N_Q=251                    # Number of |q| grid points.
+N_THETA=251                # Number of theta (polar angle) grid points.
+N_PHI=251                  # Number of phi (azimuthal angle) grid points.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
+COMPUTE_MODES=("f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
-COMPUTE_RATES=true        # Set to true to compute DM scattering rates after the spherical form factor.
-M_GRID="1.0,1000.0,50"   # DM mass grid to use, in the form min_MeV,max_MeV,N (log-spaced). Only used if COMPUTE_RATES=true.
+COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor.
+M_GRID="1.0,1000.0,100"   # DM mass grid to use, in the form min_MeV,max_MeV,N (log-spaced). Only used if COMPUTE_RATES=true.
 N_ROTATIONS="12,6,12"     # Number of detector rotations to consider (n_alpha,n_beta,n_gamma). Only used if COMPUTE_RATES=true.
 
 # ==== FFT method parameters. ====
@@ -62,7 +62,7 @@ TRANSITION_INDICES="all"       # Which electronic transitions to compute. Can be
 THRESHOLD=1e-6             # Threshold for dropping small tensor values. For spherical: |W/W_max| < THRESHOLD. For Cartesian: |M_ij/M_max| < THRESHOLD. Set to 0.0 to disable. Around 1e-6 is recommended for both accuracy and performance.
 JULIA_THREADS="auto"       # Number of threads to use for the Julia part of the code. Set to "auto" to use all available threads.
 PRECISION="float32"       # Floating point precision for form factor computation. On CPU this has negligible impact on performance, but cuts down on file size by ~2. May produce 'fuzzy looking' Re/Im plots when the values are effectively zero in float32.
-USE_GPU=false              # Set to true to enable GPU acceleration for the DFT and form factor computations. Supports spherical, FFT, and Cartesian methods.
+USE_GPU=true              # Set to true to enable GPU acceleration for the DFT and form factor computations. Supports spherical, FFT, and Cartesian methods.
 
 # ==== Control flags. ====
 SKIP_TDDFT=true            # Set to true to skip the TD-DFT calculation. Will not be skipped if the results do not already exist.
@@ -523,7 +523,11 @@ else
             for dir in "$RESULTS_DIR"/*; do
                 [ -d "$dir" ] || continue
                 tidx=$(basename "$dir")
-                [[ "$tidx" =~ ^[0-9]+$ ]] && TRANSITIONS_TO_PLOT+=("$tidx")
+                if [[ "$tidx" =~ ^[0-9]+$ ]]; then
+                    TRANSITIONS_TO_PLOT+=("$tidx")
+                elif [[ "$tidx" =~ ^transition_([0-9]+)$ ]]; then
+                    TRANSITIONS_TO_PLOT+=("${BASH_REMATCH[1]}")
+                fi
             done
         else
             IFS=',' read -ra TRANSITIONS_TO_PLOT <<< "$TRANSITION_INDICES"
@@ -609,7 +613,11 @@ if [ ${#TRANSITIONS_TO_PLOT[@]} -eq 0 ]; then
         for dir in "$RESULTS_DIR"/*; do
             [ -d "$dir" ] || continue
             tidx=$(basename "$dir")
-            [[ "$tidx" =~ ^[0-9]+$ ]] && TRANSITIONS_TO_PLOT+=("$tidx")
+            if [[ "$tidx" =~ ^[0-9]+$ ]]; then
+                TRANSITIONS_TO_PLOT+=("$tidx")
+            elif [[ "$tidx" =~ ^transition_([0-9]+)$ ]]; then
+                TRANSITIONS_TO_PLOT+=("${BASH_REMATCH[1]}")
+            fi
         done
     else
         IFS=',' read -ra TRANSITIONS_TO_PLOT <<< "$TRANSITION_INDICES"

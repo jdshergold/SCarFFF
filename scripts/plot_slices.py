@@ -19,6 +19,10 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+# Ensure that trapz is defined, so that all versions of numpy are compatible.
+if not hasattr(np, 'trapz'):
+    np.trapz = getattr(np, 'trapezoid', None)
+
 
 def parse_cli_args():
     """
@@ -532,7 +536,7 @@ def get_top_flm_modes(f_lm, q_grid, top_n=8):
     for l in range(l_max + 1):
         for m in range(-l, l + 1):
             key = l * l + (l + m) + 1
-            areas[(l, m)] = np.trapezoid(np.abs(f_lm[:, key - 1]), q_grid)
+            areas[(l, m)] = np.trapz(np.abs(f_lm[:, key - 1]), q_grid)
     top_modes = sorted(areas, key=areas.get, reverse=True)[:top_n]
     return top_modes
 
