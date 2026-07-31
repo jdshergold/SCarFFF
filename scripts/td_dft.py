@@ -66,7 +66,7 @@ ATOMIC_NUMBERS = {
 
 BOHR_TO_ANGSTROM = 0.52917721092
 
-def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1"):
+def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1", n_top=5, energy_thresh=0.1):
     """Use RDKit to generate quasi-optimal molecular geometry for a given SMILES string.
 
     # Arguments:
@@ -104,26 +104,38 @@ def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1"):
         params.useSmallRingTorsions = True
         cids = AllChem.EmbedMultipleConfs(molecule, numConfs=30, params=params)
 
-    # Optimise all of the conformers and find the one with lowest energy.
-    results = AllChem.UFFOptimizeMoleculeConfs(molecule, numThreads=0)
+    # Optimise all conformers with MMFF94, then greedily select up to n_top unique ones.
+    # Two conformers are treated as duplicates if their energies are within energy_thresh kcal/mol.
+    results = AllChem.MMFFOptimizeMoleculeConfs(molecule, numThreads=0, mmffVariant="MMFF94")
 
     energies = [res[1] for res in results]
-    best_idx = int(np.argmin(energies))
-    best_cid = int(cids[best_idx])
+    # First find n_top unique conformers with the lowest energies.
+    selected_cids = []
+    selected_energies = []
+    for idx in np.argsort(energies):
+        e = energies[int(idx)]
+        if any(abs(e - se) < energy_thresh for se in selected_energies):
+            continue
+        selected_cids.append(int(cids[int(idx)]))
+        selected_energies.append(e)
+        if len(selected_cids) == n_top:
+            break
 
-    # Extract the coordinates from the best conformer.
-    best_conf = molecule.GetConformer(best_cid)
-
-    coordinates = []
-    for i in range(molecule.GetNumAtoms()):
-        atom = molecule.GetAtomWithIdx(i)
-        pos = best_conf.GetAtomPosition(i)
-        coordinates.append([atom.GetSymbol(), pos.x, pos.y, pos.z])
+    # Then store their coordinates.
+    top_conformers = []
+    for cid in selected_cids:
+        conf = molecule.GetConformer(cid)
+        coordinates = []
+        for i in range(molecule.GetNumAtoms()):
+            atom = molecule.GetAtomWithIdx(i)
+            pos = conf.GetAtomPosition(i)
+            coordinates.append([atom.GetSymbol(), pos.x, pos.y, pos.z])
+        top_conformers.append(coordinates)
 
     # Get the ring information.
     ring_indices = molecule.GetRingInfo().AtomRings()
 
-    return coordinates, ring_indices
+    return top_conformers, ring_indices
 
 def get_dft_optimised_geometry(coords, basis="6-31g*", xc="b3lyp", use_gpu=False):
     """
@@ -491,8 +503,13 @@ def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False):
 
     # Move to GPU if requested.
     if use_gpu:
+        from gpu4pyscf.lib.cupy_helper import get_avail_mem
+
         print("Moving TD-DFT object to GPU...")
         td = td.to_gpu()
+        # td.max_memory sizes Davidson's GPU bookkeeping matrices, which grow as
+        # O(max_space^2), so only give it a quarter of what's free, not all of it.
+        td.max_memory = get_avail_mem() / 1024**2 * 0.25
 
     td.kernel()
 
@@ -545,6 +562,44 @@ def get_tdm(tdobj, state=1):
     return np.sqrt(2) * TDM
 
 
+def select_conformer_by_dft_sp(conformers, basis="6-31g*", xc="b3lyp", use_gpu=False):
+    """Run a DFT single-point on each conformer and return the one with the lowest energy.
+
+    # Arguments:
+    - conformers::list: List of conformer coordinate lists (each in [[symbol, x, y, z], ...] format).
+    - basis::str: Basis set for the calculation.
+    - xc::str: Exchange-correlation functional.
+    - use_gpu::bool: Whether to run on GPU.
+
+    # Returns:
+    - coordinates::list: Coordinates of the lowest-energy conformer.
+    """
+    best_coords = None
+    best_energy = float("inf")
+
+    for i, coords in enumerate(conformers):
+        print(f"DFT single-point on conformer {i + 1}/{len(conformers)}...")
+        mol = create_pyscf_mol(coords, basis=basis)
+        mf = dft.RKS(mol)
+        mf.xc = xc
+        mf = mf.density_fit()
+        mf.verbose = 0
+        if use_gpu:
+            mf = mf.to_gpu()
+        mf.kernel()
+        if use_gpu:
+            mf = mf.to_cpu()
+        if mf.converged and mf.e_tot < best_energy:
+            best_energy = mf.e_tot
+            best_coords = coords
+
+    if best_coords is None:
+        print("All DFT single-points failed to converge, using the MMFF94 minimum instead. If you're seeing this, you should probably be wary of any further results too.")
+        best_coords = conformers[0]
+
+    return best_coords
+
+
 def run_td_dft_analysis(
     smiles="C1=CC=CC=C1",
     basis="6-31g*",
@@ -577,13 +632,15 @@ def run_td_dft_analysis(
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and d_ij matrices.
     """
     print("Optimising geometry with RDKit.")
-    coords0, ring_indices = get_rdkit_optimised_geometry(smiles=smiles)
+    top_conformers, ring_indices = get_rdkit_optimised_geometry(smiles=smiles)
 
     if dft_optimisation:
+        print(f"Ranking {len(top_conformers)} conformers by DFT single-point energy.")
+        coords0 = select_conformer_by_dft_sp(top_conformers, basis=basis, xc=xc, use_gpu=use_gpu)
         print("Further optimising geometry with PySCF DFT.")
         coords = get_dft_optimised_geometry(coords0, basis=basis, xc=xc, use_gpu=use_gpu)
     else:
-        coords = coords0
+        coords = top_conformers[0]
 
     print("Flattening molecule.")
     if ring_flatten:
