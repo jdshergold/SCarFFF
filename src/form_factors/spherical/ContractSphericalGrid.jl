@@ -44,7 +44,7 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
     f_s = Array{Complex{T}}(undef, n_transitions, n_q, n_theta, n_phi)
 
     # Allocate per-thread caches for spherical harmonics to avoid races.
-    n_threads = nthreads()
+    n_threads = Base.Threads.maxthreadid()
     Y_cache_pool = [
         SphericalHarmonics.cache(l_max, SphericalHarmonics.FullRange) for _ in 1:n_threads
     ]

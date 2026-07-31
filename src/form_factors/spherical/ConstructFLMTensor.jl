@@ -99,7 +99,7 @@ function construct_f_lm_tensor(
     # Get dimensions.
     n_transitions, n_q, n_keys = size(R_tensor)
     n_gaunt = length(gaunt_coeffs)
-    n_threads = nthreads()
+    n_threads = Base.Threads.maxthreadid()
 
     # Allocate the output tensor.
     f_lm = zeros(Complex{T}, n_transitions, n_q, n_keys)

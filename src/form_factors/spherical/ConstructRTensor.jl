@@ -244,9 +244,10 @@ function construct_R_tensor(
     n_keys = (l_max + 1)^2
     R_tensor = zeros(Complex{T}, n_transitions, n_q, n_keys)
 
-    # Get the number of (i, j) bins and number of threads.
+    # Get the number of (i, j) bins and size thread-local pools by the maximum
+    # possible threadid(), which can exceed nthreads() with multiple thread pools.
     num_ij_bins = length(W_tensor.ij_bins)
-    n_threads = nthreads()
+    n_threads = Base.Threads.maxthreadid()
 
     # Allocate arrays for precomputed quantities.
     n_max = W_tensor.n_max

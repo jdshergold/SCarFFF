@@ -77,8 +77,9 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
     num_ij_bins = length(D_tensor.ij_bins)
     num_A_uvw_bins = length(A_tensor.uvw_bins)
 
-    # Get the number of threads and allocate thread-local storage.
-    n_threads = nthreads()
+    # Allocate thread-local storage. Use maxthreadid() because threadid() can exceed nthreads()
+    # when Julia is running with interactive/default thread pools.
+    n_threads = Base.Threads.maxthreadid()
 
     # Allocate thread-local buffers to store W tensor entries in COO format.
     i_indices_pool = [Int[] for _ in 1:n_threads]
@@ -90,6 +91,7 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
 
     # Allocate thread-local accumulators for each (i, j) slice.
     W_ij_slice_pool = [zeros(Complex{T}, n_dim, lambda_dim, mu_dim) for _ in 1:n_threads]
+    W_ij_touched_pool = [falses(n_dim, lambda_dim, mu_dim) for _ in 1:n_threads]
     nonzero_slots_pool = [Vector{NTuple{3, Int}}(undef, n_dim * lambda_dim * mu_dim) for _ in 1:n_threads]
 
     # Process (i, j) bins in parallel.
@@ -145,8 +147,9 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
                 lambda_idx = lambda + 1
                 mu_idx = mu + mu_offset
 
-                # Keep track of which slots have nonzero entries.
-                if W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx] == typed_complex_zero
+                # Track touched slots separately from their value, since contributions can cancel to zero.
+                if !W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx]
+                    W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx] = true
                     nonzero_count += 1
                     nonzero_slots_pool[thread_id][nonzero_count] = (n_idx, lambda_idx, mu_idx)
                 end
@@ -161,6 +164,8 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
         @inbounds for idx in 1:nonzero_count
             n_idx, lambda_idx, mu_idx = nonzero_slots_pool[thread_id][idx]
             value = W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx]
+            W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx] = typed_complex_zero
+            W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx] = false
             value == typed_complex_zero && continue
             push!(i_indices_pool[thread_id], pair_i)
             push!(j_indices_pool[thread_id], pair_j)
@@ -168,7 +173,6 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
             push!(mu_indices_pool[thread_id], mu_idx - mu_offset)
             push!(n_indices_pool[thread_id], n_idx - 1)
             push!(W_values_pool[thread_id], value)
-            W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx] = typed_complex_zero
         end
     end
 
