@@ -2,6 +2,9 @@ module ReadBasisSet
 
 using HDF5
 
+include("DensityMatrices.jl")
+using .DensityMatrices: build_transition_matrix, to_real_density
+
 export get_molecular_data, MoleculeData
 
 # Create a map from real spherical harmonic labels to m.
@@ -263,10 +266,16 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     n_atoms = size(atom_coordinates, 1)
     molecule_cuboid = vcat(minimum(atom_coordinates, dims = 1), maximum(atom_coordinates, dims = 1)) # Minimum and maximum x, y, z coordinates.
 
-    # Now read in the transition matrices and energies.
-    n_transitions = length(h5_data["transition_matrices"])
+    # Build the AO basis transition density matrices from the MO coefficients and amplitudes, then
+    # take the real part, which is checked rather than assumed.
+    mo_coeff_occ = h5_data["mo_coeff_occ"]
+    mo_coeff_vir = h5_data["mo_coeff_vir"]
+    n_transitions = length(h5_data["X_matrices"])
     for idx in 1:n_transitions
-        push!(transition_matrices, h5_data["transition_matrices"][idx])
+        transition_matrix = build_transition_matrix(
+            h5_data["X_matrices"][idx], h5_data["Y_matrices"][idx], mo_coeff_occ, mo_coeff_vir
+        )
+        push!(transition_matrices, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
         push!(transition_energies_eV, h5_data["energies_ev"][idx])
     end
 
@@ -402,12 +411,23 @@ function get_molecular_data(
         ao_labels = read(io, "ao_labels")
         energies_ev = read(io, "energies_ev")
 
-        # Read the transition matrices, which are stored under different keys.
-        transition_matrices = []
+        # Read the MO coefficients, which are shared across all transitions. The density matrices are
+        # assembled from these and the X and Y amplitudes rather than being read ready-made, so that
+        # the transition, ground state and difference densities can all be built from one file.
+        haskey(io, "mo_coeff_occ") || error(
+            "No 'mo_coeff_occ' found in $(td_dft_file). This file predates the switch to storing MO " *
+            "coefficients and X/Y amplitudes, so please re-run td_dft.py to regenerate it."
+        )
+        mo_coeff_occ = restore_python_hdf5_order(read(io, "mo_coeff_occ"))
+        mo_coeff_vir = restore_python_hdf5_order(read(io, "mo_coeff_vir"))
+
+        # Read the per-transition X and Y amplitudes, which are stored under different keys.
+        X_matrices = []
+        Y_matrices = []
         state_idx = 1
-        while haskey(io, "d_ij_state_$state_idx")
-            raw_tdm = read(io, "d_ij_state_$state_idx")
-            push!(transition_matrices, restore_python_hdf5_order(raw_tdm))
+        while haskey(io, "X_state_$state_idx")
+            push!(X_matrices, restore_python_hdf5_order(read(io, "X_state_$state_idx")))
+            push!(Y_matrices, restore_python_hdf5_order(read(io, "Y_state_$state_idx")))
             state_idx += 1
         end
 
@@ -417,7 +437,10 @@ function get_molecular_data(
             "atom_coordinates" => atom_coordinates,
             "ao_labels" => ao_labels,
             "energies_ev" => energies_ev,
-            "transition_matrices" => transition_matrices
+            "mo_coeff_occ" => mo_coeff_occ,
+            "mo_coeff_vir" => mo_coeff_vir,
+            "X_matrices" => X_matrices,
+            "Y_matrices" => Y_matrices
         )
     end
 

@@ -47,10 +47,14 @@ function write_mock_molecular_data_file(file_path::String, ::Type{T}) where {T<:
         # Write  the orbital labels. This is just two 1s orbitals.
         io["ao_labels"] = ["0 H 1s", "1 H 1s"]
 
-        # Write the transition data. Just single transition at 1.0 eV with identity transition matrix.
+        # Write the transition data. Just a single transition at 1.0 eV, with one occupied and one
+        # virtual orbital, whose amplitudes and coefficients give an identity transition matrix.
         # We have to transpose again here because of python-Julia weirdness.
         io["energies_ev"] = T[1.0]
-        io["d_ij_state_1"] = permutedims(T[1.0 0.0; 0.0 1.0], (2, 1))
+        io["mo_coeff_occ"] = permutedims(Complex{T}[1.0; 0.0;;], (2, 1))
+        io["mo_coeff_vir"] = permutedims(Complex{T}[0.0; 1.0;;], (2, 1))
+        io["X_state_1"] = permutedims(Complex{T}[1.0;;], (2, 1))
+        io["Y_state_1"] = permutedims(Complex{T}[0.0;;], (2, 1))
     end
 end
 

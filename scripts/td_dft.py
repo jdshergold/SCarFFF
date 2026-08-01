@@ -538,10 +538,9 @@ def write_nto(mol, ID, wghts, nto):
     cubegen.orbital(mol, ID + "vir.cube", nto[:, nocc])
 
 
-def get_tdm(tdobj, state=1):
+def get_xy(tdobj, state=1):
     """
-    Returns the transition density matrix in the MO basis, constructed from
-    the TD-DFT X and Y matrices as T = X + Y.
+    Returns the TD-DFT X and Y matrices in the MO basis for a given excited state.
 
     These are PySCF's matrices exactly as returned, i.e. the per-spin-channel
     X_alpha and Y_alpha. For the RKS singlets we use, X_alpha = X_beta, so PySCF
@@ -553,21 +552,22 @@ def get_tdm(tdobj, state=1):
     do NOT rescale here. Instead, SCarFFF carries the per-spin-channel matrices
     unmodified, and the factor of 2 for the two spin channels is applied later by
     whatever needs it. This avoids having to track how many powers of
-    X and Y a given density carries. 
+    X and Y a given density carries.
+
+    X and Y are kept separate rather than being combined into any TDMs.
+    Building the density matrices is left to SCarFFF, as it depends on the
+    density in question.
 
     # Arguments:
     - tdobj::TDDFT: The TD-DFT object containing excited state information.
     - state::int: The excited state to analyze (default: 1).
 
     # Returns:
-    - TDM::np.ndarray: The transition density matrix in the MO basis.
+    - X::np.ndarray: The excitation amplitudes, with shape (n_occupied, n_virtual).
+    - Y::np.ndarray: The de-excitation amplitudes, with the same shape.
     """
     state_id = state - 1
-    X = tdobj.xy[state_id][0]
-    Y = tdobj.xy[state_id][1]
-
-    # Add the X and Y matrices to get the TDM for a transition density in the MO basis.
-    return X + Y
+    return tdobj.xy[state_id][0], tdobj.xy[state_id][1]
 
 
 def select_conformer_by_dft_sp(conformers, basis="6-31g*", xc="b3lyp", use_gpu=False):
@@ -637,7 +637,7 @@ def run_td_dft_analysis(
         plot_molecule_3d::bool: Whether to generate the interactive 3D molecule plot (default: False).
 
     Returns:
-        tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and d_ij matrices.
+        tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
     """
     print("Optimising geometry with RDKit.")
     top_conformers, ring_indices = get_rdkit_optimised_geometry(smiles=smiles)
@@ -701,7 +701,7 @@ def run_td_dft_analysis_from_coordinates(
         plot_molecule_3d::bool: Whether to generate the interactive 3D molecule plot (default: False).
 
     Returns:
-        tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and d_ij matrices.
+        tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
     """
 
     print("Creating pySCF molecule with generated geometry.")
@@ -719,23 +719,19 @@ def run_td_dft_analysis_from_coordinates(
     else:
         td.analyze()
 
-    print(f"Computing d_ij for the first N={ntrans} transitions.")
+    print(f"Extracting X and Y for the first N={ntrans} transitions.")
 
-    # Extract the TDM for the first ntrans transitions.
-    mxTDM = [get_tdm(td, state=i + 1) for i in range(ntrans)]
+    # Extract the X and Y matrices for the first ntrans transitions.
+    mxXY = [get_xy(td, state=i + 1) for i in range(ntrans)]
 
     # Find which MOs are occupied and which are virtual.
     occupations = mf.mo_occ
     occ_mask = occupations > 0
 
-    # Extract the molecular orbital coefficients.
+    # Extract the molecular orbital coefficients. We save these and X and Y rather than an
+    # assembled density matrix, so that SCarFFF can build whichever density it needs.
     orbo = mf.mo_coeff[:, occ_mask]
     orbv = mf.mo_coeff[:, ~occ_mask]
-
-    # Use these alongside the TDM to construct d_{ij}. The true form is
-    # T = C_o X C_v^T + C_v Y^T C_o^T. When contracted with real AOs, as in our case, the
-    # simplified form below holds.
-    mxDij = [orbo @ tdm @ (orbv.conj().T) for tdm in mxTDM]
 
     # Prepare data for saving to file.
     geometry = [[atom[0], atom[1][0], atom[1][1], atom[1][2]] for atom in mol._atom]
@@ -779,13 +775,18 @@ def run_td_dft_analysis_from_coordinates(
         f.create_dataset("energies_ev", data=np.array(energies, dtype=float_dtype))
         f.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
 
-        # Store the transition matrices.
-        for i, dij_matrix in enumerate(mxDij):
-            f.create_dataset(f"d_ij_state_{i+1}", data=np.asarray(dij_matrix, dtype=complex_dtype))
+        # Store the occupied and virtual MO coefficients, shared across all transitions.
+        f.create_dataset("mo_coeff_occ", data=np.asarray(orbo, dtype=complex_dtype))
+        f.create_dataset("mo_coeff_vir", data=np.asarray(orbv, dtype=complex_dtype))
+
+        # Store the per-transition X and Y amplitudes.
+        for i, (X, Y) in enumerate(mxXY):
+            f.create_dataset(f"X_state_{i+1}", data=np.asarray(X, dtype=complex_dtype))
+            f.create_dataset(f"Y_state_{i+1}", data=np.asarray(Y, dtype=complex_dtype))
 
     print(f"\nResults saved to {output_file}")
 
-    return coordinates, mol, mf, td, mxDij
+    return coordinates, mol, mf, td, mxXY
 
 
 def parse_cli_arguments():
