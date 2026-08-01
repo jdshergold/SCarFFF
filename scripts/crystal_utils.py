@@ -11,6 +11,10 @@ from pymatgen.io.cif import CifParser
 # Two molecules are the same conformer if their Kabsch RMSD is below this threshold.
 CONFORMER_RMSD_THRESHOLD = 0.01  # Å
 
+# Fractional coordinates this close to a cell face are treated as sitting on it when wrapping
+# molecule centroids into the primary unit cell.
+CELL_WRAP_TOLERANCE = 1.0e-8
+
 
 def kabsch_rotation(x_ref, x_prime):
     """
@@ -189,14 +193,30 @@ def get_crystal_data(cif_path):
                 mol_coordinates.append(site.coords)
                 mol_species.append(element)
 
-            # Move the molecule to the origin without flattening it.
+            # Move the molecule to the origin without flattening it. The centroid we subtract here
+            # is the translation vector tau_{A,i} mapping the reference monomer onto this image, so
+            # keep it rather than throwing it away, as the crystal form factor needs it for the
+            # exp(i q . tau) phases.
             mol_coordinates = np.array(mol_coordinates)
-            mol_coordinates = mol_coordinates - mol_coordinates.mean(axis=0)
+            mol_centroid = mol_coordinates.mean(axis=0)
+            mol_coordinates = mol_coordinates - mol_centroid
+
+            # Wrap tau into the primary unit cell. Splitting a molecule's position into "which cell"
+            # and "where in the cell" is a convention, and shifting tau by a lattice vector R0
+            # rescales its phase by exp(i k . R0), which is not 1. Pinning tau to fractional
+            # coordinates in [0, 1) makes that split canonical, so the phases here and the lattice
+            # sums in the Bloch Hamiltonian agree on which cell each molecule belongs to.
+            # Snap fractional coordinates that land within numerical noise of a cell face, so a
+            # centroid at -1e-16 wraps to 0 rather than to just under 1 (a whole lattice vector out).
+            mol_fractional = np.mod(structure.lattice.get_fractional_coords(mol_centroid), 1.0)
+            mol_fractional[np.isclose(mol_fractional, 1.0, atol=CELL_WRAP_TOLERANCE)] = 0.0
+            mol_translation = structure.lattice.get_cartesian_coords(mol_fractional)
 
             # Check this molecule against each known conformer using graph matching + Kabsch.
             best_label = None
             best_rmsd = np.inf
             best_R = None
+            best_mapping = None
 
             for label, ref_coords in conformer_coordinates.items():
                 mapper = isomorphism.GraphMatcher(conformer_graphs[label], mol_graph.graph.to_undirected(), node_match=node_match)
@@ -215,6 +235,7 @@ def get_crystal_data(cif_path):
                         best_rmsd = rmsd
                         best_R = R
                         best_label = label
+                        best_mapping = new_indices
 
             # If the best match is above threshold, this is a new conformer.
             if best_rmsd >= CONFORMER_RMSD_THRESHOLD:
@@ -223,6 +244,7 @@ def get_crystal_data(cif_path):
                 conformer_species[best_label] = mol_species
                 conformer_graphs[best_label] = mol_graph.graph.to_undirected()
                 best_R = np.eye(3) # The map is just the identity for the new conformer.
+                best_mapping = list(range(len(mol_coordinates))) # And so is the atom ordering.
 
             # Find the proper rotation matrix for this conformer, and save the determinant for future reference.
             det_R = float(np.linalg.det(best_R))
@@ -232,6 +254,12 @@ def get_crystal_data(cif_path):
                 "conformer_label": best_label,
                 "det_rotation": det_R,
                 "proper_rotation": proper_rotation.tolist(),
+                # tau_{A,i}, the translation from the cell origin to this image's centroid, in Angstroms.
+                "translation": mol_translation.tolist(),
+                # Maps reference conformer atom index -> this image's atom index. Not needed for the
+                # form factor, which is a whole-molecule object, but the nuclear Z_I term in the
+                # diagonal Frenkel correction needs to know which atom is which.
+                "atom_mapping": [int(idx) for idx in best_mapping],
             })
 
         disorder_groups.append({
@@ -249,10 +277,18 @@ def get_crystal_data(cif_path):
             "atom_coordinates": conformer_coordinates[label].tolist(),
         }
 
+    # The dominant disorder group is the one with the highest occupancy. For now the crystal
+    # excitation treatment runs on this group alone, but we keep every group in the metadata so
+    # that a proper (Monte Carlo) disorder treatment later has what it needs.
+    dominant_group = max(disorder_groups, key=lambda g: g["occupancy"])["group"]
+
     crystal_data = {
         "cif_path": str(cif_path),
         "conformer_labels": conformer_labels,
         "conformers": conformers,
+        # Rows are the direct lattice vectors a1, a2, a3 in Angstroms.
+        "lattice": structure.lattice.matrix.tolist(),
+        "dominant_group": dominant_group,
         "disorder_groups": disorder_groups,
     }
 
@@ -281,6 +317,8 @@ def build_crystal_metadata(crystal_data):
                 "conformer_label": molecule["conformer_label"],
                 "det_rotation": molecule["det_rotation"],
                 "proper_quaternion": rotation_matrix_to_quaternion(molecule["proper_rotation"]),
+                "translation": molecule["translation"],
+                "atom_mapping": molecule["atom_mapping"],
             })
 
         # Append each disorder group.
@@ -292,6 +330,8 @@ def build_crystal_metadata(crystal_data):
 
     crystal_metadata = {
         "conformer_labels": list(crystal_data["conformer_labels"]),
+        "lattice": crystal_data["lattice"],
+        "dominant_group": crystal_data["dominant_group"],
         "disorder_groups": disorder_groups,
     }
 

@@ -11,7 +11,11 @@ using JSON
 using Quaternionic
 
 # Import everything that we need from SCarFFF.
+using StaticArrays
 using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
+using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_crystal_lattice,
+                                  rotate_R_tensors, compute_coherent_crystal_f_lm, project_f_lm
+using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
 
 function parse_commandline()::Dict{String, Any}
     """
@@ -44,6 +48,9 @@ function parse_commandline()::Dict{String, Any}
         "--crystal-mode"
             help = "Whether to process crystals rather than isolated molecules. Only supported for the spherical method."
             action = :store_true
+        "--crystal-order"
+            help = "How to combine monomer form factors into the crystal form factor. 'coherent' solves the Frenkel exciton Bloch problem and mixes the molecular amplitudes with the resulting coefficients. 'incoherent' is the zeroth-order approximation that adds |f|^2 over the rotated images. Options: 'coherent' or 'incoherent'."
+            default = "incoherent"
         "--method"
             help = "Computation method for the form factor. Options: 'spherical', 'fft', or 'cartesian'."
             default = "spherical"
@@ -245,6 +252,62 @@ function build_crystal_conformer_sets(crystal_metadata, ::Type{T}) where {T<:Abs
     return conformer_sets
 end
 
+function build_dominant_group_images(crystal_metadata, conformer_labels::Vector{String}, ::Type{T}) where {T<:AbstractFloat}
+    """
+    Collect the molecules of the dominant disorder group as CrystalImage objects, for the coherent
+    crystal treatment.
+
+    The coherent Frenkel exciton treatment assumes a perfect, ordered crystal, so for now it runs on
+    the highest-occupancy disorder group alone. Every group is still parsed and carried in the
+    metadata, so that a proper (Monte Carlo) disorder treatment can use them later.
+
+    # Arguments:
+    - crystal_metadata::Dict{String, Any}: The crystal metadata read from JSON.
+    - conformer_labels::Vector{String}: The conformer labels, whose order sets the conformer indices.
+    - T::Type: The floating point type to use.
+
+    # Returns:
+    - images::Vector{CrystalImage{T}}: The molecules of the dominant group.
+    - group_name::String: The name of the group used.
+    - occupancy::T: That group's occupancy.
+    """
+
+    haskey(crystal_metadata, "dominant_group") ||
+        error("The crystal metadata has no 'dominant_group' entry. Re-run td_dft.py to regenerate crystal_metadata.json with the lattice and translation data the coherent path needs.")
+
+    # Get the dominant group, and turn labels to indices (A -> 1, B -> 2,...).
+    dominant_group = string(crystal_metadata["dominant_group"])
+    label_to_index = Dict(label => idx for (idx, label) in enumerate(conformer_labels))
+
+    # Find the index of the dominant group.
+    group_index = findfirst(g -> string(g["group"]) == dominant_group, crystal_metadata["disorder_groups"])
+    group_index === nothing && error("The dominant disorder group '$(dominant_group)' is not present in the metadata.")
+    disorder_group = crystal_metadata["disorder_groups"][group_index]
+
+    # Initialise the list of images.
+    images = CrystalImage{T}[]
+    for molecule in disorder_group["molecules"]
+        # Check that the molecule has all the required data.
+        haskey(molecule, "translation") ||
+            error("A molecule in the crystal metadata has no 'translation'. Re-run td_dft.py to regenerate crystal_metadata.json.")
+
+        label = molecule["conformer_label"]
+        haskey(label_to_index, label) || error("No conformer found for label $(label).")
+
+        # Add the data of the molecule to the image list.
+        push!(images, CrystalImage{T}(
+            label_to_index[label],
+            Quaternionic.rotor(T.(molecule["proper_quaternion"])),
+            T(molecule["det_rotation"]),
+            SVector{3, T}(T.(molecule["translation"])),
+        ))
+    end
+
+    isempty(images) && error("The dominant disorder group '$(dominant_group)' contains no molecules.")
+
+    return images, dominant_group, T(disorder_group["occupancy"])
+end
+
 function main()
 
     # Start timing the computation.
@@ -260,6 +323,9 @@ function main()
     # Extract the common run parameters.
     method = lowercase(args["method"])
     crystal_mode = args["crystal-mode"]
+    crystal_order = lowercase(args["crystal-order"])
+    crystal_order in ("coherent", "incoherent") ||
+        error("Invalid crystal order '$(args["crystal-order"])'. The supported options are 'coherent' and 'incoherent'.")
     transition_indices_str = args["transition-indices"]
     force_recomp = args["force-recomputation"]
     run_benchmark = args["benchmark"]
@@ -420,6 +486,11 @@ function main()
             if compute_rates_flag
                 need_flm = true  # f_lm tensor is required for rate computation.
             end
+            if crystal_mode && crystal_order == "coherent"
+                # The coherent path rotates each conformer's R tensor into every image's orientation,
+                # so the R tensor has to be kept even if it was not asked for as an output.
+                need_R = true
+            end
 
             # Define the momentum grid.
             q_grid = collect(range(typed_zero, T(q_max), length=N_q))
@@ -570,8 +641,59 @@ function main()
                 conformer_sets = build_crystal_conformer_sets(crystal_metadata, T)
 
                 # set_f_lm is the one aggregated over one conformer group (e.g. 1_A), the other is aggregated over all groups.
+                # This is the zeroth-order, incoherent approximation: it adds |f|^2 over the rotated
+                # images, ignoring both the relative phases and any mixing between molecules.
                 set_f_lm, aggregate_f_lm = construct_crystal_f_lm_tensors(conformer_labels, conformer_f_lm, conformer_sets)
                 conformer_set_occupancies = T[conformer_set.occupancy for conformer_set in conformer_sets]
+
+                # The coherent path solves the Frenkel exciton Bloch problem and mixes the molecular
+                # amplitudes before squaring, then projects back onto real spherical harmonics.
+                coherent_results = nothing
+                if crystal_order == "coherent"
+                    haskey(crystal_metadata, "lattice") ||
+                        error("The crystal metadata has no 'lattice' entry, which the coherent path needs. Re-run td_dft.py to regenerate crystal_metadata.json.")
+
+                    # Construct the lattice and reciprocal lattice.
+                    lattice_matrix = reduce(vcat, [reshape(T.(row), 1, 3) for row in crystal_metadata["lattice"]])
+                    lattice = build_crystal_lattice(lattice_matrix, T)
+
+                    # Build the list of images of the dominant group.
+                    images, dominant_group, dominant_occupancy =
+                        build_dominant_group_images(crystal_metadata, conformer_labels, T)
+
+                    println("Solving the Frenkel exciton Bloch problem for disorder group $(dominant_group) ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
+
+                    # Get the R tensors for each conformer.
+                    conformer_R_tensors = [conformer_results[label].R_tensor for label in conformer_labels]
+                    any(isnothing, conformer_R_tensors) &&
+                        error("The coherent crystal path needs the R tensor for every conformer, but at least one is missing.")
+
+                    conformer_energy_lists = [T.(conformer_results[label].transition_energies_eV) for label in conformer_labels]
+                    basis = build_excitation_basis(images, conformer_energy_lists)
+
+                    # Rotate each conformer's coefficients into every image's orientation using D matrices. 
+                    # This keeps all images on the same unrotated q grid.
+                    rotated_R = rotate_R_tensors(conformer_R_tensors, images, basis, l_max)
+
+                    # The Brillouin zone folding works in inverse Angstroms, matching the lattice.
+                    q_grid_invA = T(KEV_TO_INV_ANGSTROM) .* q_grid
+
+                    # This streams over q internally, projecting each block onto real spherical
+                    # harmonics as it goes, so the full |f|^2 grid is never held in memory. Overwritten
+                    # need grid is specfied.
+                    crystal_state_f_lm, crystal_band_summary, crystal_f_s = compute_coherent_crystal_f_lm(
+                        rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max;
+                        need_grid = need_grid)
+
+                    coherent_results = (
+                        basis = basis,
+                        dominant_group = dominant_group,
+                        dominant_occupancy = dominant_occupancy,
+                        band_summary = crystal_band_summary,
+                        state_f_lm = crystal_state_f_lm,
+                        f_s = crystal_f_s,
+                    )
+                end
 
                 for (batch_idx, transition_idx) in enumerate(transition_indices)
                     transition_output_dir = joinpath(mol_output_dir, "crystal", string(transition_idx))
@@ -616,6 +738,46 @@ function main()
                         write(io, "q_grid", q_grid)
                         write(io, "transition_index", transition_idx)
                     end
+                end
+
+                # The coherent result is written once rather than per transition: a crystal state Ψ
+                # is a mixture of monomer transitions, so it has no per-transition decomposition.
+                if coherent_results !== nothing
+                    coherent_output_dir = joinpath(mol_output_dir, "crystal", "coherent")
+                    mkpath(coherent_output_dir)
+
+                    # The lattice, translations and per-molecule labels are not duplicated here: they
+                    # are already in crystal_metadata.json, and the per-molecule labels index λ while
+                    # the results below index Ψ, with no C stored to bridge them.
+                    coherent_basis = coherent_results.basis
+
+                    coherent_path = joinpath(coherent_output_dir, "crystal_f_lm$(type_suffix).h5")
+                    h5open(coherent_path, "w") do io
+                        # Indexed by crystal state Ψ, ordered by ascending energy at each q.
+                        write(io, "state_f_lm", coherent_results.state_f_lm)
+
+                        # The unsquared form factor on the (q, θ, ϕ) grid, if it was asked for.
+                        if coherent_results.f_s !== nothing
+                            write(io, "f_s", coherent_results.f_s)
+                            write(io, "theta_grid", theta_grid)
+                            write(io, "phi_grid", phi_grid)
+                        end
+                        write(io, "band_energy_min_eV", coherent_results.band_summary[:, 1])
+                        write(io, "band_energy_max_eV", coherent_results.band_summary[:, 2])
+                        write(io, "band_energy_mean_eV", coherent_results.band_summary[:, 3])
+
+                        # Unperturbed monomer energies, to compare against the bands above. Indexed by
+                        # λ, so compare as sets rather than element by element.
+                        write(io, "localised_energies_eV", coherent_basis.energies)
+
+                        # What went in.
+                        write(io, "transition_indices", collect(transition_indices))
+                        write(io, "disorder_group", coherent_results.dominant_group)
+                        write(io, "disorder_group_occupancy", coherent_results.dominant_occupancy)
+                        write(io, "q_grid", q_grid)
+                    end
+
+                    println("Coherent crystal form factor saved to $(coherent_path).")
                 end
 
                 if compute_rates_flag
