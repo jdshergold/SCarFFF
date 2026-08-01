@@ -9,6 +9,9 @@ using ..ReadBasisSet: MoleculeData
 include("../../utils/FastPowers.jl")
 using .FastPowers: pow_int
 
+include("../../utils/ThreadChunks.jl")
+using .ThreadChunks: chunk_count, chunk_range
+
 export construct_transition_density
 
 const KEV_TO_INV_ANGSTROM = 1/1.973269803 # Conversion factor from keV to inverse Angstroms.
@@ -116,84 +119,85 @@ function construct_transition_density(
     # Preallocate the transition_densities array.
     transition_densities = zeros(T, n_transitions, N_grid[1], N_grid[2], N_grid[3])
 
-    # Prellocate buffers for speed, and one to each thread to avoid races.
-    n_threads = Threads.nthreads()
-    primitive_pool = [zeros(T, n_primitives) for _ in 1:n_threads] # For storing primitive contributions.
-    orbital_pool = [zeros(T, n_orbitals) for _ in 1:n_threads] # For storing orbital contributions.
-    temp_pool = [zeros(T, n_orbitals, n_transitions) for _ in 1:n_threads] # For storing T_fi * ϕ_i for all transitions.
+    # Compute the transition density one grid point at a time, with each task working on a
+    # contiguous block of z-slices.
+    n_chunks = chunk_count(N_grid[3], nthreads())
 
-    # Compute the transition density one grid point at a time. Each thread works on a different z-slice.
-    @threads for kk in 1:N_grid[3]
-        z = zs[kk]
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # Each task owns its buffers, to avoid both races and allocations in the inner loop.
+            primitive_local = zeros(T, n_primitives) # For storing primitive contributions.
+            orbital_local = zeros(T, n_orbitals) # For storing orbital contributions.
+            temp_local = zeros(T, n_orbitals, n_transitions) # For storing T_fi * ϕ_i for all transitions.
 
-        # Allocate thread-local buffers.
-        tid = threadid()
-        primitive_local = primitive_pool[tid]
-        orbital_local = orbital_pool[tid]
-        temp_local = temp_pool[tid]
+            for kk in chunk_range(chunk, n_chunks, N_grid[3])
+                z = zs[kk]
 
-        for jj in 1:N_grid[2]
-            y = ys[jj]
-            for ii in 1:N_grid[1]
-                x = xs[ii]
+                for jj in 1:N_grid[2]
+                    y = ys[jj]
+                    for ii in 1:N_grid[1]
+                        x = xs[ii]
 
-                # Compute each primitive contribution at the current grid point (x, y, z).
-                @inbounds for p in 1:n_primitives
-                    dx = x - cx[p]
-                    dy = y - cy[p]
-                    dz = z - cz[p]
-                    rsq = dx*dx + dy*dy + dz*dz
+                        # Compute each primitive contribution at the current grid point (x, y, z).
+                        @inbounds for p in 1:n_primitives
+                            dx = x - cx[p]
+                            dy = y - cy[p]
+                            dz = z - cz[p]
+                            rsq = dx*dx + dy*dy + dz*dz
 
-                    # Skip the expensive exponential if the primitive contribution is negligible.
-                    exponent = -rsq * invwidths[p]
-                    if exponent < -20 # exp(-20) ~ 4.85e-10, so negligible contribution.
-                        primitive_local[p] = 0.0
-                        continue
+                            # Skip the expensive exponential if the primitive contribution is negligible.
+                            exponent = -rsq * invwidths[p]
+                            if exponent < -20 # exp(-20) ~ 4.85e-10, so negligible contribution.
+                                primitive_local[p] = 0.0
+                                continue
+                            end
+
+                            # Evaluate Cartesian polynomial expansion
+                            poly = 0.0
+                            for term_idx in primitive_term_indices[p]
+                                pref = cartesian_prefactor[term_idx]
+                                a = cartesian_a[term_idx]
+                                b = cartesian_b[term_idx]
+                                c = cartesian_c[term_idx]
+                                term_val = pref
+                                a != 0 && (term_val *= pow_int(dx, a))
+                                b != 0 && (term_val *= pow_int(dy, b))
+                                c != 0 && (term_val *= pow_int(dz, c))
+                                poly += term_val
+                            end
+
+                            primitive_local[p] = coeffs[p] * poly * exp(exponent)
+                        end
+
+                        # If all primitives are zero, so too will be all orbitals, so skip accumulation and matmul.
+                        if all(primitive_local .== 0.0)
+                            for t in 1:n_transitions
+                                transition_densities[t, ii, jj, kk] = zero(T)
+                            end
+                            continue
+                        end
+
+                        # Accumulate primitives into the correct orbitals.
+                        fill!(orbital_local, 0.0)
+                        @inbounds for p in 1:n_primitives
+                            orbital_local[primitive_to_orbital[p]] += primitive_local[p]
+                        end
+
+                        # Compute the transition density at the current grid point for ALL transitions.
+                        # This reuses the expensive orbital evaluation across all transitions.
+                        for t in 1:n_transitions
+                            mul!(view(temp_local, :, t), transition_matrices[t], orbital_local)  # temp[:, t] = T_fi * ϕ_i.
+                            transition_densities[t, ii, jj, kk] = T(dot(orbital_local, view(temp_local, :, t)))
+                        end
                     end
-
-                    # Evaluate Cartesian polynomial expansion
-                    poly = 0.0
-                    for term_idx in primitive_term_indices[p]
-                        pref = cartesian_prefactor[term_idx]
-                        a = cartesian_a[term_idx]
-                        b = cartesian_b[term_idx]
-                        c = cartesian_c[term_idx]
-                        term_val = pref
-                        a != 0 && (term_val *= pow_int(dx, a))
-                        b != 0 && (term_val *= pow_int(dy, b))
-                        c != 0 && (term_val *= pow_int(dz, c))
-                        poly += term_val
-                    end
-
-                    primitive_local[p] = coeffs[p] * poly * exp(exponent)
-                end
-
-                # If all primitives are zero, so too will be all orbitals, so skip accumulation and matmul.
-                if all(primitive_local .== 0.0)
-                    for t in 1:n_transitions
-                        transition_densities[t, ii, jj, kk] = zero(T)
-                    end
-                    continue
-                end
-
-                # Accumulate primitives into the correct orbitals.
-                fill!(orbital_local, 0.0)
-                @inbounds for p in 1:n_primitives
-                    orbital_local[primitive_to_orbital[p]] += primitive_local[p]
-                end
-
-                # Compute the transition density at the current grid point for ALL transitions.
-                # This reuses the expensive orbital evaluation across all transitions.
-                for t in 1:n_transitions
-                    mul!(view(temp_local, :, t), transition_matrices[t], orbital_local)  # temp[:, t] = T_fi * ϕ_i.
-                    transition_densities[t, ii, jj, kk] = T(dot(orbital_local, view(temp_local, :, t)))
                 end
             end
         end
     end
 
-    # Finally multiply by sqrt(2) for spin degeneracy.
-    transition_densities .*= sqrt(T(2))
+    # Finally multiply by 2 for the two spin channels, since the transition matrices carry
+    # the per-spin-channel X_α and Y_α straight from PySCF.
+    transition_densities .*= T(2)
 
     return transition_densities, r_lim
 end

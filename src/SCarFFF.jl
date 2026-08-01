@@ -9,6 +9,7 @@ using CUDA
 
 # Import the utility modules.
 include("utils/FastPowers.jl")
+include("utils/ThreadChunks.jl")
 include("utils/SparseTensors.jl")
 
 # Next import the three methods. SCarFFF = Spherical, Cartesian, and Fourier Form Factors.

@@ -12,6 +12,7 @@ using .BinEncoding: decode_bins
 using ...SparseTensors
 using ...FastPowers: fast_i_pow
 using ...SparseTensors: SparseWTensor, SparseGauntArray, lambda_mu_key
+using ...ThreadChunks: chunk_count, chunk_range
 
 export construct_R_tensor
 
@@ -49,7 +50,10 @@ end
 # The largest uncertainty from this will be from j_1(x_min) - j_1(0) ≃ x_min/3.
 const SMALL_X_THRESHOLD = 1.0e-3
 const KEV_TO_INV_ANGSTROM = 1.0 / 1.973269804  # Multiplicative factor to convert keV to inverse Å.
-const prefactor = 2.0 * sqrt(2) * (2π)^(5 / 2)
+# The first 2 is from the plane wave expansion. The second factor of 2
+# accounts for the two spin channels, since the transition matrices carry the
+# per-spin-channel X_α and Y_α straight from PySCF.
+const prefactor = 2.0 * 2.0 * (2π)^(5 / 2)
 
 @inline function fill_spherical_bessel_column!(
         j_L_matrix::Array{T, 2},
@@ -198,7 +202,7 @@ function construct_R_tensor(
     """
     Construct the R_{ℓm}(q) tensor defined by:
 
-        R_{ℓm}(q) = 2 √2 (2π)^(5/2) ∑_{ij pairs} (TDM_ij + TDM_ji) * exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
+        R_{ℓm}(q) = 4 (2π)^(5/2) ∑_{ij pairs} (TDM_ij + TDM_ji) * exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
                   * ∑_{n} q^n ∑_{λ,μ} W_{ij,λμ}^{n} G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
 
     where W_{ij,λμ}^{n} is the W tensor, TDM is the transition matrix, G_{λLℓ}^{μm} are Gaunt coefficients,
@@ -244,10 +248,9 @@ function construct_R_tensor(
     n_keys = (l_max + 1)^2
     R_tensor = zeros(Complex{T}, n_transitions, n_q, n_keys)
 
-    # Get the number of (i, j) bins and size thread-local pools by the maximum
-    # possible threadid(), which can exceed nthreads() with multiple thread pools.
+    # Get the number of (i, j) bins, and split them into one chunk per task.
     num_ij_bins = length(W_tensor.ij_bins)
-    n_threads = Base.Threads.maxthreadid()
+    n_chunks = chunk_count(num_ij_bins, nthreads())
 
     # Allocate arrays for precomputed quantities.
     n_max = W_tensor.n_max
@@ -260,12 +263,13 @@ function construct_R_tensor(
     # Precompute the powers of i.
     fill_i_powers!(i_powers, L_max)
 
-    # Prellocate buffers to each thread to avoid races.
-    gaussian_pool = [Vector{T}(undef, n_q) for _ in 1:n_threads]
-    jL_pool = [Array{T, 2}(undef, L_max + 1, n_q) for _ in 1:n_threads]
-    jL_miller_pool = [Vector{Float64}(undef, L_max + 1) for _ in 1:n_threads] # This is a buffer for Miller's algorithm, to save repeated allocations when recursing downwards.
-    Y_cache_pool = [SphericalHarmonics.cache(L_max, SphericalHarmonics.FullRange) for _ in 1:n_threads]
-    R_local_pool = [zeros(Complex{T}, n_q, n_keys) for _ in 1:n_threads]
+    # Preallocate buffers per task, keyed by chunk rather than by threadid so that each buffer has
+    # exactly one writer. These are reused across transitions.
+    gaussian_pool = [Vector{T}(undef, n_q) for _ in 1:n_chunks]
+    jL_pool = [Array{T, 2}(undef, L_max + 1, n_q) for _ in 1:n_chunks]
+    jL_miller_pool = [Vector{Float64}(undef, L_max + 1) for _ in 1:n_chunks] # This is a buffer for Miller's algorithm, to save repeated allocations when recursing downwards.
+    Y_cache_pool = [SphericalHarmonics.cache(L_max, SphericalHarmonics.FullRange) for _ in 1:n_chunks]
+    R_local_pool = [zeros(Complex{T}, n_q, n_keys) for _ in 1:n_chunks]
 
     typed_half = T(0.5)
     W_max = W_tensor.W_max
@@ -304,114 +308,117 @@ function construct_R_tensor(
         # Compute the effective W threshold for this transition.
         threshold_value = threshold * max_TDM_W
 
-        # Zero out the thread-local buffers for this transition.
-        @inbounds for thread_id in 1:n_threads
-            fill!(R_local_pool[thread_id], zero(Complex{T}))
+        # Zero out the per-task buffers for this transition.
+        @inbounds for chunk in 1:n_chunks
+            fill!(R_local_pool[chunk], zero(Complex{T}))
         end
 
-        # Accumulate one (i, j) slice at a time, threading over ij bins.
-        @threads for bin_idx in 1:num_ij_bins
-            ij_bin = W_tensor.ij_bins[bin_idx]
+        # Accumulate one (i, j) slice at a time, with one task per chunk of ij bins.
+        @sync for chunk in 1:n_chunks
+            Threads.@spawn begin
+                # Get this task's buffers.
+                gaussian_local = gaussian_pool[chunk]
+                jL_local = jL_pool[chunk]
+                jL_miller_buffer = jL_miller_pool[chunk]
+                Ylm_cache = Y_cache_pool[chunk]
+                R_local = R_local_pool[chunk]
 
-            # Skip empty (i, j) bins.
-            isempty(ij_bin) && continue
+                for bin_idx in chunk_range(chunk, n_chunks, num_ij_bins)
+                    ij_bin = W_tensor.ij_bins[bin_idx]
 
-            # Get thread-local buffers.
-            thread_id = threadid()
-            gaussian_local = gaussian_pool[thread_id]
-            jL_local = jL_pool[thread_id]
-            jL_miller_buffer = jL_miller_pool[thread_id]
-            Ylm_cache = Y_cache_pool[thread_id]
-            R_local = R_local_pool[thread_id]
+                    # Skip empty (i, j) bins.
+                    isempty(ij_bin) && continue
 
-            # All entries in this bin share the same (i, j) pair.
-            first_idx = ij_bin[1]
-            pair_i = W_tensor.i[first_idx]
-            pair_j = W_tensor.j[first_idx]
+                    # All entries in this bin share the same (i, j) pair.
+                    first_idx = ij_bin[1]
+                    pair_i = W_tensor.i[first_idx]
+                    pair_j = W_tensor.j[first_idx]
 
-            # Extract the orbital indices and compute the TDM prefactor for this pair.
-            orbital_i = cartesian_term_to_orbital[pair_i]
-            orbital_j = cartesian_term_to_orbital[pair_j]
+                    # Extract the orbital indices and compute the TDM prefactor for this pair.
+                    orbital_i = cartesian_term_to_orbital[pair_i]
+                    orbital_j = cartesian_term_to_orbital[pair_j]
 
-            if pair_i == pair_j
-                # For the diagonal entries there is only one contribution.
-                TDM_prefactor = TDM[orbital_i, orbital_j]
-            else
-                TDM_prefactor = TDM[orbital_i, orbital_j] + TDM[orbital_j, orbital_i]
-            end
+                    if pair_i == pair_j
+                        # For the diagonal entries there is only one contribution.
+                        TDM_prefactor = TDM[orbital_i, orbital_j]
+                    else
+                        TDM_prefactor = TDM[orbital_i, orbital_j] + TDM[orbital_j, orbital_i]
+                    end
 
-            # Extract the geometry for this pair.
-            sigma_ij_val = sigma_ij[pair_i, pair_j]
-            R_mod = R_ij_mod[pair_i, pair_j]
-            theta_ij = R_ij_hat[pair_i, pair_j, 1]
-            phi_ij = R_ij_hat[pair_i, pair_j, 2]
+                    # Extract the geometry for this pair.
+                    sigma_ij_val = sigma_ij[pair_i, pair_j]
+                    R_mod = R_ij_mod[pair_i, pair_j]
+                    theta_ij = R_ij_hat[pair_i, pair_j, 1]
+                    phi_ij = R_ij_hat[pair_i, pair_j, 2]
 
-            # Precompute the spherical harmonics for this pair.
-            computePlmcostheta!(Ylm_cache, theta_ij, L_max)
-            computeYlm!(Ylm_cache, theta_ij, phi_ij, L_max)
-            Yvals = SphericalHarmonics.getY(Ylm_cache)
+                    # Precompute the spherical harmonics for this pair.
+                    computePlmcostheta!(Ylm_cache, theta_ij, L_max)
+                    computeYlm!(Ylm_cache, theta_ij, phi_ij, L_max)
+                    Yvals = SphericalHarmonics.getY(Ylm_cache)
 
-            # Compute Gaussian factor exp(-σ_{ij}^2 q^2/2), along with the spherical Bessel functions j_L(q R_{ij}).
-            sigma_ij_sq = sigma_ij_val * sigma_ij_val
-            @inbounds for q_idx in 1:n_q
-                gaussian_local[q_idx] = exp(-typed_half * sigma_ij_sq * q_powers[3, q_idx])
-                fill_spherical_bessel_column!(jL_local, jL_miller_buffer, q_idx, q_grid_invA[q_idx] * R_mod, L_max)
-            end
+                    # Compute Gaussian factor exp(-σ_{ij}^2 q^2/2), along with the spherical Bessel functions j_L(q R_{ij}).
+                    sigma_ij_sq = sigma_ij_val * sigma_ij_val
+                    @inbounds for q_idx in 1:n_q
+                        gaussian_local[q_idx] = exp(-typed_half * sigma_ij_sq * q_powers[3, q_idx])
+                        fill_spherical_bessel_column!(jL_local, jL_miller_buffer, q_idx, q_grid_invA[q_idx] * R_mod, L_max)
+                    end
 
-            # Now loop over W entries in this (i, j) bin.
-            @inbounds for W_idx in ij_bin
-                # Extract the remaining indices, so that we can join with the corresponding Gaunt bin.
-                lambda = W_tensor.lambda[W_idx]
-                mu = W_tensor.mu[W_idx]
-                n = W_tensor.n[W_idx]
+                    # Now loop over W entries in this (i, j) bin.
+                    @inbounds for W_idx in ij_bin
+                        # Extract the remaining indices, so that we can join with the corresponding Gaunt bin.
+                        lambda = W_tensor.lambda[W_idx]
+                        mu = W_tensor.mu[W_idx]
+                        n = W_tensor.n[W_idx]
 
-                # Also extract the W tensor value.
-                W_val = W_tensor.W_values[W_idx]
+                        # Also extract the W tensor value.
+                        W_val = W_tensor.W_values[W_idx]
 
-                # Apply thresholding.
-                abs(TDM_prefactor) * abs(W_val) < threshold_value && continue
+                        # Apply thresholding.
+                        abs(TDM_prefactor) * abs(W_val) < threshold_value && continue
 
-                n_idx = n + 1 # For future indexing.
+                        n_idx = n + 1 # For future indexing.
 
-                # Find the Gaunt bin for this (λ, μ).
-                bin_key = lambda_mu_key[lambda + 1, mu + lambda + 1]
-                gaunt_bin = gaunt_array.lambda_mu_bins[bin_key]
+                        # Find the Gaunt bin for this (λ, μ).
+                        bin_key = lambda_mu_key[lambda + 1, mu + lambda + 1]
+                        gaunt_bin = gaunt_array.lambda_mu_bins[bin_key]
 
-                # Skip if there are no Gaunt coefficients for this (λ, μ).
-                isempty(gaunt_bin) && continue
+                        # Skip if there are no Gaunt coefficients for this (λ, μ).
+                        isempty(gaunt_bin) && continue
 
-                # Loop over the matching Gaunt coefficients.
-                for gaunt_idx in gaunt_bin
-                    L = gaunt_array.L[gaunt_idx]
-                    l = gaunt_array.l[gaunt_idx]
-                    m = gaunt_array.m[gaunt_idx]
+                        # Loop over the matching Gaunt coefficients.
+                        for gaunt_idx in gaunt_bin
+                            L = gaunt_array.L[gaunt_idx]
+                            l = gaunt_array.l[gaunt_idx]
+                            m = gaunt_array.m[gaunt_idx]
 
-                    gaunt_val = gaunt_coeffs[gaunt_idx]
+                            gaunt_val = gaunt_coeffs[gaunt_idx]
 
-                    # Compute the corresponding spherical harmonic index. M = m - μ.
-                    M = m - mu
+                            # Compute the corresponding spherical harmonic index. M = m - μ.
+                            M = m - mu
 
-                    # Fetch the correct SHM and take its complex conjugate.
-                    Y_val = Complex{T}(Yvals[(L, M)])
-                    conj_Y = conj(Y_val)
+                            # Fetch the correct SHM and take its complex conjugate.
+                            Y_val = Complex{T}(Yvals[(L, M)])
+                            conj_Y = conj(Y_val)
 
-                    # Compute the angular part of the contribution, including TDM prefactor.
-                    angular_term = TDM_prefactor * W_val * gaunt_val * conj_Y * i_powers[L + 1]
+                            # Compute the angular part of the contribution, including TDM prefactor.
+                            angular_term = TDM_prefactor * W_val * gaunt_val * conj_Y * i_powers[L + 1]
 
-                    # Precompute the key.
-                    lm_key = l * l + (l + m) + 1
+                            # Precompute the key.
+                            lm_key = l * l + (l + m) + 1
 
-                    # Now accumulate into R_local.
-                    @inbounds for k in 1:n_q
-                        R_local[k, lm_key] += angular_term * gaussian_local[k] * q_powers[n_idx, k] * jL_local[L + 1, k]
+                            # Now accumulate into R_local.
+                            @inbounds for k in 1:n_q
+                                R_local[k, lm_key] += angular_term * gaussian_local[k] * q_powers[n_idx, k] * jL_local[L + 1, k]
+                            end
+                        end
                     end
                 end
             end
         end
 
-        # Accumulate the thread-local results into the global R tensor for this transition.
-        @inbounds for R_per_thread in R_local_pool
-            R_tensor[transition_idx, :, :] .+= R_per_thread
+        # Accumulate the per-task results into the global R tensor for this transition.
+        @inbounds for R_per_chunk in R_local_pool
+            R_tensor[transition_idx, :, :] .+= R_per_chunk
         end
     end
 

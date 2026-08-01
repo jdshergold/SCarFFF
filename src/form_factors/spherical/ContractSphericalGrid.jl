@@ -7,6 +7,8 @@ export contract_spherical_grid
 using SphericalHarmonics
 using Base.Threads
 
+using ...ThreadChunks: chunk_count, chunk_range
+
 function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vector{T}, phi_grid::Vector{T})::Array{Complex{T}, 4} where {T<:AbstractFloat}
     """
     Contract the radial and angular parts of the form factor to obtain f_s(q, θ, ϕ) on a spherical grid, defined by:
@@ -43,45 +45,44 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
     # Allocate the output form factor array.
     f_s = Array{Complex{T}}(undef, n_transitions, n_q, n_theta, n_phi)
 
-    # Allocate per-thread caches for spherical harmonics to avoid races.
-    n_threads = Base.Threads.maxthreadid()
-    Y_cache_pool = [
-        SphericalHarmonics.cache(l_max, SphericalHarmonics.FullRange) for _ in 1:n_threads
-    ]
-
     # Now loop over the angular grid and construct the form factor.
-    @threads for theta_idx in 1:n_theta
-        # Get thread-local cache.
-        thread_id = threadid()
-        Y_cache = Y_cache_pool[thread_id]
+    n_chunks = chunk_count(n_theta, nthreads())
 
-        # Enumerate doesn't work with threads, so we grab θ manually.
-        theta = theta_grid[theta_idx]
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # Each task owns its spherical harmonic cache, to avoid races.
+            Y_cache = SphericalHarmonics.cache(l_max, SphericalHarmonics.FullRange)
 
-        # Precompute associated Legendre polynomials for this θ.
-        computePlmcostheta!(Y_cache, theta, l_max)
+            for theta_idx in chunk_range(chunk, n_chunks, n_theta)
+                # Enumerate doesn't work with threads, so we grab θ manually.
+                theta = theta_grid[theta_idx]
 
-        for (phi_idx, phi) in enumerate(phi_grid)
-            # Compute spherical harmonics for this (θ, ϕ) once for all transitions.
-            computeYlm!(Y_cache, theta, phi, l_max)
-            Yvals = SphericalHarmonics.getY(Y_cache)
+                # Precompute associated Legendre polynomials for this θ.
+                computePlmcostheta!(Y_cache, theta, l_max)
 
-            # Now contract over (ℓ, m) to compute f_s(q, θ, ϕ) for all transitions.
-            for transition_idx in 1:n_transitions
-                for q_idx in 1:n_q
-                    f_s_point = typed_complex_zero
-                    for l in 0:l_max
-                        # Precompute the key base.
-                        key_base = l * l + l + 1
-                        for m in -l:l
-                            # Add the m offset.
-                            key = key_base + m
-                            f_s_point += R_tensor[transition_idx, q_idx, key] * Complex{T}(Yvals[(l, m)])
+                for (phi_idx, phi) in enumerate(phi_grid)
+                    # Compute spherical harmonics for this (θ, ϕ) once for all transitions.
+                    computeYlm!(Y_cache, theta, phi, l_max)
+                    Yvals = SphericalHarmonics.getY(Y_cache)
+
+                    # Now contract over (ℓ, m) to compute f_s(q, θ, ϕ) for all transitions.
+                    for transition_idx in 1:n_transitions
+                        for q_idx in 1:n_q
+                            f_s_point = typed_complex_zero
+                            for l in 0:l_max
+                                # Precompute the key base.
+                                key_base = l * l + l + 1
+                                for m in -l:l
+                                    # Add the m offset.
+                                    key = key_base + m
+                                    f_s_point += R_tensor[transition_idx, q_idx, key] * Complex{T}(Yvals[(l, m)])
+                                end
+                            end
+
+                            # Store the form factor value.
+                            f_s[transition_idx, q_idx, theta_idx, phi_idx] = f_s_point
                         end
                     end
-
-                    # Store the form factor value.
-                    f_s[transition_idx, q_idx, theta_idx, phi_idx] = f_s_point
                 end
             end
         end

@@ -20,7 +20,7 @@ function contract_spherical_grid_gpu(
         f_s(q, θ, ϕ) = ∑_{ℓ=0}^{l_max} ∑_{m=-ℓ}^{ℓ} R_{ℓm}(q) Y_{ℓm}(θ, ϕ),
 
     where R is the R tensor that depends only on the modulus of the momentum transfer, q,
-    and Y_{ℓm} are the spherical harmonics. The √2 is from spin-degeneracy.
+    and Y_{ℓm} are the spherical harmonics.
 
     This GPU implementation computes Y_{ℓm}(θ, ϕ) for m ≥ 0 only, then performs two dense matrix
     multiplications (GEMMs) to exploit the symmetry Y_{ℓ,-m}(θ, ϕ) = (-1)^m conj(Y_{ℓm}(θ, ϕ)).

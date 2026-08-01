@@ -51,7 +51,10 @@ const SMALL_X_THRESHOLD = 1.0e-3
 
 const KEV_TO_INV_ANGSTROM = 1.0 / 1.973269804  # Multiplicative factor to convert keV to inverse Å.
 const INV_FOUR_PI = 1.0 / (4.0 * π)
-const prefactor = 2.0 * sqrt(2) * (2π)^(5 / 2)
+# The 2 is from the plane wave expansion. The second factor of 2
+# accounts for the two spin channels, since the transition matrices carry the
+# per-spin-channel X_α and Y_α straight from PySCF.
+const prefactor = 2.0 * 2.0 * (2π)^(5 / 2)
 
 const MAX_L_GLOBAL = 96 # The maximum L value we support globally for spherical Bessel functions.
 
@@ -593,7 +596,7 @@ function construct_R_tensor_gpu(
     """
     Construct the R_{ℓm}(q) tensor defined by:
 
-        R_{ℓm}(q) = 2 * √2 * (2π)^(5 / 2) * ∑_{ij} exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
+        R_{ℓm}(q) = 4 * (2π)^(5 / 2) * ∑_{ij} exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
                   * ∑_{n} q^n ∑_{λ,μ} W_{ij,λμ}^{n} G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
 
     where W_{ij,λμ}^{n} is the W tensor, G_{λLℓ}^{μm} are Gaunt coefficients, j_L are spherical Bessel functions,

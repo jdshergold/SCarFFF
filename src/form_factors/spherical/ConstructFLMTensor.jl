@@ -9,6 +9,7 @@ include("../../utils/BinEncoding.jl")
 using .BinEncoding: decode_bins
 using ...SparseTensors: SparseGauntArray, lambda_mu_key
 using ...FastPowers: fast_neg1_pow
+using ...ThreadChunks: chunk_count, chunk_range
 
 export construct_f_lm_tensor
 
@@ -99,69 +100,73 @@ function construct_f_lm_tensor(
     # Get dimensions.
     n_transitions, n_q, n_keys = size(R_tensor)
     n_gaunt = length(gaunt_coeffs)
-    n_threads = Base.Threads.maxthreadid()
 
     # Allocate the output tensor.
     f_lm = zeros(Complex{T}, n_transitions, n_q, n_keys)
 
-    # Preallocate thread-local accumulation buffers.
-    f_lm_local_pool = [zeros(Complex{T}, n_q, n_keys) for _ in 1:n_threads]
+    # Preallocate one accumulation buffer per task, keyed by chunk rather than by threadid so that
+    # each buffer has exactly one writer. These are reused across transitions.
+    n_chunks = chunk_count(n_gaunt, nthreads())
+    f_lm_local_pool = [zeros(Complex{T}, n_q, n_keys) for _ in 1:n_chunks]
 
     for transition_idx in 1:n_transitions
-        # Zero out thread-local buffers for this transition.
-        @inbounds for thread_id in 1:n_threads
-            fill!(f_lm_local_pool[thread_id], zero(Complex{T}))
+        # Zero out the per-task buffers for this transition.
+        @inbounds for chunk in 1:n_chunks
+            fill!(f_lm_local_pool[chunk], zero(Complex{T}))
         end
 
         # Extract the R tensor slice for this transition. Use a view to avoid allocations.
         R = @view R_tensor[transition_idx, :, :]
 
-        @threads for gaunt_idx in 1:n_gaunt
-            thread_id = threadid()
-            f_lm_local = f_lm_local_pool[thread_id]
+        @sync for chunk in 1:n_chunks
+            Threads.@spawn begin
+                f_lm_local = f_lm_local_pool[chunk]
 
-            # Extract the gaunt entry, with (λ = ℓ1, L = ℓ2, ℓ=ℓ, μ = m1, m = μ).
-            l1 = gaunt_array.lambda[gaunt_idx]
-            m1 = gaunt_array.mu[gaunt_idx]
-            l2 = gaunt_array.L[gaunt_idx]
-            l = gaunt_array.l[gaunt_idx]
-            mu = gaunt_array.m[gaunt_idx]
-            m2 = m1 - mu
+                for gaunt_idx in chunk_range(chunk, n_chunks, n_gaunt)
+                    # Extract the gaunt entry, with (λ = ℓ1, L = ℓ2, ℓ=ℓ, μ = m1, m = μ).
+                    l1 = gaunt_array.lambda[gaunt_idx]
+                    m1 = gaunt_array.mu[gaunt_idx]
+                    l2 = gaunt_array.L[gaunt_idx]
+                    l = gaunt_array.l[gaunt_idx]
+                    mu = gaunt_array.m[gaunt_idx]
+                    m2 = m1 - mu
 
-            gaunt_val = gaunt_coeffs[gaunt_idx]
+                    gaunt_val = gaunt_coeffs[gaunt_idx]
 
-            # Compute the R tensor keys.
-            key1 = l1 * l1 + (l1 + m1) + 1 # key(ℓ1, m1)
-            key2 = l2 * l2 + (l2 + m2) + 1 # key(ℓ2, m2)
+                    # Compute the R tensor keys.
+                    key1 = l1 * l1 + (l1 + m1) + 1 # key(ℓ1, m1)
+                    key2 = l2 * l2 + (l2 + m2) + 1 # key(ℓ2, m2)
 
-            # The (-1)^{m2} sign factor from conjugating the second spherical harmonic.
-            sign_m2 = fast_neg1_pow(m2, T)
+                    # The (-1)^{m2} sign factor from conjugating the second spherical harmonic.
+                    sign_m2 = fast_neg1_pow(m2, T)
 
-            # U_{μm} is non-zero only for m = ±|μ| (or just 0 when μ = 0).
-            # Loop over the at most two non-zero m values.
-            if mu == 0
-                # U_{0, 0} = 1; output real harmonic index is 0.
-                key_out = l * l + l + 1
-                combined = Complex{T}(sign_m2 * gaunt_val)
-                @inbounds for q_idx in 1:n_q
-                    f_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
-                end
-            else
-                # U_{μ, μ} and U_{μ, -μ} are the two non-zero entries.
-                for m in (mu, -mu)
-                    u_val = U(mu, m, T)
-                    combined = sign_m2 * gaunt_val * u_val
-                    key_out = l * l + (l + m) + 1
-                    @inbounds for q_idx in 1:n_q
-                        f_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
+                    # U_{μm} is non-zero only for m = ±|μ| (or just 0 when μ = 0).
+                    # Loop over the at most two non-zero m values.
+                    if mu == 0
+                        # U_{0, 0} = 1; output real harmonic index is 0.
+                        key_out = l * l + l + 1
+                        combined = Complex{T}(sign_m2 * gaunt_val)
+                        @inbounds for q_idx in 1:n_q
+                            f_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
+                        end
+                    else
+                        # U_{μ, μ} and U_{μ, -μ} are the two non-zero entries.
+                        for m in (mu, -mu)
+                            u_val = U(mu, m, T)
+                            combined = sign_m2 * gaunt_val * u_val
+                            key_out = l * l + (l + m) + 1
+                            @inbounds for q_idx in 1:n_q
+                                f_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
+                            end
+                        end
                     end
                 end
             end
         end
 
-        # Accumulate thread-local results into the global f_lm tensor.
-        @inbounds for f_lm_per_thread in f_lm_local_pool
-            f_lm[transition_idx, :, :] .+= f_lm_per_thread
+        # Accumulate the per-task results into the global f_lm tensor.
+        @inbounds for f_lm_per_chunk in f_lm_local_pool
+            f_lm[transition_idx, :, :] .+= f_lm_per_chunk
         end
     end
 

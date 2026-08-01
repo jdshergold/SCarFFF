@@ -334,8 +334,9 @@ function construct_transition_density_gpu(
         end
     end
 
-    # Apply the spin-degeneracy factor.
-    transition_densities_gpu .*= sqrt(T(2))
+    # Apply the factor of 2 for the two spin channels, since the transition matrices carry
+    # the per-spin-channel X_α and Y_α straight from PySCF.
+    transition_densities_gpu .*= T(2)
 
     return transition_densities_gpu, r_lim
 end

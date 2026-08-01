@@ -540,26 +540,34 @@ def write_nto(mol, ID, wghts, nto):
 
 def get_tdm(tdobj, state=1):
     """
-    Returns the transition density matrix in the MO basis. This is constructed from
-    the TDDFT X and Y matrices as T = X + Y, and should already be normalised.
+    Returns the transition density matrix in the MO basis, constructed from
+    the TD-DFT X and Y matrices as T = X + Y.
+
+    These are PySCF's matrices exactly as returned, i.e. the per-spin-channel
+    X_alpha and Y_alpha. For the RKS singlets we use, X_alpha = X_beta, so PySCF
+    only reports the common matrix, which is normalised to
+
+        sum_ia (|X_ia|^2 - |Y_ia|^2) = 1/2,
+
+    rather than the 1 you would get from summing both spin channels. We deliberately
+    do NOT rescale here. Instead, SCarFFF carries the per-spin-channel matrices
+    unmodified, and the factor of 2 for the two spin channels is applied later by
+    whatever needs it. This avoids having to track how many powers of
+    X and Y a given density carries. 
 
     # Arguments:
     - tdobj::TDDFT: The TD-DFT object containing excited state information.
     - state::int: The excited state to analyze (default: 1).
 
     # Returns:
-    - cis_t1::np.ndarray: The transition density matrix in the MO basis.
+    - TDM::np.ndarray: The transition density matrix in the MO basis.
     """
     state_id = state - 1
     X = tdobj.xy[state_id][0]
     Y = tdobj.xy[state_id][1]
 
-    # PySCF returns eigenvectors that are already normalised, so keep both
-    # excitation (X) and de-excitation (Y) components to preserve magnitude.
-    TDM = X + Y
-
-    # Factor of sqrt(2) for spin degeneracy.
-    return np.sqrt(2) * TDM
+    # Add the X and Y matrices to get the TDM for a transition density in the MO basis.
+    return X + Y
 
 
 def select_conformer_by_dft_sp(conformers, basis="6-31g*", xc="b3lyp", use_gpu=False):
@@ -724,7 +732,9 @@ def run_td_dft_analysis_from_coordinates(
     orbo = mf.mo_coeff[:, occ_mask]
     orbv = mf.mo_coeff[:, ~occ_mask]
 
-    # Use these alongside the TDM to construct d_{ij}.
+    # Use these alongside the TDM to construct d_{ij}. The true form is
+    # T = C_o X C_v^T + C_v Y^T C_o^T. When contracted with real AOs, as in our case, the
+    # simplified form below holds.
     mxDij = [orbo @ tdm @ (orbv.conj().T) for tdm in mxTDM]
 
     # Prepare data for saving to file.

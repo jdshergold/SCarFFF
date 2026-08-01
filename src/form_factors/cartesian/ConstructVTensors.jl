@@ -6,6 +6,7 @@ using Base.Threads
 
 using ..ReadBasisSet: MoleculeData
 using ..ProbabilistsHermite: fill_hermite_vector!
+using ...ThreadChunks: chunk_count, chunk_range
 
 export construct_V_tensors
 
@@ -75,98 +76,101 @@ function construct_V_tensors(
     V_y = Array{Complex{T}}(undef, n_q_y, n_pairs)
     V_z = Array{Complex{T}}(undef, n_q_z, n_pairs)
 
-    # Pre-allocate Hermite polynomial buffers for each thread to avoid allocations in the inner loop.
-    # As we go up to at most i-orbitals, max Cartesian power is 12, so we need buffers of size 13.
-    He_buffers = [Vector{T}(undef, 13) for _ in 1:nthreads()]
+    # Now we loop over the non-thresholded pairs and compute the V tensors, one task per chunk.
+    n_chunks = chunk_count(n_pairs, nthreads())
 
-    # Now we loop over the non-thresholded pairs and compute the V tensors.
-    @threads for pair_idx in 1:n_pairs
-        i, j = nonzero_pairs[pair_idx]
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # Each task has a Hermite polynomial buffer, to avoid allocations in the inner loop.
+            # As we go up to at most i-orbitals, max Cartesian power is 12, so we need size 13.
+            He_buffer = Vector{T}(undef, 13)
 
-        # Get the Hermite buffer for this thread.
-        He_buffer = He_buffers[threadid()]
+            for pair_idx in chunk_range(chunk, n_chunks, n_pairs)
+                i, j = nonzero_pairs[pair_idx]
 
-        # Get the M_ij coefficient for weighting.
-        M_ij_val = M_ij[i, j]
+                # Get the M_ij coefficient for weighting.
+                M_ij_val = M_ij[i, j]
 
-        # Extract the Cartesian powers.
-        a_i = mol.cartesian_a[i]
-        b_i = mol.cartesian_b[i]
-        c_i = mol.cartesian_c[i]
-        a_j = mol.cartesian_a[j]
-        b_j = mol.cartesian_b[j]
-        c_j = mol.cartesian_c[j]
+                # Extract the Cartesian powers.
+                a_i = mol.cartesian_a[i]
+                b_i = mol.cartesian_b[i]
+                c_i = mol.cartesian_c[i]
+                a_j = mol.cartesian_a[j]
+                b_j = mol.cartesian_b[j]
+                c_j = mol.cartesian_c[j]
 
-        # Extract the pair-specific quantities.
-        sigma_ij_val = sigma_ij[i, j]
-        X_ij = R_ij[i, j, 1]
-        Y_ij = R_ij[i, j, 2]
-        Z_ij = R_ij[i, j, 3]
+                # Extract the pair-specific quantities.
+                sigma_ij_val = sigma_ij[i, j]
+                X_ij = R_ij[i, j, 1]
+                Y_ij = R_ij[i, j, 2]
+                Z_ij = R_ij[i, j, 3]
 
-        # Determine the maximum orders for this pair.
-        max_A = a_i + a_j
-        max_B = b_i + b_j
-        max_C = c_i + c_j
+                # Determine the maximum orders for this pair.
+                max_A = a_i + a_j
+                max_B = b_i + b_j
+                max_C = c_i + c_j
 
-        # Precompute common quantities.
-        sigma_ij_sq = sigma_ij_val * sigma_ij_val
+                # Precompute common quantities.
+                sigma_ij_sq = sigma_ij_val * sigma_ij_val
 
-        # First, we compute V_x for this pair.
-        for (idx, q_x) in enumerate(q_x_vals)
-            gaussian = exp(-T(0.5) * q_x * q_x * sigma_ij_sq)
-            phase = exp(im * q_x * X_ij)
+                # First, we compute V_x for this pair.
+                for (idx, q_x) in enumerate(q_x_vals)
+                    gaussian = exp(-T(0.5) * q_x * q_x * sigma_ij_sq)
+                    phase = exp(im * q_x * X_ij)
 
-            # Evaluate the Hermite polynomials in-place using the thread-local buffer.
-            fill_hermite_vector!(He_buffer, max_A, q_x * sigma_ij_val)
+                    # Evaluate the Hermite polynomials in-place using the task-local buffer.
+                    fill_hermite_vector!(He_buffer, max_A, q_x * sigma_ij_val)
 
-            hermite_sum = zero(Complex{T})
-            i_sigma_power = one(Complex{T})
+                    hermite_sum = zero(Complex{T})
+                    i_sigma_power = one(Complex{T})
 
-            for A in 0:max_A
-                hermite_sum += b_A[i, j, A + 1] * i_sigma_power * He_buffer[A + 1]
-                i_sigma_power *= im * sigma_ij_val
+                    for A in 0:max_A
+                        hermite_sum += b_A[i, j, A + 1] * i_sigma_power * He_buffer[A + 1]
+                        i_sigma_power *= im * sigma_ij_val
+                    end
+
+                    # Weight V_x by M_ij.
+                    V_x[idx, pair_idx] = M_ij_val * gaussian * phase * hermite_sum
+                end
+
+                # Then V_y.
+                for (idx, q_y) in enumerate(q_y_vals)
+                    gaussian = exp(-T(0.5) * q_y * q_y * sigma_ij_sq)
+                    phase = exp(im * q_y * Y_ij)
+
+                    # Evaluate the Hermite polynomials in-place using the task-local buffer.
+                    fill_hermite_vector!(He_buffer, max_B, q_y * sigma_ij_val)
+
+                    hermite_sum = zero(Complex{T})
+                    i_sigma_power = one(Complex{T})
+
+                    for B in 0:max_B
+                        hermite_sum += b_B[i, j, B + 1] * i_sigma_power * He_buffer[B + 1]
+                        i_sigma_power *= im * sigma_ij_val
+                    end
+
+                    V_y[idx, pair_idx] = gaussian * phase * hermite_sum
+                end
+
+                # Finally, V_z.
+                for (idx, q_z) in enumerate(q_z_vals)
+                    gaussian = exp(-T(0.5) * q_z * q_z * sigma_ij_sq)
+                    phase = exp(im * q_z * Z_ij)
+
+                    # Evaluate the Hermite polynomials in-place using the task-local buffer.
+                    fill_hermite_vector!(He_buffer, max_C, q_z * sigma_ij_val)
+
+                    hermite_sum = zero(Complex{T})
+                    i_sigma_power = one(Complex{T})
+
+                    for C in 0:max_C
+                        hermite_sum += b_C[i, j, C + 1] * i_sigma_power * He_buffer[C + 1]
+                        i_sigma_power *= im * sigma_ij_val
+                    end
+
+                    V_z[idx, pair_idx] = gaussian * phase * hermite_sum
+                end
             end
-
-            # Weight V_x by M_ij.
-            V_x[idx, pair_idx] = M_ij_val * gaussian * phase * hermite_sum
-        end
-
-        # Then V_y.
-        for (idx, q_y) in enumerate(q_y_vals)
-            gaussian = exp(-T(0.5) * q_y * q_y * sigma_ij_sq)
-            phase = exp(im * q_y * Y_ij)
-
-            # Evaluate the Hermite polynomials in-place using the thread-local buffer.
-            fill_hermite_vector!(He_buffer, max_B, q_y * sigma_ij_val)
-
-            hermite_sum = zero(Complex{T})
-            i_sigma_power = one(Complex{T})
-
-            for B in 0:max_B
-                hermite_sum += b_B[i, j, B + 1] * i_sigma_power * He_buffer[B + 1]
-                i_sigma_power *= im * sigma_ij_val
-            end
-
-            V_y[idx, pair_idx] = gaussian * phase * hermite_sum
-        end
-
-        # Finally, V_z.
-        for (idx, q_z) in enumerate(q_z_vals)
-            gaussian = exp(-T(0.5) * q_z * q_z * sigma_ij_sq)
-            phase = exp(im * q_z * Z_ij)
-
-            # Evaluate the Hermite polynomials in-place using the thread-local buffer.
-            fill_hermite_vector!(He_buffer, max_C, q_z * sigma_ij_val)
-
-            hermite_sum = zero(Complex{T})
-            i_sigma_power = one(Complex{T})
-
-            for C in 0:max_C
-                hermite_sum += b_C[i, j, C + 1] * i_sigma_power * He_buffer[C + 1]
-                i_sigma_power *= im * sigma_ij_val
-            end
-
-            V_z[idx, pair_idx] = gaussian * phase * hermite_sum
         end
     end
 

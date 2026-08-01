@@ -7,8 +7,9 @@ using Base.Threads
 
 export contract_cartesian_grid_gpu
 
-# The √2 factor is for spin-degeneracy.
-const prefactor = sqrt(2) * (2*π)^(3/2)
+# The factor of 2 accounts for the two spin channels, since the transition matrices carry
+# the per-spin-channel X_α and Y_α straight from PySCF.
+const prefactor = 2 * (2*π)^(3/2)
 
 function contract_cartesian_grid_gpu(
     V_x::Array{Complex{T}, 2},
@@ -23,7 +24,7 @@ function contract_cartesian_grid_gpu(
     """
     Contract the separable 1D V tensors to form the full 4D form factor grid for all transitions using GPU matrix multiplications:
 
-        f_s(q) = (2π)^{3/2} Σ_p TDM_prefactor[t, p] * V_x[q_x, p] * V_y[q_y, p] * V_z[q_z, p],
+        f_s(q) = 2 (2π)^{3/2} Σ_p TDM_prefactor[t, p] * V_x[q_x, p] * V_y[q_y, p] * V_z[q_z, p],
 
     where t denotes the transition index, and V_x is weighted by M_ij. For each transition,
     pairs are discarded if |T_ij| = |M_ij * TDM| < max{|T_ij|} * threshold.

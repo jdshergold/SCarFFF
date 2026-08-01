@@ -10,6 +10,7 @@ include("../../utils/BinEncoding.jl")
 using .BinEncoding: decode_bins
 using ...SparseTensors
 using ...SparseTensors: SparseDTensor, SparseWTensor, SparseATensor, lambda_mu_key, uvw_key
+using ...ThreadChunks: chunk_count, chunk_range
 
 @inline function load_sparse_A_tensor(path::String, ::Type{T}) where {T<:AbstractFloat}
     """
@@ -77,106 +78,117 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
     num_ij_bins = length(D_tensor.ij_bins)
     num_A_uvw_bins = length(A_tensor.uvw_bins)
 
-    # Allocate thread-local storage. Use maxthreadid() because threadid() can exceed nthreads()
-    # when Julia is running with interactive/default thread pools.
-    n_threads = Base.Threads.maxthreadid()
+    # Split the (i, j) bins into one chunk per task.
+    n_chunks = chunk_count(num_ij_bins, nthreads())
 
-    # Allocate thread-local buffers to store W tensor entries in COO format.
-    i_indices_pool = [Int[] for _ in 1:n_threads]
-    j_indices_pool = [Int[] for _ in 1:n_threads]
-    lambda_indices_pool = [Int[] for _ in 1:n_threads]
-    mu_indices_pool = [Int[] for _ in 1:n_threads]
-    n_indices_pool = [Int[] for _ in 1:n_threads]
-    W_values_pool = [Complex{T}[] for _ in 1:n_threads]
+    # Allocate per-task buffers to store W tensor entries in COO format.
+    i_indices_pool = [Int[] for _ in 1:n_chunks]
+    j_indices_pool = [Int[] for _ in 1:n_chunks]
+    lambda_indices_pool = [Int[] for _ in 1:n_chunks]
+    mu_indices_pool = [Int[] for _ in 1:n_chunks]
+    n_indices_pool = [Int[] for _ in 1:n_chunks]
+    W_values_pool = [Complex{T}[] for _ in 1:n_chunks]
 
-    # Allocate thread-local accumulators for each (i, j) slice.
-    W_ij_slice_pool = [zeros(Complex{T}, n_dim, lambda_dim, mu_dim) for _ in 1:n_threads]
-    W_ij_touched_pool = [falses(n_dim, lambda_dim, mu_dim) for _ in 1:n_threads]
-    nonzero_slots_pool = [Vector{NTuple{3, Int}}(undef, n_dim * lambda_dim * mu_dim) for _ in 1:n_threads]
+    # Allocate per-task accumulators for each (i, j) slice.
+    W_ij_slice_pool = [zeros(Complex{T}, n_dim, lambda_dim, mu_dim) for _ in 1:n_chunks]
+    W_ij_touched_pool = [falses(n_dim, lambda_dim, mu_dim) for _ in 1:n_chunks]
+    nonzero_slots_pool = [Vector{NTuple{3, Int}}(undef, n_dim * lambda_dim * mu_dim) for _ in 1:n_chunks]
 
     # Process (i, j) bins in parallel.
-    @threads for bin_idx in 1:num_ij_bins
-        ij_bin = D_tensor.ij_bins[bin_idx]
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # Get the buffers for this task.
+            i_indices_local = i_indices_pool[chunk]
+            j_indices_local = j_indices_pool[chunk]
+            lambda_indices_local = lambda_indices_pool[chunk]
+            mu_indices_local = mu_indices_pool[chunk]
+            n_indices_local = n_indices_pool[chunk]
+            W_values_local = W_values_pool[chunk]
+            W_ij_slice = W_ij_slice_pool[chunk]
+            W_ij_touched = W_ij_touched_pool[chunk]
+            nonzero_slots = nonzero_slots_pool[chunk]
 
-        # If the bin is empty, we can skip it.
-        isempty(ij_bin) && continue
+            for bin_idx in chunk_range(chunk, n_chunks, num_ij_bins)
+                ij_bin = D_tensor.ij_bins[bin_idx]
 
-        # Get the thread ID.
-        thread_id = threadid()
+                # If the bin is empty, we can skip it.
+                isempty(ij_bin) && continue
 
-        # Track the number of nonzero slots for this (i, j) bin.
-        nonzero_count = 0
+                # Track the number of nonzero slots for this (i, j) bin.
+                nonzero_count = 0
 
-        # Get the corresponding slice indices for the bin.
-        first_idx = ij_bin[1]
-        pair_i = D_tensor.i[first_idx]
-        pair_j = D_tensor.j[first_idx]
+                # Get the corresponding slice indices for the bin.
+                first_idx = ij_bin[1]
+                pair_i = D_tensor.i[first_idx]
+                pair_j = D_tensor.j[first_idx]
 
-        # Now loop over all D tensor entries in this (i, j) bin.
-        @inbounds for D_idx in ij_bin
+                # Now loop over all D tensor entries in this (i, j) bin.
+                @inbounds for D_idx in ij_bin
 
-            # Get the (u, v, w) indices for this D tensor entry.
-            # We use these to contract with the correct A tensor entries.
-            u = D_tensor.u[D_idx]
-            v = D_tensor.v[D_idx]
-            w = D_tensor.w[D_idx]
-            uvw_idx = uvw_key[u + 1, v + 1, w + 1]
+                    # Get the (u, v, w) indices for this D tensor entry.
+                    # We use these to contract with the correct A tensor entries.
+                    u = D_tensor.u[D_idx]
+                    v = D_tensor.v[D_idx]
+                    w = D_tensor.w[D_idx]
+                    uvw_idx = uvw_key[u + 1, v + 1, w + 1]
 
-            uvw_idx > num_A_uvw_bins && continue
+                    uvw_idx > num_A_uvw_bins && continue
 
-            A_bin = A_tensor.uvw_bins[uvw_idx]
+                    A_bin = A_tensor.uvw_bins[uvw_idx]
 
-            # If there are no entries for this bin, skip this D bin.
-            isempty(A_bin) && continue
+                    # If there are no entries for this bin, skip this D bin.
+                    isempty(A_bin) && continue
 
-            D_val = D_tensor.D_values[D_idx]
-            n = u + v + w
-            n > n_max && continue
+                    D_val = D_tensor.D_values[D_idx]
+                    n = u + v + w
+                    n > n_max && continue
 
-            # Now loop over the matching A tensor entries and accumulate into the W_ij_slice.
-            @inbounds for A_idx in A_bin
-                lambda = A_tensor.lambda[A_idx]
-                mu = A_tensor.mu[A_idx]
-                A_val = A_values[A_idx]
+                    # Now loop over the matching A tensor entries and accumulate into the W_ij_slice.
+                    @inbounds for A_idx in A_bin
+                        lambda = A_tensor.lambda[A_idx]
+                        mu = A_tensor.mu[A_idx]
+                        A_val = A_values[A_idx]
 
-                # Skip if λ > n.
-                lambda > n && continue
+                        # Skip if λ > n.
+                        lambda > n && continue
 
-                # Accumulate into W_ij_slice.
-                n_idx = n + 1
-                lambda_idx = lambda + 1
-                mu_idx = mu + mu_offset
+                        # Accumulate into W_ij_slice.
+                        n_idx = n + 1
+                        lambda_idx = lambda + 1
+                        mu_idx = mu + mu_offset
 
-                # Track touched slots separately from their value, since contributions can cancel to zero.
-                if !W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx]
-                    W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx] = true
-                    nonzero_count += 1
-                    nonzero_slots_pool[thread_id][nonzero_count] = (n_idx, lambda_idx, mu_idx)
+                        # Track touched slots separately from their value, since contributions can cancel to zero.
+                        if !W_ij_touched[n_idx, lambda_idx, mu_idx]
+                            W_ij_touched[n_idx, lambda_idx, mu_idx] = true
+                            nonzero_count += 1
+                            nonzero_slots[nonzero_count] = (n_idx, lambda_idx, mu_idx)
+                        end
+                        W_ij_slice[n_idx, lambda_idx, mu_idx] += D_val * A_val
+                    end
                 end
-                W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx] += D_val * A_val
+
+                # Skip the pushing to W_ij if there are no nonzero entries.
+                nonzero_count == 0 && continue
+
+                # Push the nonzero entries to the task-local W tensor and reset the slice and counters.
+                @inbounds for idx in 1:nonzero_count
+                    n_idx, lambda_idx, mu_idx = nonzero_slots[idx]
+                    value = W_ij_slice[n_idx, lambda_idx, mu_idx]
+                    W_ij_slice[n_idx, lambda_idx, mu_idx] = typed_complex_zero
+                    W_ij_touched[n_idx, lambda_idx, mu_idx] = false
+                    value == typed_complex_zero && continue
+                    push!(i_indices_local, pair_i)
+                    push!(j_indices_local, pair_j)
+                    push!(lambda_indices_local, lambda_idx - 1)
+                    push!(mu_indices_local, mu_idx - mu_offset)
+                    push!(n_indices_local, n_idx - 1)
+                    push!(W_values_local, value)
+                end
             end
-        end
-
-        # Skip the pushing to W_ij if there are no nonzero entries.
-        nonzero_count == 0 && continue
-
-        # Push the nonzero entries to the thread-local W tensor and reset the slice and counters.
-        @inbounds for idx in 1:nonzero_count
-            n_idx, lambda_idx, mu_idx = nonzero_slots_pool[thread_id][idx]
-            value = W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx]
-            W_ij_slice_pool[thread_id][n_idx, lambda_idx, mu_idx] = typed_complex_zero
-            W_ij_touched_pool[thread_id][n_idx, lambda_idx, mu_idx] = false
-            value == typed_complex_zero && continue
-            push!(i_indices_pool[thread_id], pair_i)
-            push!(j_indices_pool[thread_id], pair_j)
-            push!(lambda_indices_pool[thread_id], lambda_idx - 1)
-            push!(mu_indices_pool[thread_id], mu_idx - mu_offset)
-            push!(n_indices_pool[thread_id], n_idx - 1)
-            push!(W_values_pool[thread_id], value)
         end
     end
 
-    # Merge the thread-local results into global arrays.
+    # Merge the per-task results into global arrays.
     i_indices = reduce(vcat, i_indices_pool)
     j_indices = reduce(vcat, j_indices_pool)
     lambda_indices = reduce(vcat, lambda_indices_pool)
