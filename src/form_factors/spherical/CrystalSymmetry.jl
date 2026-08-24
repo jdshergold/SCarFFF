@@ -40,10 +40,12 @@ export SymmetryOperation, StarMember, Stars, derive_symmetry_operations,
        build_stars, star_reduction_factor, choose_compatible_phi_count
 
 # How close a matched rotation, or a lattice vector's fractional coordinates, has to be.
-const MATCH_TOLERANCE = 1.0e-6
+# Max part is used to make sure float32 is not too strict to work.
+match_tolerance(::Type{T}) where {T<:AbstractFloat} = max(T(1.0e-6), 100 * eps(T))
 
-# Decimal places used to recognise two grid directions as the same.
-const DIRECTION_DIGITS = 8
+# Decimal places used to recognise two grid directions as the same. Float32 needs some slack.
+direction_digits(::Type{Float32}) = 5
+direction_digits(::Type{T}) where {T<:AbstractFloat} = 8
 
 struct SymmetryOperation{T<:AbstractFloat}
     """
@@ -185,7 +187,7 @@ function is_lattice_vector(lattice::CrystalLatticeData{T}, vector::SVector{3, T}
     # The rows of `direct` are the lattice vectors, so the fractional coordinates satisfy Aᵀ x = vector.
     fractional = inv(transpose(lattice.direct)) * vector
 
-    return all(component -> abs(component - round(component)) < MATCH_TOLERANCE, fractional)
+    return all(component -> abs(component - round(component)) < match_tolerance(T), fractional)
 end
 
 function match_operation(
@@ -226,7 +228,7 @@ function match_operation(
 
         for j in 1:n_images
             # Check if each image points along the same direction as the rotated one.
-            maximum(abs, rotated - operations[j]) < MATCH_TOLERANCE || continue
+            maximum(abs, rotated - operations[j]) < match_tolerance(T) || continue
             # Check that the rotated image sits on top of the candidate image, up to a lattice vector.
             offset = position - translations[j]
             is_lattice_vector(lattice, offset) || continue
@@ -282,7 +284,7 @@ function derive_symmetry_operations(
             composed_rotation = rotation_a * rotation_b
             composed_translation = rotation_a * translation_b + translation_a
             seen = any(candidates) do candidate
-                maximum(abs, candidate[1] - composed_rotation) < MATCH_TOLERANCE &&
+                maximum(abs, candidate[1] - composed_rotation) < match_tolerance(T) &&
                     is_lattice_vector(lattice, candidate[2] - composed_translation)
             end
             if !seen
@@ -302,7 +304,7 @@ function derive_symmetry_operations(
 
     # Put the idenity operation first in the list.
     identity_position = findfirst(
-        operation -> maximum(abs, operation.rotation - one(SMatrix{3, 3, T, 9})) < MATCH_TOLERANCE, found)
+        operation -> maximum(abs, operation.rotation - one(SMatrix{3, 3, T, 9})) < match_tolerance(T), found)
     identity_position === nothing && error(
         "The identity is not among the matched symmetry operations, which should be impossible. " *
         "Check the translations and rotations in the crystal metadata."
@@ -347,12 +349,14 @@ function build_stars(
     end
 
     # Define a key for each direction, to group them into stars.
-    direction_key(v) = ntuple(i -> round(v[i] + zero(T), digits = DIRECTION_DIGITS) + zero(T), 3)
+    digits = direction_digits(T)
+    direction_key(v) = ntuple(i -> round(v[i] + zero(T), digits = digits) + zero(T), 3)
 
     # Collapse the grid onto distinct directions, remembering every index each one occupies.
     key_to_direction = Dict{NTuple{3, T}, Int}()
     direction_vectors = SVector{3, T}[]
     direction_indices = Vector{Tuple{Int, Int}}[]
+    direction_at_node = Matrix{Int}(undef, n_theta, n_phi)
     for theta_idx in 1:n_theta, phi_idx in 1:n_phi
         vector = direction_at(theta_idx, phi_idx)
         key = direction_key(vector)
@@ -364,8 +368,28 @@ function build_stars(
             key_to_direction[key] = index
         end
         push!(direction_indices[index], (theta_idx, phi_idx))
+        direction_at_node[theta_idx, phi_idx] = index
     end
     n_directions = length(direction_vectors)
+
+    # Look a rotated direction up by snapping it to the nearest grid node and checking the residual.
+    residual_tolerance = max(sqrt(eps(T)), T(1.0e-8))
+    function nearest_direction(w::SVector{3, T})
+        # Get the angles.
+        theta = acos(clamp(w[3], -one(T), one(T)))
+        phi = mod(atan(w[2], w[1]), T(2π))
+        theta_idx = clamp(searchsortedfirst(theta_grid, theta), 1, n_theta)
+        if theta_idx > 1 && abs(theta_grid[theta_idx - 1] - theta) < abs(theta_grid[theta_idx] - theta)
+            theta_idx -= 1
+        end
+        phi_idx = clamp(searchsortedfirst(phi_grid, phi), 1, n_phi)
+        if phi_idx > 1 && abs(phi_grid[phi_idx - 1] - phi) < abs(phi_grid[phi_idx] - phi)
+            phi_idx -= 1
+        end
+        # The residual is what decides it, so a near miss on the index costs nothing.
+        maximum(abs, direction_at(theta_idx, phi_idx) - w) <= residual_tolerance || return 0
+        return direction_at_node[theta_idx, phi_idx]
+    end
 
     # An operation is usable only if every direction has an image among the directions.
     usable = SymmetryOperation{T}[]
@@ -377,7 +401,7 @@ function build_stars(
         closed = true
         for index in 1:n_directions
             # Find the image of the direction: sign * R^{-1} * direction.
-            target = get(key_to_direction, direction_key(sign .* (inverse * direction_vectors[index])), 0)
+            target = nearest_direction(sign .* (inverse * direction_vectors[index]))
             if target == 0
                 closed = false
                 break

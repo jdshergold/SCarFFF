@@ -131,64 +131,56 @@ def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean)
 
 
 
-def plot_band_energies(coherent_path, output_path, columns=6, dpi=200):
+def plot_band_energies(coherent_path, output_dir, dpi=200):
     """
-    Draw E_Psi(k) over a plane of the first Brillouin zone, one panel per crystal state.
-
-    Every band is its own surface over the plane, so they cannot share an axes: a plane of k needs
-    one panel per state. Axes are k in keV along the two reciprocal lattice vectors spanning the
-    plane. The plane is Cartesian, matching the form factor slices, and covers the bounding box of
-    the zone; points outside the zone are NaN and render blank.
+    Draw E_Psi(k) over the sampled Brillouin zone planes, one figure per crystal state.
+    Points outside the zone are NaN and render blank, which will happen for some space groups.
 
     # Arguments:
-    - coherent_path::Path: The coherent crystal HDF5, which carries the map in its band_map group.
-    - output_path::Path: Where to write the figure.
-    - columns::int: Panels per row.
+    - coherent_path::Path: The coherent crystal HDF5, carrying the maps in its band_map group.
+    - output_dir::Path: Directory to write the per state figures into.
     - dpi::int: Figure resolution.
 
     # Returns:
     - None.
     """
 
+    labels = {"xy": ("k_x", "k_y"), "xz": ("k_x", "k_z"), "yz": ("k_y", "k_z")}
+
     with h5py.File(coherent_path, "r") as coherent_file:
         band_group = coherent_file["band_map"]
-        # Julia writes (n_states, n_a, n_b); HDF5 reverses it, so transpose back.
-        energies = np.array(band_group["energies_eV"]).T
-        axis_a = band_group["axis_a_keV"][()]
-        axis_b = band_group["axis_b_keV"][()]
-        plane = band_group["plane"][()]
+        planes = [p.decode() if isinstance(p, bytes) else p for p in band_group["planes"][()]]
+        maps = {}
+        for plane in planes:
+            # Julia writes (n_states, n_a, n_b); HDF5 reverses it, so transpose back.
+            maps[plane] = (np.array(band_group[plane]["energies_eV"]).T,
+                           band_group[plane]["axis_a_keV"][()],
+                           band_group[plane]["axis_b_keV"][()])
 
-    if isinstance(plane, bytes):
-        plane = plane.decode()
+    n_states = maps[planes[0]][0].shape[0]
+    n_planes = len(planes)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_states = energies.shape[0]
-    rows = int(np.ceil(n_states / columns))
-    figure, axes = plt.subplots(rows, columns, figsize=(2.6 * columns, 2.4 * rows),
-                                squeeze=False, constrained_layout=True)
-
-    extent = [axis_a[0], axis_a[-1], axis_b[0], axis_b[-1]]
     for state in range(n_states):
-        axis = axes[state // columns][state % columns]
-        image = axis.imshow(energies[state].T, origin="lower", extent=extent,
-                            aspect="auto", cmap="viridis")
-        axis.set_title(rf"$\Psi_{{{state + 1}}}$", fontsize=9)
-        axis.tick_params(labelsize=7)
-        figure.colorbar(image, ax=axis, fraction=0.046).ax.tick_params(labelsize=6)
+        figure, axes = plt.subplots(1, n_planes, figsize=(5.5 * n_planes, 5.0), squeeze=False)
+        for plane_index, plane in enumerate(planes):
+            energies, axis_a, axis_b = maps[plane]
+            axis = axes[0, plane_index]
+            image = axis.imshow(energies[state].T, origin="lower",
+                                extent=[axis_a[0], axis_a[-1], axis_b[0], axis_b[-1]],
+                                aspect="auto", cmap="viridis")
+            first_label, second_label = labels[plane]
+            axis.set_xlabel(rf"${first_label}$ (keV)")
+            axis.set_ylabel(rf"${second_label}$ (keV)")
+            figure.colorbar(image, ax=axis, label=r"$E_\Psi\,[\mathrm{eV}]$")
 
-    for spare in range(n_states, rows * columns):
-        axes[spare // columns][spare % columns].axis("off")
+        figure.suptitle(rf"Frenkel exciton band $\Psi_{{{state + 1}}}$ over the first Brillouin zone")
+        figure.tight_layout()
+        figure.savefig(output_dir / f"state_{state + 1:02d}.png", dpi=dpi, bbox_inches="tight")
+        plt.close(figure)
 
-    first_label, second_label = ("k_x", "k_y") if plane == "xy" else \
-                                ("k_x", "k_z") if plane == "xz" else ("k_y", "k_z")
-    figure.supxlabel(rf"${first_label}$ (keV)")
-    figure.supylabel(rf"${second_label}$ (keV)")
-    figure.suptitle(f"Frenkel exciton bands over the first Brillouin zone, {plane} plane "
-                    f"({n_states} states, E in eV). Blank is outside the zone.")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    plt.close(figure)
-    print(f"Band energies saved to {output_path}.")
+    print(f"Band energies saved to {output_dir} ({n_states} states, "
+          f"{n_planes} plane(s): {', '.join(planes)}).")
 
 
 def parse_cli_args():
@@ -314,12 +306,6 @@ def parse_cli_args():
         "--plot-rates",
         action="store_true",
         help="Whether to plot DM scattering rates (spherical method only).",
-    )
-    parser.add_argument(
-        "--band-columns",
-        type=int,
-        default=6,
-        help="Panels per row in the band energy figure (default: 6).",
     )
     parser.add_argument(
         "--x-range",
@@ -457,6 +443,46 @@ def parse_cli_args():
                   "drop --group-states for the signed modes.")
             sys.exit(1)
         parsed_args.grouped = grouped
+
+    # The incoherent crystal path has no crystal states, so the same degeneracy clustering is applied
+    # to the monomer transitions instead.
+    parsed_args.transition_groups = None
+    if (parsed_args.crystal_mode and not parsed_args.coherent
+            and (parsed_args.group_states or parsed_args.group_size > 0)):
+        energies = []
+        transition = 1
+        while True:
+            directory = parsed_args.results_root / str(transition)
+            found = next((directory / c for c in ("fs_grid_f64.h5", "fs_grid_f32.h5")
+                          if (directory / c).exists()), None)
+            if found is None:
+                break
+            with h5py.File(found, "r") as transition_file:
+                energies.append(float(transition_file["conformer_transition_energies_eV"][()][0]))
+            transition += 1
+
+        if not energies:
+            print("No per transition crystal outputs found to group.")
+            sys.exit(1)
+
+        if parsed_args.group_size > 0:
+            clusters = [list(range(s, min(s + parsed_args.group_size, len(energies))))
+                        for s in range(0, len(energies), parsed_args.group_size)]
+        else:
+            clusters = cluster_monomer_transitions(np.array(energies),
+                                                   parsed_args.degeneracy_threshold)
+        parsed_args.transition_groups = [[i + 1 for i in cluster] for cluster in clusters]
+        parsed_args.n_groups = len(parsed_args.transition_groups)
+        parsed_args.grouped = any(len(g) > 1 for g in parsed_args.transition_groups)
+
+        print(f"{parsed_args.n_groups} groups from {len(energies)} monomer transitions:")
+        for index, group in enumerate(parsed_args.transition_groups):
+            mean_energy = float(np.mean([energies[i - 1] for i in group]))
+            print(f"  group {index + 1:2d}: transitions {group}, mean {mean_energy:.4f} eV")
+
+        if parsed_args.transition_indices is None:
+            parsed_args.transition_indices = ",".join(
+                str(group) for group in range(1, parsed_args.n_groups + 1))
 
     return parsed_args
 
@@ -992,11 +1018,11 @@ def main():
         args.transition_indices = "1"
     transitions_to_plot = [t.strip() for t in args.transition_indices.split(",")]
 
-    # Nothing to slice without the (q, θ, ϕ) grid, but the bands below do not need it.
-    if args.coherent and not getattr(args, "has_grid", True):
+    # The slices need the (q, θ, ϕ) grid. The f_lm modes and the bands do not.
+    slices_available = not args.coherent or getattr(args, "has_grid", True)
+    if not slices_available:
         print("No f_s in the coherent output, so there are no slices to plot. Re-run with "
-              "--compute-mode including form_factor if the group plots are wanted.")
-        transitions_to_plot = []
+              "--compute-mode including form_factor if the group slice plots are wanted.")
 
     # Check if molecule directory exists.
     if not runs_dir.exists():
@@ -1048,6 +1074,23 @@ def main():
             input_path = args.coherent_path
             output_dir = args.coherent_path.parent / (
                 f"group_{tidx}" if args.grouped else f"state_{tidx}")
+        elif getattr(args, "transition_groups", None) is not None:
+            group = int(tidx)
+            if not 1 <= group <= args.n_groups:
+                print(f"  Group {group} is out of range, the run has {args.n_groups}.")
+                return []
+            members = args.transition_groups[group - 1]
+            tdir = get_transition_dir(members[0])
+            base = "fs_grid"
+            input_path = None
+            for candidate in [tdir / f"{base}_f64.h5", tdir / f"{base}_f32.h5"]:
+                if candidate.exists():
+                    input_path = candidate
+                    break
+            if input_path is None:
+                print(f"No {args.method} form factor file found for transition {members[0]}.")
+                return []
+            output_dir = args.results_root / f"group_{group}"
         else:
             tdir = get_transition_dir(tidx)
             base = "fs_grid"
@@ -1087,7 +1130,11 @@ def main():
                             print(f"  Group {group} is out of range, the run has {args.n_groups}.")
                             return []
                         first, last = args.group_bounds[group - 1]
-                        if last - first == 1:
+                        # Per member normalisation, so groups of different size are comparable and
+                        # each plot is a per molecule intensity: |f|^2 sums divide by N, and an
+                        # unsquared f divides by sqrt(N) so that squaring it gives the same 1/N.
+                        n_members = last - first
+                        if n_members == 1:
                             # A single state keeps its phase, so the signed modes still work.
                             f_s = ff_file["f_s"][:, :, :, first]
                         else:
@@ -1095,6 +1142,7 @@ def main():
                             for state in range(first, last):
                                 contribution = np.abs(ff_file["f_s"][:, :, :, state]) ** 2
                                 f_s = contribution if f_s is None else f_s + contribution
+                            f_s = f_s / n_members
                     else:
                         f_s = ff_file["f_s"][()]
 
@@ -1107,8 +1155,27 @@ def main():
                 f_lm = None
                 conformer_f_lm = None
                 conformer_titles = None
-                if args.plot_flm_modes and "f_lm" in ff_file:
+                if args.plot_flm_modes and args.coherent and "state_f_lm" in ff_file:
+                    # In coherent mode the f_lm belongs to the crystal states, not to the monomer
+                    # transitions, so take the group's states and sum them. That is the same sum the
+                    # slices above show, so the two panels of a group describe the same object.
+                    first, last = args.group_bounds[int(tidx) - 1]
+                    f_lm = ff_file["state_f_lm"][:, :, first:last].mean(axis=2).T
+                elif args.plot_flm_modes and "f_lm" in ff_file:
                     f_lm = ff_file["f_lm"][()].T
+                    if getattr(args, "transition_groups", None) is not None:
+                        # Average the cluster, matching the coherent groups' per member norm.
+                        members = args.transition_groups[int(tidx) - 1]
+                        for member in members[1:]:
+                            member_dir = get_transition_dir(member)
+                            member_path = next(
+                                (member_dir / c for c in ("fs_grid_f64.h5", "fs_grid_f32.h5")
+                                 if (member_dir / c).exists()), None)
+                            if member_path is None:
+                                continue
+                            with h5py.File(member_path, "r") as member_file:
+                                f_lm = f_lm + member_file["f_lm"][()].T
+                        f_lm = f_lm / len(members)
                     if "conformer_f_lm" in ff_file:
                         conformer_f_lm = np.transpose(ff_file["conformer_f_lm"][()], (2, 1, 0))
 
@@ -1179,7 +1246,8 @@ def main():
     plots_to_generate = []
 
     if args.method == "spherical":
-        plots_to_generate.append(("form_factor", False))
+        if slices_available:
+            plots_to_generate.append(("form_factor", False))
         if args.plot_flm_modes:
             plots_to_generate.append(("flm_modes", False))
     elif args.method == "fft":
@@ -1342,16 +1410,12 @@ def main():
     # for a band map. They are not slices of q, so they get their own figure rather than a panel.
     if args.coherent and args.coherent_path is not None:
         with h5py.File(args.coherent_path, "r") as coherent_file:
-            plane = coherent_file["band_map"]["plane"][()] if "band_map" in coherent_file else None
-        if plane is None:
-            print("No band_map group in the coherent output, so no band energy figure. Re-run the "
-                  "form factor with --band-map-plane to get one.")
+            has_bands = "band_map" in coherent_file
+        if has_bands:
+            plot_band_energies(args.coherent_path, args.coherent_path.parent / "bands")
         else:
-            if isinstance(plane, bytes):
-                plane = plane.decode()
-            plot_band_energies(args.coherent_path,
-                               args.coherent_path.parent / f"band_energies_{plane}.png",
-                               args.band_columns)
+            print("No band_map group in the coherent output, so no band energy figures. Re-run the "
+                  "form factor with --band-map-plane to get them.")
 
 
 if __name__ == "__main__":

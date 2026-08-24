@@ -164,7 +164,7 @@ function parse_commandline()::Dict{String, Any}
             help = "Sample the band energies E_Psi(k) over a Cartesian plane of the first " *
                    "Brillouin zone and save them alongside the coherent output, for plotting. The " *
                    "planes are the same as the form factor slices: xy is k_z = 0, xz is k_y = 0, " *
-                   "yz is k_x = 0. Use 'none' to skip it."
+                   "yz is k_x = 0. Use 'all' for all three, or 'none' to skip it."
             default = "none"
         "--band-map-points"
             help = "Samples along each axis of the band map plane."
@@ -301,7 +301,7 @@ function parse_transition_indices(indices_str::String, td_h5_path::String)::Vect
             "Found no transitions in $(td_h5_path). Expected X_state_1 and Y_state_1, or one of the " *
             "older transition_matrices or d_ij_state_1 layouts."
         )
-        println("Resolved --transition-indices all to $(n_transitions) transitions, counted from the $(source).")
+        println("Found $(n_transitions) transitions, counted from the $(source).")
 
         return collect(1:n_transitions)
     else
@@ -475,8 +475,8 @@ function main()
     no_dipole_term = args["no-dipole-term"]
     band_map_plane = lowercase(args["band-map-plane"])
     band_map_points = args["band-map-points"]
-    band_map_plane in ("none", "xy", "xz", "yz") ||
-        error("--band-map-plane must be none, xy, xz or yz, got '$(band_map_plane)'.")
+    band_map_plane in ("none", "all", "xy", "xz", "yz") ||
+        error("--band-map-plane must be none, all, xy, xz or yz, got '$(band_map_plane)'.")
     no_couplings = args["no-couplings"]
     transition_indices_str = args["transition-indices"]
     force_recomp = args["force-recomputation"]
@@ -816,8 +816,13 @@ function main()
 
                 # set_f_lm is the one aggregated over one conformer group (e.g. 1_A), the other is aggregated over all groups.
                 # This is the zeroth-order, incoherent approximation: it adds |f|^2 over the rotated
-                # images, ignoring both the relative phases and any mixing between molecules.
-                set_f_lm, aggregate_f_lm = construct_crystal_f_lm_tensors(conformer_labels, conformer_f_lm, conformer_sets)
+                # images, ignoring both the relative phases and any mixing between molecules. The
+                # coherent path supersedes it, so under --crystal-order coherent it is built only if
+                # the rates still need it, and the per transition outputs below are skipped.
+                need_incoherent = crystal_order != "coherent" || compute_rates_flag
+                set_f_lm, aggregate_f_lm = need_incoherent ?
+                    construct_crystal_f_lm_tensors(conformer_labels, conformer_f_lm, conformer_sets) :
+                    (nothing, nothing)
                 conformer_set_occupancies = T[conformer_set.occupancy for conformer_set in conformer_sets]
 
                 # The coherent path solves the Frenkel exciton Bloch problem and mixes the molecular
@@ -952,12 +957,17 @@ function main()
                     # Optionally sample E_Ψ(k) over a plane of the first Brillouin zone, for plotting.
                     # Everything it needs is already built, so this is just the sweep, and it inherits
                     # the run's own q grid, ε and l_max rather than being told them a second time.
-                    if band_map_plane != "none"
-                        band_timing = @timed sample_band_plane(
-                            basis, lattice, crystal_couplings, crystal_long_range,
-                            band_map_plane, band_map_points, T)
-                        band_axes, band_energies = band_timing.value
-                        push!(stage_times, "band map ($(band_map_plane) plane)" => band_timing.time)
+                    band_planes = band_map_plane == "none" ? String[] :
+                                  band_map_plane == "all" ? ["xy", "xz", "yz"] : [band_map_plane]
+                    band_maps = Dict{String, Tuple{Tuple{Vector{T}, Vector{T}}, Array{T, 3}}}()
+                    if !isempty(band_planes)
+                        band_timing = @timed for plane in band_planes
+                            band_maps[plane] = sample_band_plane(
+                                basis, lattice, crystal_couplings, crystal_long_range,
+                                plane, band_map_points, T)
+                        end
+                        push!(stage_times,
+                              "band map ($(join(band_planes, ", ")))" => band_timing.time)
                     end
 
                     crystal_total = sum(last, stage_times)
@@ -984,6 +994,10 @@ function main()
                 end
 
                 for (batch_idx, transition_idx) in enumerate(transition_indices)
+                    # These per transition files describe the incoherent approximation the coherent output replaces, 
+                    #so they are not written at all if coherent output is requested.
+                    aggregate_f_lm === nothing && break
+
                     transition_output_dir = joinpath(mol_output_dir, "crystal", string(transition_idx))
                     mkpath(transition_output_dir)
 
@@ -1094,12 +1108,16 @@ function main()
                         end
 
                         # The band energies over a plane of the first Brillouin zone, if asked for.
-                        if band_map_plane != "none"
+                        if !isempty(band_planes)
                             band_group = create_group(io, "band_map")
-                            write(band_group, "energies_eV", band_energies)
-                            write(band_group, "axis_a_keV", band_axes[1])
-                            write(band_group, "axis_b_keV", band_axes[2])
-                            write(band_group, "plane", band_map_plane)
+                            write(band_group, "planes", band_planes)
+                            for plane in band_planes
+                                (plane_axes, plane_energies) = band_maps[plane]
+                                plane_group = create_group(band_group, plane)
+                                write(plane_group, "energies_eV", plane_energies)
+                                write(plane_group, "axis_a_keV", plane_axes[1])
+                                write(plane_group, "axis_b_keV", plane_axes[2])
+                            end
                         end
 
                         # What went in.

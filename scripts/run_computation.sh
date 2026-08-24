@@ -8,21 +8,22 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="benzene_test"     # Name for this run.
+RUN_NAME="benzene_test_frenkel"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
 CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
-SMILES="C1=CC=CC=C1"        # Single molecule mode. SMILES string for the molecule.
-CIF_FILE=""                 # Single crystal mode. Path to a CIF file.
+SMILES=""        # Single molecule mode. SMILES string for the molecule.
+CIF_FILE="examples/benzene_1423904.cif"                 # Single crystal mode. Path to a CIF file.
 CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
 
 # ==== Crystal parameters (crystal mode only). ====
 CRYSTAL_ORDER="coherent"    # How to combine the monomer form factors. "coherent" solves the Frenkel
                             # exciton Bloch problem and mixes amplitudes before squaring; "incoherent"
                             # just adds |f|^2 over the images. Everything below is coherent-only.
-BAND_MAP_PLANE="xy"         # Cartesian plane to sample the band energies E(k) over, matching the form
-                            # factor slices: xy (k_z=0), xz (k_y=0), yz (k_x=0), or "none" to skip.
+BAND_MAP_PLANE="all"        # Cartesian plane(s) to sample the band energies E(k) over, matching the
+                            # form factor slices: "all", or one of xy (k_z=0), xz (k_y=0), yz (k_x=0),
+                            # or "none" to skip.
 
 
 # ==== TD-DFT parameters. ====
@@ -31,7 +32,7 @@ XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
-DFT_OPTIMISATION=true    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
+DFT_OPTIMISATION=false    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
 PLOT_MOLECULE_3D=false    # Set to true to generate interactive 3D molecule plot from TD-DFT.
 
 # ==== Form factor computation parameters. ====
@@ -49,7 +50,7 @@ N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 t
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODES=("f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
+COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
 COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor.
@@ -72,7 +73,7 @@ TRANSITION_INDICES="all"       # Which electronic transitions to compute. Can be
 THRESHOLD=1e-6             # Threshold for dropping small tensor values. For spherical: |W/W_max| < THRESHOLD. For Cartesian: |M_ij/M_max| < THRESHOLD. Set to 0.0 to disable. Around 1e-6 is recommended for both accuracy and performance.
 JULIA_THREADS="auto"       # Number of threads to use for the Julia part of the code. Set to "auto" to use all available threads.
 PRECISION="float32"       # Floating point precision for form factor computation. On CPU this has negligible impact on performance, but cuts down on file size by ~2. May produce 'fuzzy looking' Re/Im plots when the values are effectively zero in float32.
-USE_GPU=true              # Set to true to enable GPU acceleration for the DFT and form factor computations. Supports spherical, FFT, and Cartesian methods.
+USE_GPU=false              # Set to true to enable GPU acceleration for the DFT and form factor computations. Supports spherical, FFT, and Cartesian methods.
 
 # ==== Control flags. ====
 SKIP_TDDFT=true            # Set to true to skip the TD-DFT calculation. Will not be skipped if the results do not already exist.
@@ -112,6 +113,9 @@ PLOT_RANGE_Z=()           # z range in Angstroms (e.g., ("-10" "10")).
 # ========================================
 # CONFIG ENDS HERE
 # ========================================
+
+FLM_MODES_ARG=""
+if [ "$PLOT_FLM_MODES" = true ]; then FLM_MODES_ARG="--plot-flm-modes"; fi
 
 # Get the directory where this script is located.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -563,11 +567,14 @@ else
                 # Coherent crystal outputs get the grouped slices under group_n/ plus the band
                 # energies over the first Brillouin zone, in one pass.
                 if [ -d "$MOL_DIR/crystal/coherent" ]; then
+                    # The coherent output supersedes the incoherent one, which is not computed at
+                    # all under --crystal-order coherent, so there is nothing per transition to plot.
                     $PYTHON_BIN plot_slices.py --run-name "$RUN_NAME" --molecule-number "$MOL_NUM" \
                         --method spherical --results-dir crystal --coherent --group-states \
-                        || echo "  Coherent crystal plotting failed."
+                        $FLM_MODES_ARG || echo "  Coherent crystal plotting failed."
+                else
+                    run_slice_plots "$MOL_NUM" "crystal" true
                 fi
-                run_slice_plots "$MOL_NUM" "crystal" true
                 for conformer_dir in "$MOL_DIR"/conformers/*; do
                     [ -d "$conformer_dir" ] || continue
                     conformer_label=$(basename "$conformer_dir")

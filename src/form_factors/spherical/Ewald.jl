@@ -382,7 +382,10 @@ function build_ewald_long_range(
     # The Hermite interpolation and the dipole slopes both assume a uniform grid anchored at zero.
     abs(q_grid_invA[1]) < eps(T) ||
         error("The Ewald long-range sum expects a q grid starting at zero, got $(q_grid_invA[1]).")
-    all(abs(q_grid_invA[i + 1] - q_grid_invA[i] - q_step) < 1.0e-8 * q_step for i in 1:(n_q - 1)) ||
+    # Use sqrt(eps) here, to make sure it is compatible with float32. This will still be well below
+    # any meaningul deviations.
+    uniform_tolerance = sqrt(eps(T)) * q_step
+    all(abs(q_grid_invA[i + 1] - q_grid_invA[i] - q_step) < uniform_tolerance for i in 1:(n_q - 1)) ||
         error("The Ewald long-range sum expects a uniform q grid.")
 
     # Check that we can actually reach Q_max with the grid and error settings.
