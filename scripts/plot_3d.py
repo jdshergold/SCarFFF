@@ -104,6 +104,22 @@ def parse_cli_args():
         help="Whether to plot the transition density (FFT method only).",
     )
     parser.add_argument(
+        "--coherent",
+        action="store_true",
+        help="Plot the coherent crystal states rather than the per-transition crystal form factors "
+             "(spherical crystal runs only). The data is read from crystal/coherent/, and "
+             "--transition-indices then selects groups of crystal states, ordered by ascending "
+             "energy, rather than monomer transitions.",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=0,
+        help="Crystal states summed per plot in coherent mode, in ascending energy. Defaults to the "
+             "number of molecules in the unit cell, which is how many crystal states each monomer "
+             "transition gives rise to. Pass 1 to plot states individually.",
+    )
+    parser.add_argument(
         "--x-range",
         type=str,
         default=None,
@@ -166,6 +182,41 @@ def parse_cli_args():
     if parsed_args.method not in ["spherical", "fft", "cartesian"]:
         print(f"Error: Invalid method '{parsed_args.method}'. Must be 'spherical', 'fft', or 'cartesian'.")
         sys.exit(1)
+
+    # In coherent mode every crystal state lives in one file rather than one directory each, and the
+    # indices select groups of states rather than monomer transitions.
+    parsed_args.coherent_path = None
+    if parsed_args.coherent:
+        if parsed_args.method != "spherical":
+            print("--coherent only applies to spherical crystal runs.")
+            sys.exit(1)
+        coherent_root = (runs_dir / "crystal" / "coherent" if parsed_args.results_dir is None
+                         else parsed_args.output_dir / "coherent")
+        for candidate in ["crystal_f_lm_f64.h5", "crystal_f_lm_f32.h5"]:
+            path = coherent_root / candidate
+            if path.exists():
+                parsed_args.coherent_path = path
+                break
+        if parsed_args.coherent_path is None:
+            print(f"No coherent form factor file found under {coherent_root}.")
+            sys.exit(1)
+
+        with h5py.File(parsed_args.coherent_path, "r") as coherent_file:
+            n_states = coherent_file["f_s"].shape[3]
+            n_transitions = coherent_file["transition_indices"].shape[0]
+        parsed_args.effective_group_size = (
+            parsed_args.group_size if parsed_args.group_size > 0 else n_states // n_transitions)
+        if parsed_args.effective_group_size < 1 or n_states % parsed_args.effective_group_size:
+            print(f"{n_states} states do not divide into groups of "
+                  f"{parsed_args.effective_group_size}.")
+            sys.exit(1)
+        parsed_args.n_groups = n_states // parsed_args.effective_group_size
+
+        # Summing |f|^2 over a group discards the phase, so the signed modes have nothing to show.
+        if parsed_args.effective_group_size > 1 and parsed_args.mode != "modsq":
+            print(f"Grouped coherent plots sum |f|^2, so --mode {parsed_args.mode} is not available; "
+                  "use --group-size 1 for the signed modes.")
+            sys.exit(1)
 
     # The transition density is only available for the FFT method.
     if parsed_args.plot_transition_density and parsed_args.method != "fft":
@@ -372,7 +423,7 @@ def apply_range_limits(coord1_mesh, coord2_mesh, coord3_mesh, data, args, coord_
     return coord1_trim, coord2_trim, coord3_trim, data_trim
 
 
-def extract_domain_data(data, mode, is_transition_density):
+def extract_domain_data(data, mode, is_transition_density, already_squared=False):
     """
     Get the correct data to plot based on the selected mode.
 
@@ -380,6 +431,8 @@ def extract_domain_data(data, mode, is_transition_density):
     - data::np.ndarray: Complex array of 3D form factor values, or real array of transition density values.
     - mode::str or None: What to plot for form factors. Should be one of "modsq", "Im", or "Re". This is ignored for transition density.
     - is_transition_density::bool: Whether we are plotting the transition density.
+    - already_squared::bool: Whether the data is already |f|^2, which it is when crystal states have
+      been summed over a group, since the sum has to happen after squaring.
 
     # Returns:
     - plot_data::np.ndarray: The data to plot.
@@ -394,8 +447,8 @@ def extract_domain_data(data, mode, is_transition_density):
         symmetric = True
     else:
         if mode == "modsq":
-            plot_data = np.abs(data) ** 2
-            label = "|f_s(q)|^2"
+            plot_data = data if already_squared else np.abs(data) ** 2
+            label = "Σ_Ψ |f_s(q)|^2" if already_squared else "|f_s(q)|^2"
             colorscale = "Viridis"
             symmetric = False
         elif mode == "Im":
@@ -580,6 +633,45 @@ def main():
         # Returns:
         - ::tuple: Loaded data, containing e.g. form factor, transition density, and grid data.
         """
+        if args.coherent:
+            # One group of crystal states, summed. Everything else below is shared with the
+            # per-transition path, since after the sum it is just another scalar field on the grid.
+            group_size = args.effective_group_size
+            group = int(tidx)
+            if not 1 <= group <= args.n_groups:
+                print(f"  Group {group} is out of range, the run has {args.n_groups}.")
+                return None
+            first = (group - 1) * group_size
+
+            with h5py.File(args.coherent_path, "r") as ff_file:
+                theta_grid = ff_file["theta_grid"][()]
+                phi_grid = ff_file["phi_grid"][()]
+                q_grid = ff_file["q_grid"][()]
+                band_mean = ff_file["band_energy_mean_eV"][()]
+
+                # Julia writes (n_states, n_q, n_theta, n_phi), which h5py presents reversed, so the
+                # state is the last index here. A single state keeps its phase, so the signed modes
+                # still work; a group has to be squared before summing and loses it.
+                if group_size == 1:
+                    field = ff_file["f_s"][:, :, :, first]
+                else:
+                    field = None
+                    for state in range(first, first + group_size):
+                        contribution = np.abs(ff_file["f_s"][:, :, :, state]) ** 2
+                        field = contribution if field is None else field + contribution
+
+            # Julia's (n_q, n_theta, n_phi) arrives as (n_phi, n_theta, n_q), so match the layout
+            # the per-transition path produces.
+            field = np.transpose(field, (1, 0, 2))
+            output_dir = args.coherent_path.parent / (
+                f"group_{group}" if group_size > 1 else f"state_{group}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            mean_energy = band_mean[first:first + group_size].mean()
+            print(f"  Group {group} of {args.n_groups}: states {first + 1}-{first + group_size}, "
+                  f"mean energy {mean_energy:.4f} eV.")
+
+            return (field, theta_grid, phi_grid, q_grid, output_dir)
+
         numeric_dir = Path(args.output_dir / str(tidx))
         transition_dir = Path(args.output_dir / f"transition_{tidx}")
         if numeric_dir.exists():
@@ -692,7 +784,8 @@ def main():
                 if args.method == "spherical":
                     f_s, theta_grid, phi_grid, q_grid, output_dir = data
                     plot_data, label, colorscale, symmetric = extract_domain_data(
-                        f_s, mode, False
+                        f_s, mode, False,
+                        already_squared=args.coherent and args.effective_group_size > 1
                     )
 
                     # Determine q_lim from args if specified.

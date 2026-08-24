@@ -17,6 +17,13 @@ SMILES="C1=CC=CC=C1"        # Single molecule mode. SMILES string for the molecu
 CIF_FILE=""                 # Single crystal mode. Path to a CIF file.
 CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
 
+# ==== Crystal parameters (crystal mode only). ====
+CRYSTAL_ORDER="coherent"    # How to combine the monomer form factors. "coherent" solves the Frenkel
+                            # exciton Bloch problem and mixes amplitudes before squaring; "incoherent"
+                            # just adds |f|^2 over the images. Everything below is coherent-only.
+BAND_MAP_PLANE="xy"         # Cartesian plane to sample the band energies E(k) over, matching the form
+                            # factor slices: xy (k_z=0), xz (k_y=0), yz (k_x=0), or "none" to skip.
+
 
 # ==== TD-DFT parameters. ====
 BASIS="def2-svp"             # Basis set to use. See README for supported basis sets and aliases.
@@ -34,8 +41,11 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 # Momentum transfer grid parameters.
 Q_MAX=25.0                 # Maximum momentum transfer in keV.
 N_Q=251                    # Number of |q| grid points.
-N_THETA=251                # Number of theta (polar angle) grid points.
-N_PHI=251                  # Number of phi (azimuthal angle) grid points.
+# Angular grid. Leave these at 0 to size them from L_MAX, which is what the projection onto
+# spherical harmonics actually needs: |f|^2 is quadratic in the form factor so it carries content up
+# to 2*L_MAX, giving 4*L_MAX+1 points. Setting them larger costs time and buys nothing.
+N_THETA=0                  # Number of theta (polar angle) grid points, or 0 to size from L_MAX.
+N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 to size from L_MAX.
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
@@ -283,9 +293,9 @@ else
 
     # Add the input to the command.
     if [ "$CRYSTAL_MODE" = true ] && [ -n "$CIF_DIR" ]; then
-        JULIA_CMD="$JULIA_CMD --cif-dir \"$CIF_DIR\" --crystal-mode"
+        JULIA_CMD="$JULIA_CMD --cif-dir \"$CIF_DIR\" --crystal-mode --crystal-order $CRYSTAL_ORDER"
     elif [ "$CRYSTAL_MODE" = true ]; then
-        JULIA_CMD="$JULIA_CMD --cif-file \"$CIF_FILE\" --crystal-mode"
+        JULIA_CMD="$JULIA_CMD --cif-file \"$CIF_FILE\" --crystal-mode --crystal-order $CRYSTAL_ORDER"
     elif [ -n "$CSV_FILE" ]; then
         JULIA_CMD="$JULIA_CMD --csv-file \"$CSV_FILE\""
     else
@@ -306,6 +316,9 @@ else
         JULIA_CMD="$JULIA_CMD --N-theta $N_THETA"
         JULIA_CMD="$JULIA_CMD --N-phi $N_PHI"
         JULIA_CMD="$JULIA_CMD --l-max $L_MAX"
+        if [ "$CRYSTAL_MODE" = true ] && [ "$CRYSTAL_ORDER" = "coherent" ]; then
+            JULIA_CMD="$JULIA_CMD --band-map-plane $BAND_MAP_PLANE"
+        fi
         JULIA_CMD="$JULIA_CMD --threshold $THRESHOLD"
         COMPUTE_MODE_ARG=$(IFS=','; echo "${COMPUTE_MODES[*]}")
         JULIA_CMD="$JULIA_CMD --compute-mode \"$COMPUTE_MODE_ARG\""
@@ -547,6 +560,13 @@ else
             fi
 
             if [ "$CRYSTAL_MODE" = true ]; then
+                # Coherent crystal outputs get the grouped slices under group_n/ plus the band
+                # energies over the first Brillouin zone, in one pass.
+                if [ -d "$MOL_DIR/crystal/coherent" ]; then
+                    $PYTHON_BIN plot_slices.py --run-name "$RUN_NAME" --molecule-number "$MOL_NUM" \
+                        --method spherical --results-dir crystal --coherent --group-states \
+                        || echo "  Coherent crystal plotting failed."
+                fi
                 run_slice_plots "$MOL_NUM" "crystal" true
                 for conformer_dir in "$MOL_DIR"/conformers/*; do
                     [ -d "$conformer_dir" ] || continue

@@ -14,8 +14,95 @@ using Quaternionic
 using StaticArrays
 using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
 using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_crystal_lattice,
-                                  rotate_R_tensors, compute_coherent_crystal_f_lm, project_f_lm
+                                  rotate_R_tensors, compute_coherent_crystal_f_lm, project_f_lm,
+                                  enumerate_neighbour_cells, compute_couplings, default_angular_grid,
+                                  choose_ewald_parameters, build_ewald_long_range, subtract_self_term!,
+                                  image_translation_span, supercell_radius,
+                                  derive_symmetry_operations, build_stars,
+                                  star_reduction_factor, choose_compatible_phi_count
+using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
 using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
+using SCarFFF.SphericalFormFactor.BlochHamiltonian: BlochEigensystem, solve_bloch_hamiltonian!
+using SCarFFF.ThreadChunks: chunk_count, chunk_range
+using Base.Threads
+using LinearAlgebra: norm, dot
+
+
+function sample_band_plane(
+        basis, lattice, couplings, long_range, plane::String, n_points::Int, ::Type{T},
+    ) where {T<:AbstractFloat}
+    """
+    Sample the Frenkel exciton band energies E_Ψ(k) over a Cartesian plane of the first Brillouin
+    zone, so the axes line up with the form factor slices.
+
+    # Arguments:
+    - basis: The localised excitation basis.
+    - lattice: The crystal lattice.
+    - couplings: The real-space couplings, or nothing.
+    - long_range: The Ewald long-range data, or nothing.
+    - plane::String: The Cartesian plane to sample: xy, xz or yz.
+    - n_points::Int: Samples along each axis.
+    - T::Type: The floating point type.
+
+    # Returns:
+    - Tuple: The two axes in keV, and the energies with dimensions (n_states, n_points, n_points),
+      NaN outside the zone.
+    """
+
+    # Get the reciprocal lattice vectors and cell volume.
+    b1 = SVector{3, T}(lattice.reciprocal[1, :])
+    b2 = SVector{3, T}(lattice.reciprocal[2, :])
+    b3 = SVector{3, T}(lattice.reciprocal[3, :])
+    a_rows = (SVector{3, T}(lattice.direct[1, :]), SVector{3, T}(lattice.direct[2, :]),
+              SVector{3, T}(lattice.direct[3, :]))
+
+    # The zone corners are the eight (±b1 ±b2 ±b3)/2, so their extreme Cartesian components bound it.
+    half_widths = zeros(T, 3)
+    for s1 in (-1, 1), s2 in (-1, 1), s3 in (-1, 1)
+        corner = (s1 * b1 + s2 * b2 + s3 * b3) / 2
+        half_widths .= max.(half_widths, abs.(corner))
+    end
+
+    first_axis, second_axis = plane == "xy" ? (1, 2) : plane == "xz" ? (1, 3) : (2, 3)
+    axis_a_invA = collect(range(-half_widths[first_axis], half_widths[first_axis], length = n_points))
+    axis_b_invA = collect(range(-half_widths[second_axis], half_widths[second_axis], length = n_points))
+
+    n_states = length(basis.energies)
+    energies = fill(T(NaN), n_states, n_points, n_points)
+    n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
+
+    # Rebuild the Hamiltonian and diagonalise for the energies at each k. 
+    n_chunks = chunk_count(n_points, nthreads())
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells)
+            for i in chunk_range(chunk, n_chunks, n_points)
+                for j in 1:n_points
+                    components = zeros(T, 3)
+                    components[first_axis] = axis_a_invA[i]
+                    components[second_axis] = axis_b_invA[j]
+                    k_vector = SVector{3, T}(components)
+
+                    # Inside the zone means every fractional coordinate within [-1/2, 1/2].
+                    inside = all(abs(dot(a_rows[axis], k_vector) / (2 * T(π))) <= T(0.5) + eps(T)
+                                 for axis in 1:3)
+                    inside || continue
+
+                    solve_bloch_hamiltonian!(eigensystem, basis, k_vector, couplings, long_range)
+                    @inbounds for state in 1:n_states
+                        energies[state, i, j] = eigensystem.energies[state]
+                    end
+                end
+            end
+        end
+    end
+
+    axis_a = axis_a_invA ./ T(KEV_TO_INV_ANGSTROM)
+    axis_b = axis_b_invA ./ T(KEV_TO_INV_ANGSTROM)
+
+    return (axis_a, axis_b), energies
+end
+
 
 function parse_commandline()::Dict{String, Any}
     """
@@ -51,6 +138,41 @@ function parse_commandline()::Dict{String, Any}
         "--crystal-order"
             help = "How to combine monomer form factors into the crystal form factor. 'coherent' solves the Frenkel exciton Bloch problem and mixes the molecular amplitudes with the resulting coefficients. 'incoherent' is the zeroth-order approximation that adds |f|^2 over the rotated images. Options: 'coherent' or 'incoherent'."
             default = "incoherent"
+        "--coupling-method"
+            help = "How to sum the intermolecular couplings over the lattice (coherent crystal mode). 'ewald' splits the Coulomb kernel into a short-range real-space sum and a long-range reciprocal-space one, both of which converge exponentially, so the error is set by --ewald-epsilon. 'direct' sums the bare 1/r kernel out to --coupling-cutoff, which is only conditionally convergent and is kept as a cross-check. Options: 'ewald' or 'direct'."
+            default = "ewald"
+        "--ewald-epsilon"
+            help = "Requested truncation error for the Ewald sums. Both the real- and reciprocal-space cutoffs are pinned to it, so this is the single accuracy knob."
+            arg_type = Float64
+            default = 1.0e-3
+        "--ewald-eta"
+            help = "Fixed Ewald splitting parameter in inverse Angstroms, or 0 to derive the one that minimises the total work. The answer must not depend on it, so setting it by hand is how that gets tested."
+            arg_type = Float64
+            default = 0.0
+        "--ewald-cost-ratio"
+            help = "The cost of one reciprocal lattice vector relative to one real-space cell, which sets where the derived Ewald cutoffs balance. Only the ratio matters."
+            arg_type = Float64
+            default = 1.0
+        "--no-dipole-term"
+            help = "Drop the Q = 0 term of the Ewald reciprocal sum instead of replacing it with the angular-averaged transition dipole product, which is the conducting boundary condition."
+            action = :store_true
+        "--coupling-cutoff"
+            help = "Real-space cutoff in Angstroms for the intermolecular coupling sum, used only by --coupling-method direct. Under Ewald the cutoff is derived from --ewald-epsilon instead. A cutoff of 0 still couples the molecules within the unit cell, since those sit at zero lattice vector; it just excludes neighbouring cells. Use --no-couplings to switch the correction off entirely."
+            arg_type = Float64
+            default = 40.0
+        "--band-map-plane"
+            help = "Sample the band energies E_Psi(k) over a Cartesian plane of the first " *
+                   "Brillouin zone and save them alongside the coherent output, for plotting. The " *
+                   "planes are the same as the form factor slices: xy is k_z = 0, xz is k_y = 0, " *
+                   "yz is k_x = 0. Use 'none' to skip it."
+            default = "none"
+        "--band-map-points"
+            help = "Samples along each axis of the band map plane."
+            arg_type = Int
+            default = 401
+        "--no-couplings"
+            help = "Switch the intermolecular couplings off entirely (coherent crystal mode), leaving the bands flat and recovering the zeroth-order limit."
+            action = :store_true
         "--method"
             help = "Computation method for the form factor. Options: 'spherical', 'fft', or 'cartesian'."
             default = "spherical"
@@ -63,13 +185,13 @@ function parse_commandline()::Dict{String, Any}
             arg_type = Int
             default = 101
         "--N-theta"
-            help = "Number of theta grid points (spherical method)."
+            help = "Number of theta grid points (spherical method). Leave at 0 to size it from l-max, which is what the projection onto spherical harmonics actually needs."
             arg_type = Int
-            default = 101
+            default = 0
         "--N-phi"
-            help = "Number of phi grid points (spherical method)."
+            help = "Number of phi grid points (spherical method). Leave at 0 to size it from l-max. Prefer an odd value: phi + pi only lands on the grid when this is odd, and the crystal symmetry reduction loses roughly half its operations, time reversal included, when it does not."
             arg_type = Int
-            default = 101
+            default = 0
         "--l-max"
             help = "Maximum angular momentum quantum number (spherical method)."
             arg_type = Int
@@ -154,20 +276,33 @@ function parse_transition_indices(indices_str::String, td_h5_path::String)::Vect
     """
 
     if lowercase(strip(indices_str)) == "all"
-        # Read the TD-DFT file to get the total number of transitions.
-        n_transitions = h5open(td_h5_path, "r") do io
-            if haskey(io, "transition_matrices")
-                length(read(io, "transition_matrices"))
-            elseif haskey(io, "energies_ev")
-                length(read(io, "energies_ev"))
-            else
-                count = 0
-                while haskey(io, "d_ij_state_$(count + 1)")
-                    count += 1
-                end
-                count
+        # Count the number of transitions in the TD-DFT HDF5 file.
+        n_transitions, source = h5open(td_h5_path, "r") do io
+            count = 0
+            while haskey(io, "X_state_$(count + 1)") && haskey(io, "Y_state_$(count + 1)")
+                count += 1
             end
+            count > 0 && return count, "X and Y amplitudes"
+
+            if haskey(io, "transition_matrices")
+                return length(read(io, "transition_matrices")), "transition_matrices"
+            end
+
+            while haskey(io, "d_ij_state_$(count + 1)")
+                count += 1
+            end
+            count > 0 && return count, "d_ij matrices"
+
+            haskey(io, "energies_ev") && return length(read(io, "energies_ev")), "energies_ev"
+            return 0, "nothing"
         end
+
+        n_transitions > 0 || error(
+            "Found no transitions in $(td_h5_path). Expected X_state_1 and Y_state_1, or one of the " *
+            "older transition_matrices or d_ij_state_1 layouts."
+        )
+        println("Resolved --transition-indices all to $(n_transitions) transitions, counted from the $(source).")
+
         return collect(1:n_transitions)
     else
         # Parse the comma-separated list.
@@ -326,6 +461,23 @@ function main()
     crystal_order = lowercase(args["crystal-order"])
     crystal_order in ("coherent", "incoherent") ||
         error("Invalid crystal order '$(args["crystal-order"])'. The supported options are 'coherent' and 'incoherent'.")
+    coupling_method = lowercase(args["coupling-method"])
+    coupling_method in ("ewald", "direct") ||
+        error("Invalid coupling method '$(args["coupling-method"])'. The supported options are 'ewald' and 'direct'.")
+    coupling_cutoff = args["coupling-cutoff"]
+    coupling_cutoff >= 0 || error("The coupling cutoff must not be negative, got $(coupling_cutoff).")
+    ewald_epsilon = args["ewald-epsilon"]
+    0 < ewald_epsilon < 1 || error("The Ewald truncation error must lie in (0, 1), got $(ewald_epsilon).")
+    ewald_eta = args["ewald-eta"]
+    ewald_eta >= 0 || error("The Ewald splitting parameter must not be negative, got $(ewald_eta).")
+    ewald_cost_ratio = args["ewald-cost-ratio"]
+    ewald_cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(ewald_cost_ratio).")
+    no_dipole_term = args["no-dipole-term"]
+    band_map_plane = lowercase(args["band-map-plane"])
+    band_map_points = args["band-map-points"]
+    band_map_plane in ("none", "xy", "xz", "yz") ||
+        error("--band-map-plane must be none, xy, xz or yz, got '$(band_map_plane)'.")
+    no_couplings = args["no-couplings"]
     transition_indices_str = args["transition-indices"]
     force_recomp = args["force-recomputation"]
     run_benchmark = args["benchmark"]
@@ -470,6 +622,11 @@ function main()
             N_theta = args["N-theta"]
             N_phi = args["N-phi"]
             l_max = args["l-max"]
+
+            # Size the angular grid from l_max unless it was set explicitly.
+            default_theta, default_phi = default_angular_grid(l_max)
+            N_theta = N_theta > 0 ? N_theta : default_theta
+            N_phi = N_phi > 0 ? N_phi : default_phi
             threshold_val = T(args["threshold"])
             # Parse the compute-mode as a comma-separated list of outputs to compute/save.
             valid_spherical_modes = Set(["form_factor", "R_tensor", "f_lm_tensor"])
@@ -490,6 +647,23 @@ function main()
                 # The coherent path rotates each conformer's R tensor into every image's orientation,
                 # so the R tensor has to be kept even if it was not asked for as an output.
                 need_R = true
+            end
+
+            # Widen the grid by a few points if necessary to maximise the symmetry reduction.
+            if crystal_mode && crystal_order == "coherent"
+                grid_metadata = JSON.parsefile(joinpath(mol_output_dir, "crystal_metadata.json"))
+                grid_images, _, _ = build_dominant_group_images(
+                    grid_metadata, String.(grid_metadata["conformer_labels"]), T)
+                grid_lattice = build_crystal_lattice(
+                    reduce(vcat, [reshape(T.(row), 1, 3) for row in grid_metadata["lattice"]]), T)
+                widened_N_phi = choose_compatible_phi_count(
+                    N_theta, N_phi, derive_symmetry_operations(grid_images, grid_lattice))
+                if widened_N_phi != N_phi
+                    println("Widening N_phi from $(N_phi) to $(widened_N_phi) so the crystal symmetry " *
+                            "operations land on grid nodes, which buys back diagonalisations for " *
+                            "$(round(100 * (widened_N_phi / N_phi - 1), digits = 1))% more grid points.")
+                    N_phi = widened_N_phi
+                end
             end
 
             # Define the momentum grid.
@@ -671,27 +845,141 @@ function main()
                     conformer_energy_lists = [T.(conformer_results[label].transition_energies_eV) for label in conformer_labels]
                     basis = build_excitation_basis(images, conformer_energy_lists)
 
-                    # Rotate each conformer's coefficients into every image's orientation using D matrices. 
+                    # Rotate each conformer's coefficients into every image's orientation using D matrices.
                     # This keeps all images on the same unrotated q grid.
-                    rotated_R = rotate_R_tensors(conformer_R_tensors, images, basis, l_max)
+                    stage_times = Pair{String, Float64}[]
+                    rotate_timing = @timed rotate_R_tensors(conformer_R_tensors, images, basis, l_max)
+                    rotated_R = rotate_timing.value
+                    push!(stage_times, "rotate R tensors" => rotate_timing.time)
 
                     # The Brillouin zone folding works in inverse Angstroms, matching the lattice.
                     q_grid_invA = T(KEV_TO_INV_ANGSTROM) .* q_grid
 
+                    # Build the intermolecular couplings, unless they have been switched off.
+                    crystal_couplings = nothing
+                    ewald_parameters = nothing
+                    crystal_long_range = nothing
+                    cells = nothing
+                    if no_couplings
+                        println("Intermolecular couplings are switched off, so the bands will be flat.")
+                    else
+                        if coupling_method == "ewald"
+                            ewald_parameters = choose_ewald_parameters(
+                                lattice, ewald_epsilon; eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                            # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
+                            real_cutoff = ewald_parameters.R_max + image_translation_span(basis)
+                        else
+                            real_cutoff = T(coupling_cutoff)
+                        end
+
+                        cells = enumerate_neighbour_cells(lattice, real_cutoff)
+
+                        # Precompute the Gaunt coefficients for the coupling.
+                        coupling_gaunt_path = joinpath(@__DIR__, "..", "src", "data", "gaunt_coefficients",
+                                                       "gaunt_coefficients_coupling_lmax$(l_max)$(type_suffix).h5")
+                        if force_recomp || !isfile(coupling_gaunt_path)
+                            precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, coupling_gaunt_path, T)
+                        end
+
+                        if ewald_parameters === nothing
+                            println("Computing intermolecular couplings directly out to $(coupling_cutoff) Å ($(length(cells.vectors)) cells).")
+                            coupling_timing = @timed compute_couplings(
+                                rotated_R, basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
+                            crystal_couplings = coupling_timing.value
+                            push!(stage_times, "couplings J(ΔR)" => coupling_timing.time)
+                        else
+                            tau_of_lambda = [basis.images[basis.image_of[lambda]].translation
+                                             for lambda in 1:length(basis.energies)]
+                            long_range_timing = @timed build_ewald_long_range(
+                                rotated_R, tau_of_lambda, basis.image_of, lattice, q_grid_invA, l_max,
+                                ewald_parameters; include_dipole_term = !no_dipole_term)
+                            crystal_long_range = long_range_timing.value
+                            push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
+
+                            # Print a summary of the Ewald parameters.
+                            expected_Q = lattice.volume * ewald_parameters.Q_max^3 / (6 * π^2)
+                            supercell = supercell_radius(lattice)
+                            widened = ewald_parameters.R_max <= supercell * (1 + 1e-12) ?
+                                " (widened to the 3x3x3 supercell)" : ""
+                            println("Ewald split at ε = $(ewald_parameters.epsilon): " *
+                                    "η = $(round(ewald_parameters.eta, digits = 4)) Å^-1, " *
+                                    "R_max = $(round(ewald_parameters.R_max, digits = 2)) Å$(widened) " *
+                                    "($(length(cells.vectors)) cells searched, padded by the cell span), " *
+                                    "Q_max = $(round(ewald_parameters.Q_max, digits = 4)) Å^-1 " *
+                                    "(N_Q ≈ $(round(Int, expected_Q)), $(length(crystal_long_range.G_vectors)) candidates), " *
+                                    "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
+                            no_dipole_term && println("The Q = 0 term is dropped, so this is the conducting boundary condition.")
+
+                            coupling_timing = @timed compute_couplings(
+                                rotated_R, basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
+                                parameters = ewald_parameters)
+                            crystal_couplings = coupling_timing.value
+                            push!(stage_times, "couplings J(ΔR)" => coupling_timing.time)
+                            subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
+                        end
+                    end
+
+                    # Print a summary of the timing, and symmetry statistics.
+                    symmetry_timing = @timed begin
+                        operations = derive_symmetry_operations(basis.images, lattice)
+                        build_stars(theta_grid, phi_grid, operations)
+                    end
+                    stars = symmetry_timing.value
+                    push!(stage_times, "symmetry stars" => symmetry_timing.time)
+                    println("Symmetry: $(length(stars.operations)) usable operations, " *
+                            "$(length(stars.irreducible_directions)) stars over " *
+                            "$(length(theta_grid) * length(phi_grid)) directions, " *
+                            "$(round(star_reduction_factor(stars, length(theta_grid), length(phi_grid)), digits = 2))x " *
+                            "fewer diagonalisations.")
+
+                    # Print a warning about even ϕ grids losing symmetry speedup.
+                    iseven(length(phi_grid)) && println(
+                        "  Note: N_phi = $(length(phi_grid)) is even, so ϕ -> ϕ + π falls between grid " *
+                        "points and roughly half the symmetry operations are unusable. An odd N_phi " *
+                        "(the default is 4 * l_max + 1) would recover them at no cost in accuracy.")
+
                     # This streams over q internally, projecting each block onto real spherical
                     # harmonics as it goes, so the full |f|^2 grid is never held in memory. Overwritten
                     # need grid is specfied.
-                    crystal_state_f_lm, crystal_band_summary, crystal_f_s = compute_coherent_crystal_f_lm(
-                        rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max;
-                        need_grid = need_grid)
+                    coherent_timing = @timed compute_coherent_crystal_f_lm(
+                        rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max,
+                        stars;
+                        need_grid = need_grid, couplings = crystal_couplings,
+                        long_range = crystal_long_range)
+                    crystal_state_f_lm, crystal_band_summary, crystal_f_s = coherent_timing.value
+                    push!(stage_times, "coherent f_lm (H(k), diagonalise, project)" => coherent_timing.time)
+
+                    # Optionally sample E_Ψ(k) over a plane of the first Brillouin zone, for plotting.
+                    # Everything it needs is already built, so this is just the sweep, and it inherits
+                    # the run's own q grid, ε and l_max rather than being told them a second time.
+                    if band_map_plane != "none"
+                        band_timing = @timed sample_band_plane(
+                            basis, lattice, crystal_couplings, crystal_long_range,
+                            band_map_plane, band_map_points, T)
+                        band_axes, band_energies = band_timing.value
+                        push!(stage_times, "band map ($(band_map_plane) plane)" => band_timing.time)
+                    end
+
+                    crystal_total = sum(last, stage_times)
+                    println("\nCrystal stage timings ($(round(crystal_total, digits = 1)) s total):")
+                    for (name, seconds) in stage_times
+                        println("  $(rpad(name, 42)) $(lpad(round(seconds, digits = 1), 7)) s  " *
+                                "$(lpad(round(Int, 100 * seconds / crystal_total), 3))%")
+                    end
+                    println()
 
                     coherent_results = (
                         basis = basis,
+                        lattice = lattice,
                         dominant_group = dominant_group,
                         dominant_occupancy = dominant_occupancy,
                         band_summary = crystal_band_summary,
                         state_f_lm = crystal_state_f_lm,
                         f_s = crystal_f_s,
+                        couplings = crystal_couplings,
+                        cells = cells,
+                        ewald_parameters = ewald_parameters,
+                        long_range = crystal_long_range,
                     )
                 end
 
@@ -746,9 +1034,6 @@ function main()
                     coherent_output_dir = joinpath(mol_output_dir, "crystal", "coherent")
                     mkpath(coherent_output_dir)
 
-                    # The lattice, translations and per-molecule labels are not duplicated here: they
-                    # are already in crystal_metadata.json, and the per-molecule labels index λ while
-                    # the results below index Ψ, with no C stored to bridge them.
                     coherent_basis = coherent_results.basis
 
                     coherent_path = joinpath(coherent_output_dir, "crystal_f_lm$(type_suffix).h5")
@@ -767,8 +1052,55 @@ function main()
                         write(io, "band_energy_mean_eV", coherent_results.band_summary[:, 3])
 
                         # Unperturbed monomer energies, to compare against the bands above. Indexed by
-                        # λ, so compare as sets rather than element by element.
+                        # λ, so compare as sets rather than element by element. These are the diag(E)
+                        # of H(k) below.
                         write(io, "localised_energies_eV", coherent_basis.energies)
+
+                        # Save the lattice vectors and image translations.
+                        write(io, "lattice_A", Matrix{T}(coherent_results.lattice.direct))
+                        write(io, "image_translations_A",
+                              reduce(hcat, [image.translation for image in coherent_basis.images]))
+                        write(io, "image_of", coherent_basis.image_of)
+
+                        # Save everything needed to rebuild H(k), and hence E_Ψ(k) and C(k), at any k
+                        # later:
+                        #
+                        #     H(k) = diag(E) + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
+                        if coherent_results.couplings !== nothing
+                            couplings_group = create_group(io, "couplings")
+                            write(couplings_group, "method", coupling_method)
+                            write(couplings_group, "cell_vectors", reduce(hcat, coherent_results.cells.vectors))
+                            # The real-space sum over ΔR. Under "ewald" this is the short-range half
+                            # alone, with the long-range self interaction already subtracted at ΔR = 0.
+                            # Under "direct" it is the whole coupling, and there is no long_range group.
+                            write(couplings_group, "J_real_space_eV", coherent_results.couplings.values)
+
+                            if coherent_results.long_range !== nothing
+                                long_range = coherent_results.long_range
+                                # The reciprocal-space half, 𝒥^LR(k). It depends on k, so what is saved
+                                # is the ingredients that rebuild it rather than a table over ΔR.
+                                long_range_group = create_group(couplings_group, "long_range")
+                                write(long_range_group, "eta", coherent_results.ewald_parameters.eta)
+                                write(long_range_group, "epsilon", coherent_results.ewald_parameters.epsilon)
+                                write(long_range_group, "R_max", coherent_results.ewald_parameters.R_max)
+                                write(long_range_group, "Q_max", coherent_results.ewald_parameters.Q_max)
+                                write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors))
+                                write(long_range_group, "f_table", long_range.f_table)
+                                write(long_range_group, "q_step", long_range.q_step)
+                                write(long_range_group, "l_max_lr", long_range.l_max_lr)
+                                write(long_range_group, "dipole_slopes", long_range.dipole_slopes)
+                                write(long_range_group, "include_dipole_term", long_range.include_dipole_term)
+                            end
+                        end
+
+                        # The band energies over a plane of the first Brillouin zone, if asked for.
+                        if band_map_plane != "none"
+                            band_group = create_group(io, "band_map")
+                            write(band_group, "energies_eV", band_energies)
+                            write(band_group, "axis_a_keV", band_axes[1])
+                            write(band_group, "axis_b_keV", band_axes[2])
+                            write(band_group, "plane", band_map_plane)
+                        end
 
                         # What went in.
                         write(io, "transition_indices", collect(transition_indices))
