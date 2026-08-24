@@ -10,7 +10,27 @@ using LinearAlgebra: mul!
 using ..ConstructFLMTensor: U
 using ...ThreadChunks: chunk_count, chunk_range
 
-export project_f_lm, build_projection_matrices, build_U_blocks, project_block!
+export project_f_lm, build_projection_matrices, build_U_blocks, project_block!, default_angular_grid
+
+function default_angular_grid(l_max::Int)::Tuple{Int, Int}
+    """
+    Choose the θ and ϕ grid sizes needed to resolve the form factor at a given l_max.
+
+    The quantity we project is |f|², which is quadratic in the form factor, so its angular content
+    runs to 2 * l_max rather than l_max. Nyquist for that is 2 * (2 * l_max) + 1 = 4 * l_max + 1
+    samples over a full period.
+
+    # Arguments:
+    - l_max::Int: The maximum angular momentum mode of the form factor.
+
+    # Returns:
+    - n_theta::Int: The number of θ grid points.
+    - n_phi::Int: The number of ϕ grid points.
+    """
+    l_max >= 0 || error("l_max must not be negative, got $(l_max).")
+    points = 4 * l_max + 1
+    return points, points
+end
 
 function quadrature_weights(grid::Vector{T}, periodic::Bool)::Vector{T} where {T<:AbstractFloat}
     """

@@ -736,7 +736,9 @@ def run_td_dft_analysis_from_coordinates(
     # Prepare data for saving to file.
     geometry = [[atom[0], atom[1][0], atom[1][1], atom[1][2]] for atom in mol._atom]
     ao_labels = [str(label) for label in mol.ao_labels()]
-    energies = [float(energy * 27.211396) for energy in td.e]  # Convert Hartree to eV.
+    # Truncated to ntrans, to match f_osc and the X and Y amplitudes below. This ensures
+    # that there are no errors when requesting more states computed than saved.
+    energies = [float(energy * 27.211396) for energy in td.e[:ntrans]]  # Convert Hartree to eV.
 
     # Extract oscillator strengths.
     oscillator_strengths = np.array(

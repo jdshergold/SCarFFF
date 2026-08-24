@@ -23,7 +23,7 @@ end
     """
     Return the contiguous slice of 1:n belonging to the given chunk, splitting the range as
     evenly as possible. This matches the partitioning that @threads would use, so the memory
-    access pattern is unchanged, but it lets each task own its scratch buffers rather than
+    access pattern is unchanged, but it lets each task own its buffers rather than
     indexing a shared pool by threadid(). This helps avoid accidental data races, which can
     occur with the more naive pattern.
 

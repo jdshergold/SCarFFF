@@ -4,10 +4,26 @@ module BlochHamiltonian
 
 using StaticArrays
 using Quaternionic
-using LinearAlgebra: Hermitian, eigen!
+using LinearAlgebra
+using LinearAlgebra: dot, mul!
+using FastLapackInterface: HermitianEigenWs
 
-export CrystalImage, CrystalExcitationBasis, build_excitation_basis,
+using ..Ewald: EwaldLongRangeData, EwaldLongRangeBuffers, add_long_range!
+
+export CrystalImage, CrystalExcitationBasis, build_excitation_basis, CrystalCouplings,
        build_bloch_hamiltonian!, solve_bloch_hamiltonian!, BlochEigensystem
+
+struct CrystalCouplings{T<:AbstractFloat}
+    """
+    The intermolecular couplings J_{λλ'}(ΔR), and the lattice vectors they are indexed by.
+
+    # Fields:
+    - values::Array{Complex{T}, 3}: The couplings in eV, with dimensions (n_cells, n_lambda, n_lambda).
+    - cell_vectors::Vector{SVector{3, T}}: The lattice vector ΔR for each cell, in Å.
+    """
+    values::Array{Complex{T}, 3}
+    cell_vectors::Vector{SVector{3, T}}
+end
 
 struct CrystalImage{T<:AbstractFloat}
     """
@@ -105,7 +121,7 @@ function build_excitation_basis(
     return CrystalExcitationBasis{T}(image_of, transition_of, energies, images, n_transitions)
 end
 
-struct BlochEigensystem{T<:AbstractFloat}
+struct BlochEigensystem{T<:AbstractFloat, W, E}
     """
     The Bloch Hamiltonian at one k, together with its eigenvalues and eigenvectors.
 
@@ -116,18 +132,38 @@ struct BlochEigensystem{T<:AbstractFloat}
     - H::Matrix{Complex{T}}: The Bloch Hamiltonian at the current k.
     - coefficients::Matrix{Complex{T}}: The eigenvectors C, with column Ψ holding C_λ(Ψ).
     - energies::Vector{T}: The eigenvalues E_Ψ(k), in eV.
+    - eigen_buffers::W: LAPACK buffers for the Hermitian eigensolve.
+    - ewald_buffers::E: Buffers for the Ewald long-range sum, or nothing.
+    - cell_phases::Vector{Complex{T}}: exp(i k . ΔR) for each neighbour cell at the current k.
     """
     H::Matrix{Complex{T}}
     coefficients::Matrix{Complex{T}}
     energies::Vector{T}
+    eigen_buffers::W
+    ewald_buffers::E
+    cell_phases::Vector{Complex{T}}
 end
 
-function BlochEigensystem(basis::CrystalExcitationBasis{T}) where {T<:AbstractFloat}
+function BlochEigensystem(
+        basis::CrystalExcitationBasis{T},
+        long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing;
+        n_cells::Int = 0,
+    ) where {T<:AbstractFloat}
+    # Get the number of states.
     n_lambda = length(basis.energies)
-    return BlochEigensystem{T}(
-        Matrix{Complex{T}}(undef, n_lambda, n_lambda),
+
+    # Allocate memory for the Hamiltonian.
+    H = Matrix{Complex{T}}(undef, n_lambda, n_lambda)
+
+    # If there are long-range terms, allocate buffers for them.
+    ewald_buffers = long_range === nothing ? nothing : EwaldLongRangeBuffers(long_range)
+    return BlochEigensystem{T, HermitianEigenWs{Complex{T}, Matrix{Complex{T}}, T}, typeof(ewald_buffers)}(
+        H,
         Matrix{Complex{T}}(undef, n_lambda, n_lambda),
         Vector{T}(undef, n_lambda),
+        HermitianEigenWs(H; vecs = true),
+        ewald_buffers,
+        Vector{Complex{T}}(undef, n_cells),
     )
 end
 
@@ -135,29 +171,32 @@ end
         eigensystem::BlochEigensystem{T},
         basis::CrystalExcitationBasis{T},
         k::SVector{3, T},
+        couplings::Union{Nothing, CrystalCouplings{T}} = nothing,
+        long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Assemble the Bloch Hamiltonian
 
-        H_{A_i s, B_j t}(k) = (E_{A,s} + D_{A_i,s}) δ_{AB} δ_{ij} δ_{st} + Σ_{ΔR} J_{A_i s, B_j t}(ΔR) e^{i k . ΔR}.
+        H_{A_i s, B_j t}(k) = (E_{A,s} + D_{A_i,s}) δ_{AB} δ_{ij} δ_{st}
+                              + Σ_{ΔR} J_{A_i s, B_j t}(ΔR) e^{i k . ΔR} + 𝒥^LR_{A_i s, B_j t}(k).
 
-    Phase 2a of the crystal upgrade sets the intermolecular couplings to zero, so D = 0 and J = 0
-    and H is simply the diagonal matrix of monomer excitation energies, independent of k. The full
-    matrix and the general eigensolve are still built and used, so that turning the couplings on in
-    phase 2b is a matter of filling in the two terms marked below and nothing else.
-
-    Note that H is periodic under k -> k + G for any reciprocal lattice vector G, since G . ΔR ∈ 2πZ
-    for any lattice vector ΔR. Any Brillouin zone representative therefore gives the same result.
+    Passing no couplings leaves H diagonal and k-independent, which is the zeroth-order (incoherent) limit in
+    which the crystal excitations are just the localised molecular ones. The couplings are split into the
+    short- (J) and long-range (𝒥) parts using Ewald summation.
 
     # Arguments:
     - eigensystem::BlochEigensystem{T}: The eigensystem, whose H field is overwritten.
     - basis::CrystalExcitationBasis{T}: The localised excitation basis.
     - k::SVector{3, T}: The Brillouin zone wavevector, in Å^{-1}.
+    - couplings::Union{Nothing, CrystalCouplings{T}}: The "short-range" J_{λλ'}(ΔR), or nothing for no coupling.
+    - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing when
+      the couplings are the full unsplit lattice sum.
 
     # Returns:
-    - Nothing. eigensystem.H is modified in place.
+    - Nothing. eigensystem.H is overwritten with the full Hermitian matrix.
     """
 
+    # Zero the Hamiltonian.
     H = eigensystem.H
     fill!(H, zero(Complex{T}))
 
@@ -169,9 +208,41 @@ end
     end
 
     # Off-diagonal: the lattice-summed excitation transfer.
-    # TODO: add Σ_{ΔR} J_{A_i s, B_j t}(ΔR) exp(i k . ΔR), with J the Coulomb coupling
-    # between transition densities and the sum truncated at a real-space neighbour cutoff.
-    # J_{A_i s, A_i s}(0) is excluded, as that contribution already sits in the diagonal energy.
+    # Only the upper triangle is accumulated below, which halves the work 
+    # The lower triangle is then mirrored at the end to make H readable and avoid errors.
+    # This also ensures exact Hermiticity.
+    if couplings !== nothing
+        n_lambda = length(basis.energies)
+        n_cells = length(couplings.cell_vectors)
+        phases = eigensystem.cell_phases
+        # Sized on first use if the caller did not say how many cells there would be, so that
+        # constructing the eigensystem without that hint still works rather than failing here.
+        length(phases) == n_cells || resize!(phases, n_cells)
+        @inbounds for cell_idx in 1:n_cells
+            phases[cell_idx] = cis(dot(k, couplings.cell_vectors[cell_idx]))
+        end
+
+        # Σ_ΔR J(ΔR) exp(i k . ΔR).
+        values = couplings.values
+        @inbounds for lambda_prime in 1:n_lambda, lambda in 1:lambda_prime
+            total = zero(Complex{T})
+            @simd for cell_idx in 1:n_cells
+                total += values[cell_idx, lambda, lambda_prime] * phases[cell_idx]
+            end
+            H[lambda, lambda_prime] += total
+        end
+    end
+
+    # The Ewald long-range half, summed over Q = k + G. Also upper triangle only.
+    if long_range !== nothing
+        add_long_range!(H, long_range, eigensystem.ewald_buffers, k)
+    end
+
+    # Mirror the upper triangle into the lower one.
+    n_lambda = length(basis.energies)
+    @inbounds for lambda_prime in 1:n_lambda, lambda in 1:(lambda_prime - 1)
+        H[lambda_prime, lambda] = conj(H[lambda, lambda_prime])
+    end
 
     return nothing
 end
@@ -180,66 +251,45 @@ end
         eigensystem::BlochEigensystem{T},
         basis::CrystalExcitationBasis{T},
         k::SVector{3, T},
+        couplings::Union{Nothing, CrystalCouplings{T}} = nothing,
+        long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Build and diagonalise the Bloch Hamiltonian at a single k, giving the crystal excitation
     energies E_Ψ(k) and the coefficients C_{A_i,s}^Ψ(k) that coherently mix the localised molecular
     excitations.
 
-    ## The state labelling convention
+    ## The state labelling convention:
 
     Ψ is defined by ascending energy: Ψ = 1 is the lowest crystal excitation at this k, Ψ = 2 the
-    next, and so on. This is nice for the following reasons:
-
-    - It is canonical. The n-th lowest eigenvalue is a property of H alone, so it is reproducible on
-      any machine and at any later time. Rebuilding H from the stored couplings and re-diagonalising
-      recovers exactly the same assignment, which is what makes it safe to store the form factor and
-      the energies separately and pair them up again afterwards.
-    - It is continuous. Eigenvalues depend continuously on the matrix and sorting preserves that, so
-      the sorted branches are continuous in k without any band-tracking machinery.
-
-    That second point is worth unpacking, because the obvious worry is a fair one: if we diagonalise
-    independently at every k, what stops the label Ψ = 3 from meaning one branch at one k and a
-    different branch at the next?
-
-    The answer is that two branches can only touch if three separate conditions hold at once. Take
-    the 2x2 Hermitian block spanned by the two states in question,
-
-        [ a   c  ]
-        [ c*  b  ],
-
-    whose eigenvalues coincide only when a = b, Re(c) = 0 and Im(c) = 0. That is three constraints,
-    and k-space has only three dimensions to satisfy them in, which leaves the solutions as isolated
-    points rather than lines or surfaces. A path through k therefore essentially never lands on one.
-    What it meets instead is an avoided crossing: the two branches approach, exchange which molecules
-    dominate them, and separate again without ever meeting. The composition of a state changes there,
-    but its identity as "the third lowest" does not.
-
-    The exception is a degeneracy imposed by crystal symmetry. Symmetry can force the three
-    conditions to hold along an entire high-symmetry line rather than at isolated points, so the
-    branches genuinely do meet. The labelling stays well defined even then, but the branches meet in
-    a cone, which makes them continuous without being smooth.
+    next, and so on. This gives a canonical labelling of the branches for later reprodcability, if we
+    only have H.
 
     # Arguments:
     - eigensystem::BlochEigensystem{T}: The eigensystem, whose fields are overwritten.
     - basis::CrystalExcitationBasis{T}: The localised excitation basis.
     - k::SVector{3, T}: The Brillouin zone wavevector, in Å^{-1}.
+    - couplings::Union{Nothing, CrystalCouplings{T}}: The "short-range" J_{λλ'}(ΔR) couplings, or nothing for no coupling.
+    - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing.
 
     # Returns:
     - Nothing. eigensystem.energies and eigensystem.coefficients are modified in place, with column
       Ψ of the coefficients holding C_λ(Ψ), and Ψ ordered by ascending energy.
     """
 
-    build_bloch_hamiltonian!(eigensystem, basis, k)
+    build_bloch_hamiltonian!(eigensystem, basis, k, couplings, long_range)
 
-    # eigen! overwrites its argument, which is why H is rebuilt from scratch on every call. For a
-    # Hermitian argument it returns eigenvalues in ascending order, with matching eigenvector
-    # columns, which is exactly the Ψ ordering described above.
-    factorisation = eigen!(Hermitian(eigensystem.H))
+
+    # Use syevr! to diagonalise the Hamiltonian, which overwrites rather than allocates. 
+    #Eigevalues are also returned in ascending order, matching our convention.
+    values, vectors = LinearAlgebra.LAPACK.syevr!(
+        eigensystem.eigen_buffers, 'V', 'A', 'U', eigensystem.H,
+        zero(T), zero(T), 0, 0, -one(T),
+    )
 
     # Store the energies and coefficients.
-    eigensystem.energies .= factorisation.values
-    eigensystem.coefficients .= factorisation.vectors
+    eigensystem.energies .= values
+    eigensystem.coefficients .= vectors
 
     return nothing
 end
