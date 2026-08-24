@@ -5,12 +5,13 @@ module ConstructRTensor
 using HDF5
 using SphericalHarmonics
 using Base.Threads
+using LinearAlgebra: mul!
 
 include("../../utils/BinEncoding.jl")
 
 using .BinEncoding: decode_bins
 using ...SparseTensors
-using ...FastPowers: fast_i_pow
+using ...FastPowers: fast_i_pow, fast_neg1_pow
 using ...SparseTensors: SparseWTensor, SparseGauntArray, lambda_mu_key
 using ...ThreadChunks: chunk_count, chunk_range
 
@@ -54,6 +55,9 @@ const KEV_TO_INV_ANGSTROM = 1.0 / 1.973269804  # Multiplicative factor to conver
 # accounts for the two spin channels, since the transition matrices carry the
 # per-spin-channel X_α and Y_α straight from PySCF.
 const prefactor = 2.0 * 2.0 * (2π)^(5 / 2)
+# Maximum memory used by the real and imaginary blocks of S_{ℓm,ij}(q) together. The full set of
+# Cartesian-term overlap coefficients is generally too large to store, so it is computed in blocks.
+const PAIR_RESPONSE_BYTES = 64 * 1024 * 1024
 
 @inline function fill_spherical_bessel_column!(
         j_L_matrix::Array{T, 2},
@@ -187,6 +191,72 @@ end
     end
 end
 
+function build_pair_density_weights(
+        W_tensor::SparseWTensor{T},
+        density_matrices::Vector{Matrix{T}},
+        cartesian_term_to_orbital::Vector{Int},
+    ) where {T<:AbstractFloat}
+    """
+    Convert the requested AO density-like matrices into weights for the non-empty Cartesian-term
+    pairs stored in the W tensor. The density matrix weights, built from T_ij, appearing in:
+
+        R_{lm}^{(a)}(q) = 2 ∑_{i,j} T_ij^(a) S_{ℓm,ij}(q) = 2 [∑_i T_ii^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_ij^(a) + T_ji^(a)) S_{ℓm,ij}(q)].
+
+    is then returned, as appropriate. This is either T_ii or T_ij + T_ji. The factor of 2 for the
+    two spin channels is applied later, when the R tensor is assembled.
+
+    # Arguments:
+    - W_tensor::SparseWTensor{T}: The sparse W tensor, binned by Cartesian-term pair (i, j).
+    - density_matrices::Vector{Matrix{T}}: The AO density-like matrices used to form the requested
+      R_{ℓm} coefficients.
+    - cartesian_term_to_orbital::Vector{Int}: Mapping from Cartesian-term index to AO index.
+
+    # Returns:
+    - full_bins::Vector{Int}: Indices of the non-empty (i, j) bins in W_tensor.ij_bins.
+    - pair_i::Vector{Int}: First Cartesian-term index for each non-empty pair.
+    - pair_j::Vector{Int}: Second Cartesian-term index for each non-empty pair.
+    - pair_density_weights::Matrix{T}: Density weight for every requested matrix and Cartesian pair,
+      with dimensions (n_densities, n_pairs).
+    """
+
+    # W stores only the upper triangle of the Cartesian-term pair matrix. Convert each AO density
+    # matrix into weights for those pairs without assuming that the AO matrix itself is symmetric.
+    full_bins = Int[]
+    pair_i = Int[]
+    pair_j = Int[]
+
+    # First make a list of the non-empty W bins, since thresholding W may have left empty (i, j) bins.
+    for bin_idx in eachindex(W_tensor.ij_bins)
+        ij_bin = W_tensor.ij_bins[bin_idx]
+        isempty(ij_bin) && continue
+
+        # All entries in this bin share the same Cartesian-term pair.
+        first_idx = ij_bin[1]
+        push!(full_bins, bin_idx)
+        push!(pair_i, W_tensor.i[first_idx])
+        push!(pair_j, W_tensor.j[first_idx])
+    end
+
+    # Precompute the density weights once.
+    pair_density_weights = Matrix{T}(undef, length(density_matrices), length(full_bins))
+    @inbounds for pair_idx in eachindex(full_bins)
+        i = pair_i[pair_idx]
+        j = pair_j[pair_idx]
+        orbital_i = cartesian_term_to_orbital[i]
+        orbital_j = cartesian_term_to_orbital[j]
+
+        for density_idx in eachindex(density_matrices)
+            density = density_matrices[density_idx]
+
+            # If i = j, return the diagonal element, otherwise the sum across the diagonal.
+            pair_density_weights[density_idx, pair_idx] = i == j ?
+                density[orbital_i, orbital_j] :
+                density[orbital_i, orbital_j] + density[orbital_j, orbital_i]
+        end
+    end
+    return full_bins, pair_i, pair_j, pair_density_weights
+end
+
 function construct_R_tensor(
         W_tensor::SparseWTensor{T},
         sigma_ij::Array{T, 2},
@@ -195,66 +265,69 @@ function construct_R_tensor(
         q_grid::Vector{T},
         l_max::Int,
         gaunt_array_path::String,
-        transition_matrices::Vector{Matrix{T}},
-        cartesian_term_to_orbital::Vector{Int};
-        threshold::T = zero(T),
+        density_matrices::Vector{Matrix{T}},
+        cartesian_term_to_orbital::Vector{Int},
     )::Array{Complex{T}, 3} where {T<:AbstractFloat}
     """
-    Construct the R_{ℓm}(q) tensor defined by:
+    Construct the R_{ℓm}(q) tensors for all of the requested density-like matrices:
 
-        R_{ℓm}(q) = 4 (2π)^(5/2) ∑_{ij pairs} (TDM_ij + TDM_ji) * exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
-                  * ∑_{n} q^n ∑_{λ,μ} W_{ij,λμ}^{n} G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
+        R_{ℓm}^{(a)}(q) = 2 [∑_i T_ii^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_ij^(a) + T_ji^(a)) S_{ℓm,ij}(q)].
 
-    where W_{ij,λμ}^{n} is the W tensor, TDM is the transition matrix, G_{λLℓ}^{μm} are Gaunt coefficients,
-    j_L are spherical Bessel functions, and Y_L^M are spherical harmonics evaluated at Rhat_{ij}.
+    Here, the factor of 2 accounts for the two spin channels, and the Cartesian-term overlap
+    coefficient is
 
-    This function batches over all transitions, computing R for each transition simultaneously with optional thresholding.
+        S_{ℓm,ij}(q) = 2 (2π)^(5/2) exp(-σ_{ij}²q²/2) ∑_{L,n,λ,μ} i^L j_L(qR_{ij}) q^n
+                         W_{ij,λμ}^n G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
+
+    where W_{ij,λμ}^n is the W tensor, G_{λLℓ}^{μm} are Gaunt coefficients, j_L are spherical Bessel
+    functions, and Y_L^M are spherical harmonics evaluated at Rhat_{ij}. Each S_{ℓm,ij}(q) is calculated
+    once, in blocks, before being combined with every density matrix. Only m ≥ 0 is calculated
+    directly, since
+
+        R_{ℓ,-m}^{(a)}(q) = (-1)^(m-ℓ) R_{ℓm}^{(a)*}(q),
+
+    lets us skip half the work.
 
     # Arguments:
-    - W_tensor::SparseWTensor{T}: The W tensor in sparse COO format.
-    - sigma_ij::Array{T,2}: The σ_{ij} values for all Cartesian term pairs.
-    - R_ij_mod::Array{T,2}: The |R_{ij}| distances for all Cartesian term pairs.
-    - R_ij_hat::Array{T,3}: The (θ, ϕ) angles for the unit vectors Rhat_{ij}.
-    - q_grid::Vector{T}: The 1D grid of |q| values at which to evaluate the R tensor, in keV.
+    - W_tensor::SparseWTensor{T}: The sparse W tensor, already filtered by the requested W threshold.
+    - sigma_ij::Array{T,2}: The σ_{ij} values for all Cartesian-term pairs.
+    - R_ij_mod::Array{T,2}: The |R_{ij}| distances for all Cartesian-term pairs.
+    - R_ij_hat::Array{T,3}: The (θ, ϕ) angles of the unit vectors Rhat_{ij}.
+    - q_grid::Vector{T}: The one-dimensional grid of |q| values in keV.
     - l_max::Int: Maximum ℓ to include in the expansion.
-    - gaunt_array_path::String: Path to the precomputed Gaunt coefficients (HDF5 file).
-    - transition_matrices::Vector{Matrix{T}}: Vector of transition matrices, one per transition.
-    - cartesian_term_to_orbital::Vector{Int}: Mapping from Cartesian term index to orbital index.
-    - threshold::T: Threshold for skipping (i,j) pairs. If |TDM_ij + TDM_ji| * W_max < threshold * global_max, skip this pair (default: 0.0).
+    - gaunt_array_path::String: Path to the precomputed sparse Gaunt coefficients.
+    - density_matrices::Vector{Matrix{T}}: The AO density-like matrices used to construct R. These
+      may be transition matrices or diagonal-correction matrices and are not assumed symmetric.
+    - cartesian_term_to_orbital::Vector{Int}: Mapping from Cartesian-term index to AO index.
 
     # Returns:
-    - R_tensor::Array{Complex{T},3}: The computed R tensor, with dimensions (n_transitions, q, lm_key), keyed by lm = ℓ^2 + (ℓ + m) + 1.
+    - R_tensor::Array{Complex{T},3}: The prefactored R tensor with dimensions
+      (n_densities, n_q, (ℓ_max + 1)^2), keyed by key(ℓ,m) = ℓ^2 + (ℓ + m) + 1.
     """
 
-    # Load Gaunt coefficients.
+    # Load the Gaunt coefficients.
     gaunt_array = load_gaunt_array(gaunt_array_path, T)
     gaunt_coeffs = gaunt_array.coefficients
 
-    # Get the relevant dimensions.
+    # Get the relevant angular and output dimensions. Only the triangular m ≥ 0 range is computed
+    # explicitly, which halves both the S coefficient work and its temporary storage.
     lambda_max = maximum(W_tensor.lambda)
     L_max = l_max + lambda_max
     n_q = length(q_grid)
-    n_transitions = length(transition_matrices)
+    n_densities = length(density_matrices)
+    n_keys_pos = (l_max + 1) * (l_max + 2) ÷ 2 # Number of keys with m ≥ 0..
+    n_outputs = n_q * n_keys_pos
 
-    # Convert the q_grid from keV to inverse Å without excessive allocations.
+    # Convert the q grid from keV to inverse Angstroms without excessive allocations.
     q_grid_invA = Vector{T}(undef, n_q)
     unit_conversion = T(KEV_TO_INV_ANGSTROM)
-    @inbounds for i in 1:n_q
-        q_grid_invA[i] = q_grid[i] * unit_conversion
+    @inbounds @simd for q_idx in eachindex(q_grid)
+        q_grid_invA[q_idx] = q_grid[q_idx] * unit_conversion
     end
 
-    # Preallocate the R tensor with a batch dimension for transitions.
-    # To save memory, we use the triangular key for (ℓ, m).
-    n_keys = (l_max + 1)^2
-    R_tensor = zeros(Complex{T}, n_transitions, n_q, n_keys)
-
-    # Get the number of (i, j) bins, and split them into one chunk per task.
-    num_ij_bins = length(W_tensor.ij_bins)
-    n_chunks = chunk_count(num_ij_bins, nthreads())
-
-    # Allocate arrays for precomputed quantities.
+    # Allocate and precompute the powers of q and i that are reused for every Cartesian pair.
     n_max = W_tensor.n_max
-    q_powers = Array{T, 2}(undef, n_max + 1, n_q)
+    q_powers = Matrix{T}(undef, n_max + 1, n_q)
     i_powers = Vector{Complex{T}}(undef, L_max + 1)
 
     # Precompute the powers of q.
@@ -263,152 +336,118 @@ function construct_R_tensor(
     # Precompute the powers of i.
     fill_i_powers!(i_powers, L_max)
 
-    # Preallocate buffers per task, keyed by chunk rather than by threadid so that each buffer has
-    # exactly one writer. These are reused across transitions.
-    gaussian_pool = [Vector{T}(undef, n_q) for _ in 1:n_chunks]
-    jL_pool = [Array{T, 2}(undef, L_max + 1, n_q) for _ in 1:n_chunks]
-    jL_miller_pool = [Vector{Float64}(undef, L_max + 1) for _ in 1:n_chunks] # This is a buffer for Miller's algorithm, to save repeated allocations when recursing downwards.
-    Y_cache_pool = [SphericalHarmonics.cache(L_max, SphericalHarmonics.FullRange) for _ in 1:n_chunks]
-    R_local_pool = [zeros(Complex{T}, n_q, n_keys) for _ in 1:n_chunks]
+    # List the non-empty W bins and prepare the density weight (T_ij factors) for each Cartesian pair before the
+    # expensive S calculation.
+    full_bins, pair_i, pair_j, pair_density_weights = build_pair_density_weights(
+        W_tensor, density_matrices, cartesian_term_to_orbital)
+    n_pairs = length(full_bins)
 
+    # Keep the real and imaginary blocks of S within a fixed memory budget.
+    bytes_per_pair = 2 * n_outputs * sizeof(T)
+    pair_block = min(n_pairs, max(1, PAIR_RESPONSE_BYTES ÷ bytes_per_pair))
+    response_real = Matrix{T}(undef, n_outputs, pair_block)
+    response_imag = Matrix{T}(undef, n_outputs, pair_block)
+
+    # Preallocate one set of buffers per task rather than per thread, so every buffer has exactly
+    # one writer even if a task moves between Julia threads. The buffers are reused for every block.
+    max_tasks = chunk_count(pair_block, nthreads())
+    gaussian_pool = [Vector{T}(undef, n_q) for _ in 1:max_tasks]
+    jL_pool = [Matrix{T}(undef, L_max + 1, n_q) for _ in 1:max_tasks]
+    # This buffer is reused by Miller's algorithm rather than allocated for every pair and q value.
+    jL_miller_pool = [Vector{Float64}(undef, L_max + 1) for _ in 1:max_tasks]
+    Y_cache_pool = [SphericalHarmonics.cache(L_max, SphericalHarmonics.FullRange) for _ in 1:max_tasks]
+
+    # BLAS combines the density weights with the real and imaginary parts of S separately. This lets
+    # the real density matrices use real GEMMs.
+    R_pos_real = zeros(T, n_densities, n_outputs)
+    R_pos_imag = zeros(T, n_densities, n_outputs)
     typed_half = T(0.5)
-    W_max = W_tensor.W_max
 
-    # Loop over transitions.
-    for transition_idx in 1:n_transitions
-        # Extract TDM for this transition as a view to avoid allocations.
-        TDM = @view transition_matrices[transition_idx][:, :]
+    # Work through the Cartesian pairs in blocks to reduce memory usage.
+    for pair_start in 1:pair_block:n_pairs
+        # Catch the last incomplete block.
+        pair_stop = min(pair_start + pair_block - 1, n_pairs)
+        n_block = pair_stop - pair_start + 1
 
-        # Compute the maximum |TDM_ij + TDM_ji| * W_max for this transition for thresholding.
-        max_TDM_W = zero(T)
-        if threshold > zero(T)
-            @inbounds for bin_idx in 1:num_ij_bins
-                ij_bin = W_tensor.ij_bins[bin_idx]
-                isempty(ij_bin) && continue
+        # Restrict the reusable arrays to the active block and clear their previous values.
+        real_block = @view response_real[:, 1:n_block]
+        imag_block = @view response_imag[:, 1:n_block]
+        fill!(real_block, zero(T))
+        fill!(imag_block, zero(T))
 
-                first_idx = ij_bin[1]
-                pair_i = W_tensor.i[first_idx]
-                pair_j = W_tensor.j[first_idx]
-
-                orbital_i = cartesian_term_to_orbital[pair_i]
-                orbital_j = cartesian_term_to_orbital[pair_j]
-
-                # Compute |TDM_ij + TDM_ji| * W_max, handling diagonal separately
-                if pair_i == pair_j
-                    TDM_contribution = abs(TDM[orbital_i, orbital_j]) * W_max
-                else
-                    TDM_contribution = abs(TDM[orbital_i, orbital_j] + TDM[orbital_j, orbital_i]) * W_max
-                end
-
-                # Update the maximum.
-                max_TDM_W = max(max_TDM_W, TDM_contribution)
-            end
-        end
-
-        # Compute the effective W threshold for this transition.
-        threshold_value = threshold * max_TDM_W
-
-        # Zero out the per-task buffers for this transition.
-        @inbounds for chunk in 1:n_chunks
-            fill!(R_local_pool[chunk], zero(Complex{T}))
-        end
-
-        # Accumulate one (i, j) slice at a time, with one task per chunk of ij bins.
-        @sync for chunk in 1:n_chunks
+        # Thread over the (i, j) pairs in this block. Each pair writes to its own column of S.
+        n_tasks = chunk_count(n_block, nthreads())
+        @sync for task_idx in 1:n_tasks
             Threads.@spawn begin
                 # Get this task's buffers.
-                gaussian_local = gaussian_pool[chunk]
-                jL_local = jL_pool[chunk]
-                jL_miller_buffer = jL_miller_pool[chunk]
-                Ylm_cache = Y_cache_pool[chunk]
-                R_local = R_local_pool[chunk]
+                gaussian = gaussian_pool[task_idx]
+                jL = jL_pool[task_idx]
+                jL_miller = jL_miller_pool[task_idx]
+                Ylm_cache = Y_cache_pool[task_idx]
 
-                for bin_idx in chunk_range(chunk, n_chunks, num_ij_bins)
-                    ij_bin = W_tensor.ij_bins[bin_idx]
-
-                    # Skip empty (i, j) bins.
-                    isempty(ij_bin) && continue
-
-                    # All entries in this bin share the same (i, j) pair.
-                    first_idx = ij_bin[1]
-                    pair_i = W_tensor.i[first_idx]
-                    pair_j = W_tensor.j[first_idx]
-
-                    # Extract the orbital indices and compute the TDM prefactor for this pair.
-                    orbital_i = cartesian_term_to_orbital[pair_i]
-                    orbital_j = cartesian_term_to_orbital[pair_j]
-
-                    if pair_i == pair_j
-                        # For the diagonal entries there is only one contribution.
-                        TDM_prefactor = TDM[orbital_i, orbital_j]
-                    else
-                        TDM_prefactor = TDM[orbital_i, orbital_j] + TDM[orbital_j, orbital_i]
-                    end
+                for pair_in_block in chunk_range(task_idx, n_tasks, n_block)
+                    # Convert the position in this block to the full pair list, then recover (i, j).
+                    global_pair_idx = pair_start + pair_in_block - 1
+                    i = pair_i[global_pair_idx]
+                    j = pair_j[global_pair_idx]
+                    ij_bin = W_tensor.ij_bins[full_bins[global_pair_idx]]
 
                     # Extract the geometry for this pair.
-                    sigma_ij_val = sigma_ij[pair_i, pair_j]
-                    R_mod = R_ij_mod[pair_i, pair_j]
-                    theta_ij = R_ij_hat[pair_i, pair_j, 1]
-                    phi_ij = R_ij_hat[pair_i, pair_j, 2]
+                    sigma_sq = sigma_ij[i, j] * sigma_ij[i, j]
+                    R_mod = R_ij_mod[i, j]
+                    theta_ij = R_ij_hat[i, j, 1]
+                    phi_ij = R_ij_hat[i, j, 2]
 
                     # Precompute the spherical harmonics for this pair.
                     computePlmcostheta!(Ylm_cache, theta_ij, L_max)
                     computeYlm!(Ylm_cache, theta_ij, phi_ij, L_max)
                     Yvals = SphericalHarmonics.getY(Ylm_cache)
 
-                    # Compute Gaussian factor exp(-σ_{ij}^2 q^2/2), along with the spherical Bessel functions j_L(q R_{ij}).
-                    sigma_ij_sq = sigma_ij_val * sigma_ij_val
+                    # Compute the Gaussian exp(-σ_{ij}²q²/2) and spherical Bessel functions
+                    # j_L(qR_{ij}) across the q grid.
                     @inbounds for q_idx in 1:n_q
-                        gaussian_local[q_idx] = exp(-typed_half * sigma_ij_sq * q_powers[3, q_idx])
-                        fill_spherical_bessel_column!(jL_local, jL_miller_buffer, q_idx, q_grid_invA[q_idx] * R_mod, L_max)
+                        gaussian[q_idx] = exp(-typed_half * sigma_sq * q_powers[3, q_idx])
+                        fill_spherical_bessel_column!(jL, jL_miller, q_idx,
+                                                      q_grid_invA[q_idx] * R_mod, L_max)
                     end
 
-                    # Now loop over W entries in this (i, j) bin.
+                    # Loop over all non-zero W entries belonging to this Cartesian pair.
                     @inbounds for W_idx in ij_bin
-                        # Extract the remaining indices, so that we can join with the corresponding Gaunt bin.
+                        # Extract the W indices and value, then find the matching Gaunt bin.
                         lambda = W_tensor.lambda[W_idx]
                         mu = W_tensor.mu[W_idx]
-                        n = W_tensor.n[W_idx]
-
-                        # Also extract the W tensor value.
+                        n_idx = W_tensor.n[W_idx] + 1
                         W_val = W_tensor.W_values[W_idx]
-
-                        # Apply thresholding.
-                        abs(TDM_prefactor) * abs(W_val) < threshold_value && continue
-
-                        n_idx = n + 1 # For future indexing.
-
-                        # Find the Gaunt bin for this (λ, μ).
                         bin_key = lambda_mu_key[lambda + 1, mu + lambda + 1]
-                        gaunt_bin = gaunt_array.lambda_mu_bins[bin_key]
 
-                        # Skip if there are no Gaunt coefficients for this (λ, μ).
-                        isempty(gaunt_bin) && continue
+                        # Loop over the matching Gaunt coefficients. The m < 0 coefficients follow
+                        # from conjugation symmetry and are restored after combining with T.
+                        for gaunt_idx in gaunt_array.lambda_mu_bins[bin_key]
+                            m = gaunt_array.m[gaunt_idx]
+                            m < 0 && continue
 
-                        # Loop over the matching Gaunt coefficients.
-                        for gaunt_idx in gaunt_bin
                             L = gaunt_array.L[gaunt_idx]
                             l = gaunt_array.l[gaunt_idx]
-                            m = gaunt_array.m[gaunt_idx]
 
-                            gaunt_val = gaunt_coeffs[gaunt_idx]
-
-                            # Compute the corresponding spherical harmonic index. M = m - μ.
+                            # Compute the corresponding spherical-harmonic index M = m - μ and the
+                            # q-independent angular part of this contribution.
                             M = m - mu
+                            angular = W_val * gaunt_coeffs[gaunt_idx] *
+                                      conj(Complex{T}(Yvals[(L, M)])) * i_powers[L + 1]
+                            angular_real = real(angular)
+                            angular_imag = imag(angular)
 
-                            # Fetch the correct SHM and take its complex conjugate.
-                            Y_val = Complex{T}(Yvals[(L, M)])
-                            conj_Y = conj(Y_val)
+                            # Combine the triangular (ℓ,m) key and q index into one index so that one
+                            # Cartesian pair occupies one contiguous column.
+                            key_pos = (l * (l + 1)) ÷ 2 + m + 1
+                            output_base = (key_pos - 1) * n_q
 
-                            # Compute the angular part of the contribution, including TDM prefactor.
-                            angular_term = TDM_prefactor * W_val * gaunt_val * conj_Y * i_powers[L + 1]
-
-                            # Precompute the key.
-                            lm_key = l * l + (l + m) + 1
-
-                            # Now accumulate into R_local.
-                            @inbounds for k in 1:n_q
-                                R_local[k, lm_key] += angular_term * gaussian_local[k] * q_powers[n_idx, k] * jL_local[L + 1, k]
+                            # Accumulate this q-dependent contribution to S_{ℓm,ij}(q).
+                            @simd for q_idx in 1:n_q
+                                radial = gaussian[q_idx] * q_powers[n_idx, q_idx] * jL[L + 1, q_idx]
+                                output_idx = output_base + q_idx
+                                real_block[output_idx, pair_in_block] += angular_real * radial
+                                imag_block[output_idx, pair_in_block] += angular_imag * radial
                             end
                         end
                     end
@@ -416,15 +455,43 @@ function construct_R_tensor(
             end
         end
 
-        # Accumulate the per-task results into the global R tensor for this transition.
-        @inbounds for R_per_chunk in R_local_pool
-            R_tensor[transition_idx, :, :] .+= R_per_chunk
-        end
+        # Pick the right part of density weights (T_ij combinations) to fill R.
+        density_block = @view pair_density_weights[:, pair_start:pair_stop]
+
+        # Combine every density-like matrix with the completed block of S coefficients.
+        # The syntax is mul(C, A, B, alpha, beta) does C = α * A * B + β * C, so this adds A * B to C.
+        mul!(R_pos_real, density_block, transpose(real_block), one(T), one(T))
+        mul!(R_pos_imag, density_block, transpose(imag_block), one(T), one(T))
     end
 
-    # Apply the prefactor.
-    R_tensor .*= Complex{T}(prefactor)
+    # Allocate the final full-m tensor and apply the common plane-wave and spin prefactor while copying
+    # over the directly evaluated m ≥ 0 coefficients.
+    R_tensor = Array{Complex{T}}(undef, n_densities, n_q, (l_max + 1)^2)
+    scale = T(prefactor)
+    @inbounds for l in 0:l_max
+        full_key_base = l * l + l + 1
+        pos_key_base = (l * (l + 1)) ÷ 2 + 1
+        for m in 0:l
+            pos_key = pos_key_base + m
+            full_key = full_key_base + m
+            sign = fast_neg1_pow(m - l, T) # (-1)^(m-l).
+            output_base = (pos_key - 1) * n_q
 
+            for q_idx in 1:n_q
+                output_idx = output_base + q_idx
+                @simd for density_idx in 1:n_densities
+                    value = scale * Complex{T}(R_pos_real[density_idx, output_idx],
+                                               R_pos_imag[density_idx, output_idx])
+                    R_tensor[density_idx, q_idx, full_key] = value
+
+                    # Fill in the m < 0 for free.
+                    if m > 0
+                        R_tensor[density_idx, q_idx, full_key_base - m] = sign * conj(value)
+                    end
+                end
+            end
+        end
+    end
     return R_tensor
 end
 

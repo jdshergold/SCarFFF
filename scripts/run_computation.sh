@@ -82,7 +82,6 @@ SKIP_FORM_FACTOR=false     # Set to true to skip the form factor computation. Wi
 SKIP_2D_PLOTS=false        # Set to true to skip 2D slice plot generation.
 SKIP_3D_PLOTS=true         # Set to true to skip 3D isosurface plot generation.
 FORCE_RECOMPUTATION=false  # Set to true to force recomputation of A and Gaunt coefficients in the form factor computation.
-BENCHMARK=false            # Set to true to run benchmark after form factor computation. Testing only.
 
 # ==== Verification. ====
 CHECK_OSCILLATOR_STRENGTH=false  # Set to true to compute and compare oscillator strengths found from the form factor with those from PySCF.
@@ -380,10 +379,6 @@ else
         if [ "$USE_GPU" = true ]; then
             JULIA_CMD="$JULIA_CMD --use-gpu"
         fi
-    fi
-
-    if [ "$BENCHMARK" = true ]; then
-        JULIA_CMD="$JULIA_CMD --benchmark"
     fi
 
     eval $JULIA_CMD

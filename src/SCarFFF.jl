@@ -11,6 +11,7 @@ using CUDA
 include("utils/FastPowers.jl")
 include("utils/ThreadChunks.jl")
 include("utils/SparseTensors.jl")
+include("utils/StageTimings.jl")
 
 # Next import the three methods. SCarFFF = Spherical, Cartesian, and Fourier Form Factors.
 include("form_factors/spherical/SphericalFormFactor.jl")
@@ -115,8 +116,7 @@ end
                 l_max,
                 gaunt_path,
                 transition_matrices,
-                mol.cartesian_term_to_orbital;
-                threshold = T(0),
+                mol.cartesian_term_to_orbital,
             )
 
             # Contract with the spherical harmonics to get the final form factor.

@@ -16,6 +16,9 @@ using ...SparseTensors: SparseWTensor, SparseGauntArray
 
 export construct_R_tensor_gpu
 
+# TODO: Upgrade this to the blocked, shared Cartesian-pair response using S_{ℓm,ij}(q)
+# used by ConstructRTensor on the CPU.
+
 @inline function load_gaunt_array(path::String, ::Type{T}) where {T<:AbstractFloat}
     """
     Load a SparseGauntArray from an HDF5 file.

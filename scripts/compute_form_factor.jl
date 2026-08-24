@@ -3,7 +3,6 @@
 
 using HDF5
 using ArgParse
-using BenchmarkTools
 using CSV
 using DataFrames
 using CUDA
@@ -25,6 +24,7 @@ using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
 using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
 using SCarFFF.SphericalFormFactor.BlochHamiltonian: BlochEigensystem, solve_bloch_hamiltonian!
 using SCarFFF.ThreadChunks: chunk_count, chunk_range
+using SCarFFF.StageTimings: print_stage_timings
 using Base.Threads
 using LinearAlgebra: norm, dot
 
@@ -227,9 +227,6 @@ function parse_commandline()::Dict{String, Any}
             default = "1"
         "--force-recomputation"
             help = "Whether to force the recomputation of Gaunt coefficients and the A tensor even if they exist."
-            action = :store_true
-        "--benchmark"
-            help = "Whether to run a benchmark of the computation after running it."
             action = :store_true
         "--precision"
             help = "Floating point precision to use. Options: float64, float32."
@@ -481,7 +478,6 @@ function main()
     no_couplings = args["no-couplings"]
     transition_indices_str = args["transition-indices"]
     force_recomp = args["force-recomputation"]
-    run_benchmark = args["benchmark"]
     precision = lowercase(args["precision"])
     if precision == "float32"
         T = Float32
@@ -876,12 +872,7 @@ function main()
                     crystal_state_f_lm, crystal_f_s = incoherent_timing.value
                     push!(stage_times, "incoherent f_lm" => incoherent_timing.time)
 
-                    crystal_total = sum(last, stage_times)
-                    println("\nCrystal stage timings ($(round(crystal_total, digits = 1)) s total):")
-                    for (name, seconds) in stage_times
-                        println("  $(rpad(name, 42)) $(lpad(round(seconds, digits = 1), 7)) s  " *
-                                "$(lpad(round(Int, 100 * seconds / crystal_total), 3))%")
-                    end
+                    print_stage_timings("Crystal stage timings", stage_times)
 
                     crystal_results = (
                         order = "incoherent",
@@ -1011,12 +1002,7 @@ function main()
                               "band map ($(join(band_planes, ", ")))" => band_timing.time)
                     end
 
-                    crystal_total = sum(last, stage_times)
-                    println("\nCrystal stage timings ($(round(crystal_total, digits = 1)) s total):")
-                    for (name, seconds) in stage_times
-                        println("  $(rpad(name, 42)) $(lpad(round(seconds, digits = 1), 7)) s  " *
-                                "$(lpad(round(Int, 100 * seconds / crystal_total), 3))%")
-                    end
+                    print_stage_timings("Crystal stage timings", stage_times)
                     println()
 
                     crystal_results = (
@@ -1220,25 +1206,6 @@ function main()
                     rate_results = compute_rates(f_lm, q_grid, m_grid, T.(transition_energies_eV), N_rotations)
                 end
 
-                # Run the benchmark. Testing only.
-                if run_benchmark
-                    println("\nRunning benchmark...")
-                    @btime compute_spherical_form_factor(
-                        $q_grid,
-                        $theta_grid,
-                        $phi_grid,
-                        $l_max,
-                        $td_h5,
-                        transition_indices=$transition_indices,
-                        force_recomputation=$force_recomp,
-                        threshold=$threshold_val,
-                        use_gpu=$use_gpu,
-                        need_grid=$need_grid,
-                        need_R=$need_R,
-                        need_flm=$need_flm
-                    )
-                end
-
                 # Save the results to disk.
                 # Loop over each computed transition and save them separately.
                 for (batch_idx, transition_idx) in enumerate(transition_indices)
@@ -1327,20 +1294,6 @@ function main()
                 use_gpu=use_gpu
             )
 
-            # Run the benchmark. Testing only.
-            if run_benchmark
-                println("\nRunning benchmark...")
-                @btime compute_fft_form_factor(
-                    $qx_grid,
-                    $qy_grid,
-                    $qz_grid,
-                    $td_h5,
-                    transition_indices=$transition_indices,
-                    check_parseval=false,
-                    use_gpu=$use_gpu
-                )
-            end
-
             # Save the results to disk. Loop over each computed transition and save them separately.
             for (batch_idx, transition_idx) in enumerate(transition_indices)
                 transition_output_dir = joinpath(mol_output_dir, "fft", "transition_$(transition_idx)")
@@ -1412,22 +1365,6 @@ function main()
                 need_grid=need_grid,
                 need_V=need_V
             )
-
-            # Run the benchmark. Testing only.
-            if run_benchmark
-                println("\nRunning benchmark...")
-                @btime compute_cartesian_form_factor(
-                    $qx_grid,
-                    $qy_grid,
-                    $qz_grid,
-                    $td_h5,
-                    transition_indices=$transition_indices,
-                    threshold=$threshold_val,
-                    use_gpu=$use_gpu,
-                    need_grid=$need_grid,
-                    need_V=$need_V
-                )
-            end
 
             # Save the results to disk. Loop over each computed transition and save them separately.
             for (batch_idx, transition_idx) in enumerate(transition_indices)

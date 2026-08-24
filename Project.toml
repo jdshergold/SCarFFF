@@ -5,7 +5,6 @@ version = "0.1.0"
 [deps]
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
-BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CGcoefficient = "c862aa61-d51e-47d1-b396-b1e789b4e0b6"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
@@ -31,3 +30,9 @@ AbstractFFTs = "1.5.0"
 FastLapackInterface = "2.1.1"
 Quaternionic = "3.1.1"
 VectorSpaceDarkMatter = "0.3.0"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

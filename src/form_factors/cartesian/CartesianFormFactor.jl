@@ -17,6 +17,7 @@ using .ConstructbCoefficients: construct_b_coefficients
 using .ConstructVTensors: construct_V_tensors
 using .ContractCartesianGrid: contract_cartesian_grid
 using .ContractCartesianGridGPU: contract_cartesian_grid_gpu
+using ..StageTimings: print_stage_timings, time_stage!
 
 export compute_cartesian_form_factor
 
@@ -55,8 +56,12 @@ function compute_cartesian_form_factor(
     - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
     """
 
+    stage_times = Pair{String, Float64}[]
+
     # Construct MoleculeData structure.
-    mol = get_molecular_data(td_dft_path; precision = T)
+    mol = time_stage!(stage_times, "read molecular data") do
+        get_molecular_data(td_dft_path; precision = T)
+    end
 
     # Convert q values from keV to inverse Angstroms.
     q_x_inv_ang = T(KEV_TO_INV_ANGSTROM) .* q_x_vals
@@ -64,28 +69,40 @@ function compute_cartesian_form_factor(
     q_z_inv_ang = T(KEV_TO_INV_ANGSTROM) .* q_z_vals
 
     # Construct the pair coefficients.
-    M_ij, sigma_ij, R_ij, _, _ = construct_pair_coefficients(mol)
+    M_ij, sigma_ij, R_ij, _, _ = time_stage!(stage_times, "pair coefficients") do
+        construct_pair_coefficients(mol)
+    end
 
     # Construct the b coefficients.
-    b_A, b_B, b_C = construct_b_coefficients(mol, R_ij)
+    b_A, b_B, b_C = time_stage!(stage_times, "b coefficients") do
+        construct_b_coefficients(mol, R_ij)
+    end
 
     # Extract the transition matrices for the requested transitions.
     transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
 
     # Construct the V tensors.
-    V_x, V_y, V_z, nonzero_pairs = construct_V_tensors(
-        mol, M_ij, sigma_ij, R_ij, b_A, b_B, b_C,
-        q_x_inv_ang, q_y_inv_ang, q_z_inv_ang;
-        threshold = threshold
-    )
+    V_x, V_y, V_z, nonzero_pairs = time_stage!(stage_times, "V tensors") do
+        construct_V_tensors(
+            mol, M_ij, sigma_ij, R_ij, b_A, b_B, b_C,
+            q_x_inv_ang, q_y_inv_ang, q_z_inv_ang;
+            threshold = threshold
+        )
+    end
 
     # Contract to get the form factors for the requested transitions (if needed).
     f_s = nothing
     if need_grid
         if use_gpu
-            f_s = Array(contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold))
+            f_s = time_stage!(stage_times, "Cartesian grid (GPU)") do
+                result = Array(contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold))
+                CUDA.synchronize()
+                result
+            end
         else
-            f_s = contract_cartesian_grid(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold)
+            f_s = time_stage!(stage_times, "Cartesian grid") do
+                contract_cartesian_grid(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold)
+            end
         end
     end
 
@@ -97,6 +114,8 @@ function compute_cartesian_form_factor(
 
     # Extract the transition energies for the requested transitions.
     transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
+
+    print_stage_timings("Cartesian form-factor stage timings", stage_times)
 
     return V_tensors, f_s, transition_energies_eV
 end

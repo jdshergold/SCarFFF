@@ -13,6 +13,7 @@ using .ConstructTransitionDensity: construct_transition_density
 using .ConstructTransitionDensityGPU: construct_transition_density_gpu
 using .PerformFFT: perform_fft, check_parseval_theorem
 using .PerformFFTGPU: perform_fft_gpu
+using ..StageTimings: print_stage_timings, time_stage!
 
 export compute_fft_form_factor
 
@@ -50,8 +51,12 @@ function compute_fft_form_factor(
     - transition_energies_eV::Vector{T}: The transition energies in eV.
     """
 
+    stage_times = Pair{String, Float64}[]
+
     # Construct the MoleculeData structure.
-    mol = get_molecular_data(td_dft_path; precision = T)
+    mol = time_stage!(stage_times, "read molecular data") do
+        get_molecular_data(td_dft_path; precision = T)
+    end
 
     # Get the transition matrices for the specified transitions.
     transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
@@ -60,64 +65,82 @@ function compute_fft_form_factor(
     N_grid = [length(qx_grid), length(qy_grid), length(qz_grid)]
 
     if use_gpu
-        transition_densities_gpu, r_lim = construct_transition_density_gpu(
-            mol,
-            transition_matrices,
-            qx_grid,
-            qy_grid,
-            qz_grid
-        )
-        CUDA.synchronize()
+        transition_densities_gpu, r_lim = time_stage!(stage_times, "transition-density grid (GPU)") do
+            result = construct_transition_density_gpu(
+                mol,
+                transition_matrices,
+                qx_grid,
+                qy_grid,
+                qz_grid
+            )
+            CUDA.synchronize()
+            result
+        end
 
         # Perform the FFT on the GPU.
-        form_factors_gpu = perform_fft_gpu(transition_densities_gpu, r_lim, N_grid)
-        CUDA.synchronize()
+        form_factors_gpu = time_stage!(stage_times, "FFT (GPU)") do
+            result = perform_fft_gpu(transition_densities_gpu, r_lim, N_grid)
+            CUDA.synchronize()
+            result
+        end
 
         # Transfer the results to CPU.
-        transition_densities = Array(transition_densities_gpu)
-        form_factors = Array(form_factors_gpu)
-        CUDA.synchronize()
+        transition_densities, form_factors = time_stage!(stage_times, "copy results to CPU") do
+            result = (Array(transition_densities_gpu), Array(form_factors_gpu))
+            CUDA.synchronize()
+            result
+        end
 
         # Check Parseval's theorem if requested.
         if check_parseval
-            for t_idx in 1:length(transition_matrices)
-                check_parseval_theorem(
-                    view(transition_densities, t_idx, :, :, :),
-                    view(form_factors, t_idx, :, :, :),
-                    r_lim, N_grid
-                )
+            time_stage!(stage_times, "Parseval check") do
+                for t_idx in 1:length(transition_matrices)
+                    check_parseval_theorem(
+                        view(transition_densities, t_idx, :, :, :),
+                        view(form_factors, t_idx, :, :, :),
+                        r_lim, N_grid
+                    )
+                end
             end
         end
     else
         # CPU path.
-        transition_densities, r_lim = construct_transition_density(
-            mol,
-            transition_matrices,
-            qx_grid,
-            qy_grid,
-            qz_grid
-        )
+        transition_densities, r_lim = time_stage!(stage_times, "transition-density grid") do
+            construct_transition_density(
+                mol,
+                transition_matrices,
+                qx_grid,
+                qy_grid,
+                qz_grid
+            )
+        end
 
         # Store a copy of the transition densities for the Parseval's theorem check if needed.
         transition_densities_copy = check_parseval ? copy(transition_densities) : nothing
 
         # Perform the FFT on CPU.
-        form_factors = perform_fft(transition_densities, r_lim, N_grid)
+        form_factors = time_stage!(stage_times, "FFT") do
+            perform_fft(transition_densities, r_lim, N_grid)
+        end
 
         # Check Parseval's theorem if requested.
         if check_parseval
-            for t_idx in 1:length(transition_matrices)
-                check_parseval_theorem(
-                    view(transition_densities_copy, t_idx, :, :, :),
-                    view(form_factors, t_idx, :, :, :),
-                    r_lim, N_grid
-                )
+            time_stage!(stage_times, "Parseval check") do
+                for t_idx in 1:length(transition_matrices)
+                    check_parseval_theorem(
+                        view(transition_densities_copy, t_idx, :, :, :),
+                        view(form_factors, t_idx, :, :, :),
+                        r_lim, N_grid
+                    )
+                end
             end
         end
     end
 
     # Extract the transition energies for the requested transitions.
     transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
+
+    print_stage_timings("FFT form-factor stage timings", stage_times)
 
     return form_factors, transition_densities, r_lim, transition_energies_eV
 end
