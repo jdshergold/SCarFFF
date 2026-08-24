@@ -14,7 +14,8 @@ using Quaternionic
 using StaticArrays
 using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
 using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_crystal_lattice,
-                                  rotate_R_tensors, compute_coherent_crystal_f_lm, project_f_lm,
+                                  rotate_R_tensors, compute_coherent_crystal_f_lm,
+                                  compute_incoherent_crystal_f_lm, project_f_lm,
                                   enumerate_neighbour_cells, compute_couplings, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range, subtract_self_term!,
                                   image_translation_span, supercell_radius,
@@ -498,6 +499,9 @@ function main()
     if crystal_mode && method != "spherical"
         error("Crystal mode is only supported for the spherical method.")
     end
+    if crystal_mode && crystal_order == "coherent" && args["compute-rates"]
+        error("Scattering rates are not supported for coherent crystal form factors because the rate calculation does not yet use the crystal band energies. Use --crystal-order incoherent or omit --compute-rates.")
+    end
 
 
     input_modes = [
@@ -643,13 +647,14 @@ function main()
             if compute_rates_flag
                 need_flm = true  # f_lm tensor is required for rate computation.
             end
-            if crystal_mode && crystal_order == "coherent"
-                # The coherent path rotates each conformer's R tensor into every image's orientation,
-                # so the R tensor has to be kept even if it was not asked for as an output.
+            if crystal_mode
+                # Both crystal orders rotate each conformer's R tensor into every image's
+                # orientation, so it has to be kept even if it was not asked for as an output.
                 need_R = true
             end
 
-            # Widen the grid by a few points if necessary to maximise the symmetry reduction.
+            # Widen the grid by a few points if necessary to maximise the symmetry reduction. Only
+            # the coherent order diagonalises, so only it benefits.
             if crystal_mode && crystal_order == "coherent"
                 grid_metadata = JSON.parsefile(joinpath(mol_output_dir, "crystal_metadata.json"))
                 grid_images, _, _ = build_dominant_group_images(
@@ -814,23 +819,21 @@ function main()
                 # Turn the individual conformer results into the crystal results.
                 conformer_sets = build_crystal_conformer_sets(crystal_metadata, T)
 
-                # set_f_lm is the one aggregated over one conformer group (e.g. 1_A), the other is aggregated over all groups.
-                # This is the zeroth-order, incoherent approximation: it adds |f|^2 over the rotated
-                # images, ignoring both the relative phases and any mixing between molecules. The
-                # coherent path supersedes it, so under --crystal-order coherent it is built only if
-                # the rates still need it, and the per transition outputs below are skipped.
-                need_incoherent = crystal_order != "coherent" || compute_rates_flag
-                set_f_lm, aggregate_f_lm = need_incoherent ?
+                # set_f_lm is aggregated over one conformer group (e.g. 1_A), the other is
+                # aggregated over all groups. This f_lm-space path remains only for incoherent crystal
+                # rates. The plotted incoherent form factor is built separately on the angular grid.
+                need_incoherent_rates = compute_rates_flag
+                set_f_lm, aggregate_f_lm = need_incoherent_rates ?
                     construct_crystal_f_lm_tensors(conformer_labels, conformer_f_lm, conformer_sets) :
                     (nothing, nothing)
                 conformer_set_occupancies = T[conformer_set.occupancy for conformer_set in conformer_sets]
 
-                # The coherent path solves the Frenkel exciton Bloch problem and mixes the molecular
-                # amplitudes before squaring, then projects back onto real spherical harmonics.
-                coherent_results = nothing
-                if crystal_order == "coherent"
+                #Run the crystal computation. Coherent solves the Frenkel exciton Bloch problem and mixes them before
+                # squaring, incoherent adds them in intensity with no phases and no mixing.
+                crystal_results = nothing
+                begin
                     haskey(crystal_metadata, "lattice") ||
-                        error("The crystal metadata has no 'lattice' entry, which the coherent path needs. Re-run td_dft.py to regenerate crystal_metadata.json.")
+                        error("The crystal metadata has no 'lattice' entry, which the crystal path needs. Re-run td_dft.py to regenerate crystal_metadata.json.")
 
                     # Construct the lattice and reciprocal lattice.
                     lattice_matrix = reduce(vcat, [reshape(T.(row), 1, 3) for row in crystal_metadata["lattice"]])
@@ -840,12 +843,16 @@ function main()
                     images, dominant_group, dominant_occupancy =
                         build_dominant_group_images(crystal_metadata, conformer_labels, T)
 
-                    println("Solving the Frenkel exciton Bloch problem for disorder group $(dominant_group) ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
+                    if crystal_order == "coherent"
+                        println("Solving the Frenkel exciton Bloch problem for disorder group $(dominant_group) ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
+                    else
+                        println("Adding the images of disorder group $(dominant_group) in intensity ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
+                    end
 
                     # Get the R tensors for each conformer.
                     conformer_R_tensors = [conformer_results[label].R_tensor for label in conformer_labels]
                     any(isnothing, conformer_R_tensors) &&
-                        error("The coherent crystal path needs the R tensor for every conformer, but at least one is missing.")
+                        error("The crystal path needs the R tensor for every conformer, but at least one is missing.")
 
                     conformer_energy_lists = [T.(conformer_results[label].transition_energies_eV) for label in conformer_labels]
                     basis = build_excitation_basis(images, conformer_energy_lists)
@@ -859,6 +866,40 @@ function main()
 
                     # The Brillouin zone folding works in inverse Angstroms, matching the lattice.
                     q_grid_invA = T(KEV_TO_INV_ANGSTROM) .* q_grid
+
+                if crystal_order != "coherent"
+                    # Nothing here depends on k, so there is no Bloch problem to solve: no couplings,
+                    # no Ewald sum, no symmetry stars and no diagonalisation.
+                    incoherent_timing = @timed compute_incoherent_crystal_f_lm(
+                        rotated_R, basis, q_grid_invA, theta_grid, phi_grid, l_max;
+                        need_grid = need_grid)
+                    crystal_state_f_lm, crystal_f_s = incoherent_timing.value
+                    push!(stage_times, "incoherent f_lm" => incoherent_timing.time)
+
+                    crystal_total = sum(last, stage_times)
+                    println("\nCrystal stage timings ($(round(crystal_total, digits = 1)) s total):")
+                    for (name, seconds) in stage_times
+                        println("  $(rpad(name, 42)) $(lpad(round(seconds, digits = 1), 7)) s  " *
+                                "$(lpad(round(Int, 100 * seconds / crystal_total), 3))%")
+                    end
+
+                    crystal_results = (
+                        order = "incoherent",
+                        basis = basis,
+                        lattice = lattice,
+                        dominant_group = dominant_group,
+                        dominant_occupancy = dominant_occupancy,
+                        state_f_lm = crystal_state_f_lm,
+                        f_s = crystal_f_s,
+                        band_summary = nothing,
+                        couplings = nothing,
+                        cells = nothing,
+                        ewald_parameters = nothing,
+                        long_range = nothing,
+                        band_planes = String[],
+                        band_maps = nothing,
+                    )
+                else
 
                     # Build the intermolecular couplings, unless they have been switched off.
                     crystal_couplings = nothing
@@ -978,7 +1019,8 @@ function main()
                     end
                     println()
 
-                    coherent_results = (
+                    crystal_results = (
+                        order = "coherent",
                         basis = basis,
                         lattice = lattice,
                         dominant_group = dominant_group,
@@ -990,80 +1032,43 @@ function main()
                         cells = cells,
                         ewald_parameters = ewald_parameters,
                         long_range = crystal_long_range,
+                        band_planes = band_planes,
+                        band_maps = band_maps,
                     )
                 end
-
-                for (batch_idx, transition_idx) in enumerate(transition_indices)
-                    # These per transition files describe the incoherent approximation the coherent output replaces, 
-                    #so they are not written at all if coherent output is requested.
-                    aggregate_f_lm === nothing && break
-
-                    transition_output_dir = joinpath(mol_output_dir, "crystal", string(transition_idx))
-                    mkpath(transition_output_dir)
-
-                    # Allocate the output tensors.
-                    # Conformer tensor is e.g. "A", "B", etc.
-                    # Conformer set tensor is e.g. "1_A", "1_B", etc.
-                    conformer_tensor = Array{T}(undef, length(conformer_labels), size(aggregate_f_lm, 2), size(aggregate_f_lm, 3))
-                    conformer_energies = Vector{T}(undef, length(conformer_labels))
-                    conformer_set_tensor = Array{T}(undef, length(set_f_lm), size(aggregate_f_lm, 2), size(aggregate_f_lm, 3))
-                    conformer_set_energies = Vector{T}(undef, length(set_f_lm))
-                    conformer_set_names = String[]
-                    conformer_set_labels = String[]
-
-                    # Fill the individual conformer tensors.
-                    for (conformer_idx, conformer_label) in enumerate(conformer_labels)
-                        conformer_tensor[conformer_idx, :, :] = conformer_results[conformer_label].f_lm[batch_idx, :, :]
-                        conformer_energies[conformer_idx] = conformer_results[conformer_label].transition_energies_eV[batch_idx]
-                    end
-
-                    # Fill the conformer set tensors.
-                    for (set_idx, conformer_set) in enumerate(conformer_sets)
-                        conformer_set_tensor[set_idx, :, :] = set_f_lm[set_idx][batch_idx, :, :]
-                        conformer_set_energies[set_idx] = conformer_results[conformer_set.label].transition_energies_eV[batch_idx]
-                        push!(conformer_set_names, conformer_set.name)
-                        push!(conformer_set_labels, conformer_set.label)
-                    end
-
-                    # Save the results to disk.
-                    output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
-                    h5open(output_path, "w") do io
-                        write(io, "f_lm", aggregate_f_lm[batch_idx, :, :])
-                        write(io, "conformer_f_lm", conformer_tensor)
-                        write(io, "conformer_labels", conformer_labels)
-                        write(io, "conformer_transition_energies_eV", conformer_energies)
-                        write(io, "conformer_set_f_lm", conformer_set_tensor)
-                        write(io, "conformer_set_names", conformer_set_names)
-                        write(io, "conformer_set_labels", conformer_set_labels)
-                        write(io, "conformer_set_occupancies", conformer_set_occupancies)
-                        write(io, "conformer_set_transition_energies_eV", conformer_set_energies)
-                        write(io, "q_grid", q_grid)
-                        write(io, "transition_index", transition_idx)
-                    end
                 end
 
-                # The coherent result is written once rather than per transition: a crystal state Ψ
-                # is a mixture of monomer transitions, so it has no per-transition decomposition.
-                if coherent_results !== nothing
-                    coherent_output_dir = joinpath(mol_output_dir, "crystal", "coherent")
-                    mkpath(coherent_output_dir)
 
-                    coherent_basis = coherent_results.basis
+                # One file per crystal, either order. Coherent is indexed by crystal state Ψ, which
+                # is a mixture of monomer transitions and so has no per-transition decomposition;
+                # incoherent is indexed by monomer transition. The layout is otherwise the same, so
+                # the plotting does not care which it is beyond reading crystal_order.
+                if crystal_results !== nothing
+                    crystal_output_dir = joinpath(mol_output_dir, "crystal")
+                    mkpath(crystal_output_dir)
 
-                    coherent_path = joinpath(coherent_output_dir, "crystal_f_lm$(type_suffix).h5")
+                    coherent_basis = crystal_results.basis
+
+                    coherent_path = joinpath(crystal_output_dir, "crystal_f_lm$(type_suffix).h5")
                     h5open(coherent_path, "w") do io
-                        # Indexed by crystal state Ψ, ordered by ascending energy at each q.
-                        write(io, "state_f_lm", coherent_results.state_f_lm)
+                        # Which order (coherent or incoherent) produced this, so a reader knows what the first axis indexes.
+                        write(io, "crystal_order", crystal_results.order)
+
+                        # Coherent: crystal states Ψ, ordered by ascending energy at each q.
+                        # Incoherent: monomer transitions.
+                        write(io, "state_f_lm", crystal_results.state_f_lm)
 
                         # The unsquared form factor on the (q, θ, ϕ) grid, if it was asked for.
-                        if coherent_results.f_s !== nothing
-                            write(io, "f_s", coherent_results.f_s)
+                        if crystal_results.f_s !== nothing
+                            write(io, "f_s", crystal_results.f_s)
                             write(io, "theta_grid", theta_grid)
                             write(io, "phi_grid", phi_grid)
                         end
-                        write(io, "band_energy_min_eV", coherent_results.band_summary[:, 1])
-                        write(io, "band_energy_max_eV", coherent_results.band_summary[:, 2])
-                        write(io, "band_energy_mean_eV", coherent_results.band_summary[:, 3])
+                        if crystal_results.band_summary !== nothing
+                            write(io, "band_energy_min_eV", crystal_results.band_summary[:, 1])
+                            write(io, "band_energy_max_eV", crystal_results.band_summary[:, 2])
+                            write(io, "band_energy_mean_eV", crystal_results.band_summary[:, 3])
+                        end
 
                         # Unperturbed monomer energies, to compare against the bands above. Indexed by
                         # λ, so compare as sets rather than element by element. These are the diag(E)
@@ -1071,7 +1076,7 @@ function main()
                         write(io, "localised_energies_eV", coherent_basis.energies)
 
                         # Save the lattice vectors and image translations.
-                        write(io, "lattice_A", Matrix{T}(coherent_results.lattice.direct))
+                        write(io, "lattice_A", Matrix{T}(crystal_results.lattice.direct))
                         write(io, "image_translations_A",
                               reduce(hcat, [image.translation for image in coherent_basis.images]))
                         write(io, "image_of", coherent_basis.image_of)
@@ -1080,24 +1085,24 @@ function main()
                         # later:
                         #
                         #     H(k) = diag(E) + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
-                        if coherent_results.couplings !== nothing
+                        if crystal_results.couplings !== nothing
                             couplings_group = create_group(io, "couplings")
                             write(couplings_group, "method", coupling_method)
-                            write(couplings_group, "cell_vectors", reduce(hcat, coherent_results.cells.vectors))
+                            write(couplings_group, "cell_vectors", reduce(hcat, crystal_results.cells.vectors))
                             # The real-space sum over ΔR. Under "ewald" this is the short-range half
                             # alone, with the long-range self interaction already subtracted at ΔR = 0.
                             # Under "direct" it is the whole coupling, and there is no long_range group.
-                            write(couplings_group, "J_real_space_eV", coherent_results.couplings.values)
+                            write(couplings_group, "J_real_space_eV", crystal_results.couplings.values)
 
-                            if coherent_results.long_range !== nothing
-                                long_range = coherent_results.long_range
+                            if crystal_results.long_range !== nothing
+                                long_range = crystal_results.long_range
                                 # The reciprocal-space half, 𝒥^LR(k). It depends on k, so what is saved
                                 # is the ingredients that rebuild it rather than a table over ΔR.
                                 long_range_group = create_group(couplings_group, "long_range")
-                                write(long_range_group, "eta", coherent_results.ewald_parameters.eta)
-                                write(long_range_group, "epsilon", coherent_results.ewald_parameters.epsilon)
-                                write(long_range_group, "R_max", coherent_results.ewald_parameters.R_max)
-                                write(long_range_group, "Q_max", coherent_results.ewald_parameters.Q_max)
+                                write(long_range_group, "eta", crystal_results.ewald_parameters.eta)
+                                write(long_range_group, "epsilon", crystal_results.ewald_parameters.epsilon)
+                                write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max)
+                                write(long_range_group, "Q_max", crystal_results.ewald_parameters.Q_max)
                                 write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors))
                                 write(long_range_group, "f_table", long_range.f_table)
                                 write(long_range_group, "q_step", long_range.q_step)
@@ -1108,11 +1113,11 @@ function main()
                         end
 
                         # The band energies over a plane of the first Brillouin zone, if asked for.
-                        if !isempty(band_planes)
+                        if !isempty(crystal_results.band_planes)
                             band_group = create_group(io, "band_map")
-                            write(band_group, "planes", band_planes)
-                            for plane in band_planes
-                                (plane_axes, plane_energies) = band_maps[plane]
+                            write(band_group, "planes", crystal_results.band_planes)
+                            for plane in crystal_results.band_planes
+                                (plane_axes, plane_energies) = crystal_results.band_maps[plane]
                                 plane_group = create_group(band_group, plane)
                                 write(plane_group, "energies_eV", plane_energies)
                                 write(plane_group, "axis_a_keV", plane_axes[1])
@@ -1122,12 +1127,12 @@ function main()
 
                         # What went in.
                         write(io, "transition_indices", collect(transition_indices))
-                        write(io, "disorder_group", coherent_results.dominant_group)
-                        write(io, "disorder_group_occupancy", coherent_results.dominant_occupancy)
+                        write(io, "disorder_group", crystal_results.dominant_group)
+                        write(io, "disorder_group_occupancy", crystal_results.dominant_occupancy)
                         write(io, "q_grid", q_grid)
                     end
 
-                    println("Coherent crystal form factor saved to $(coherent_path).")
+                    println("$(titlecase(crystal_results.order)) crystal form factor saved to $(coherent_path).")
                 end
 
                 if compute_rates_flag

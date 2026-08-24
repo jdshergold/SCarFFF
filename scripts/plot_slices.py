@@ -226,7 +226,7 @@ def parse_cli_args():
         type=str,
         default=None,
         help="Transition indices to plot (spherical and Cartesian methods). Comma-separated. "
-             "Defaults to 1, or to every group in coherent crystal mode, where the whole point is "
+             "Defaults to 1, or to every group for an aggregate crystal output, where the point is "
              "to see all of them.",
     )
     parser.add_argument(
@@ -236,7 +236,7 @@ def parse_cli_args():
         default=None,
         choices=["xy", "xz", "yz"],
         help="Planes to plot. The options are xy (q_z=0), xz (q_y=0), and yz (q_x=0). Defaults to "
-             "xy, or to all three in coherent crystal mode, where they go in one figure.",
+             "xy, or to all three for an aggregate crystal output, where they go in one figure.",
     )
     parser.add_argument(
         "--modes",
@@ -265,19 +265,11 @@ def parse_cli_args():
         help="qz range to plot, given as 'min,max' in keV (e.g., '-5,5'). If not specified, the full data range will be plotted.",
     )
     parser.add_argument(
-        "--coherent",
-        action="store_true",
-        help="Plot the coherent crystal states rather than the per-transition crystal form factors "
-             "(spherical crystal runs only). --transition-indices then selects the crystal state Ψ, "
-             "ordered by ascending energy, and the data is read from crystal/coherent/.",
-    )
-    parser.add_argument(
         "--group-states",
         action="store_true",
-        help="In coherent mode, sum crystal states into groups rather than plotting each one, with "
-             "--transition-indices then selecting the group. Each group holds one block of "
-             "(molecules per cell) states per near-degenerate monomer transition, so that "
-             "interleaving states stay together.",
+        help="Group near-degenerate crystal contributions for plotting, with --transition-indices "
+             "then selecting the group. Coherent groups contain crystal states, whilst incoherent groups "
+             "contain monomer transitions.",
     )
     parser.add_argument(
         "--degeneracy-threshold",
@@ -381,21 +373,22 @@ def parse_cli_args():
         and parsed_args.results_root == runs_dir / "crystal"
     )
 
-    # In coherent mode the indices select crystal states Ψ rather than monomer transitions, and they
-    # all live in one file rather than one directory each.
+    # A crystal run puts everything in one file, named based on whatever method was used.
+    parsed_args.coherent = False
     parsed_args.coherent_path = None
-    if parsed_args.coherent:
-        if not parsed_args.crystal_mode:
-            print("--coherent only applies to spherical crystal runs.")
-            sys.exit(1)
+    parsed_args.crystal_order = None
+    if parsed_args.crystal_mode:
         for candidate in ["crystal_f_lm_f64.h5", "crystal_f_lm_f32.h5"]:
-            path = parsed_args.results_root / "coherent" / candidate
+            path = parsed_args.results_root / candidate
             if path.exists():
                 parsed_args.coherent_path = path
                 break
-        if parsed_args.coherent_path is None:
-            print(f"No coherent form factor file found under {parsed_args.results_root / 'coherent'}.")
-            sys.exit(1)
+
+    if parsed_args.coherent_path is not None:
+        with h5py.File(parsed_args.coherent_path, "r") as order_file:
+            order = order_file["crystal_order"][()] if "crystal_order" in order_file else b"coherent"
+        parsed_args.crystal_order = order.decode() if isinstance(order, bytes) else str(order)
+        parsed_args.coherent = True
 
         with h5py.File(parsed_args.coherent_path, "r") as coherent_file:
             # f_s is only written when the form factor itself was asked for, whereas state_f_lm
@@ -404,11 +397,19 @@ def parse_cli_args():
             parsed_args.has_grid = "f_s" in coherent_file
             n_states = coherent_file["state_f_lm"].shape[2]
             n_transitions = coherent_file["transition_indices"].shape[0]
+            parsed_args.n_molecules = len(np.unique(coherent_file["image_of"][()]))
             localised = coherent_file["localised_energies_eV"][()]
-            band_min = coherent_file["band_energy_min_eV"][()]
-            band_max = coherent_file["band_energy_max_eV"][()]
-            band_mean = coherent_file["band_energy_mean_eV"][()]
+            # Band statistics exist only for the coherent order, since the incoherent has no bands.
+            has_bands = "band_energy_mean_eV" in coherent_file
+            band_min = coherent_file["band_energy_min_eV"][()] if has_bands else None
+            band_max = coherent_file["band_energy_max_eV"][()] if has_bands else None
+            band_mean = coherent_file["band_energy_mean_eV"][()] if has_bands else None
 
+        # CHECKED TO HERE.
+
+        # Coherent groups run over crystal states, so each monomer transition contributes n_cell of
+        # them; incoherent groups run over the monomer transitions themselves, so n_cell is 1 and the
+        # same clustering gives one group per degenerate manifold either way.
         n_cell = n_states // n_transitions
         if parsed_args.group_states or parsed_args.group_size > 0:
             # The basis runs over transitions fastest, so the first block of localised energies is
@@ -421,14 +422,22 @@ def parse_cli_args():
             except ValueError as error:
                 print(error)
                 sys.exit(1)
-            for line in describe_groups(parsed_args.group_bounds, degeneracies, n_cell,
-                                        band_min, band_max, band_mean):
-                print(line)
+            if has_bands:
+                for line in describe_groups(parsed_args.group_bounds, degeneracies, n_cell,
+                                            band_min, band_max, band_mean):
+                    print(line)
+            else:
+                print(f"{parsed_args.n_groups if hasattr(parsed_args, 'n_groups') else len(parsed_args.group_bounds)} "
+                      f"groups from {n_transitions} monomer transitions "
+                      f"({parsed_args.crystal_order}):")
+                for index, (first, last) in enumerate(parsed_args.group_bounds):
+                    print(f"  group {index + 1:2d}: transitions {first + 1:3d}-{last:3d} "
+                          f"({last - first:2d}), mean {np.mean(localised[first:last]):.4f} eV")
         else:
             parsed_args.group_bounds = [(s, s + 1) for s in range(n_states)]
         parsed_args.n_groups = len(parsed_args.group_bounds)
 
-        # In coherent mode the indices are groups, and there is no reason to want only the first, so
+        # Aggregate crystal indices are groups, and there is no reason to want only the first, so
         # plot the lot unless the caller asked for particular ones.
         if parsed_args.transition_indices is None:
             parsed_args.transition_indices = ",".join(
@@ -439,50 +448,10 @@ def parse_cli_args():
         # Summing |f|^2 over a group discards the phase, so the signed modes have nothing to show.
         grouped = any(last - first > 1 for first, last in parsed_args.group_bounds)
         if grouped and any(m != "modsq" for m in parsed_args.modes):
-            print("Grouped coherent plots sum |f|^2, so only --modes modsq is available; "
+            print("Grouped crystal plots sum |f|^2, so only --modes modsq is available; "
                   "drop --group-states for the signed modes.")
             sys.exit(1)
         parsed_args.grouped = grouped
-
-    # The incoherent crystal path has no crystal states, so the same degeneracy clustering is applied
-    # to the monomer transitions instead.
-    parsed_args.transition_groups = None
-    if (parsed_args.crystal_mode and not parsed_args.coherent
-            and (parsed_args.group_states or parsed_args.group_size > 0)):
-        energies = []
-        transition = 1
-        while True:
-            directory = parsed_args.results_root / str(transition)
-            found = next((directory / c for c in ("fs_grid_f64.h5", "fs_grid_f32.h5")
-                          if (directory / c).exists()), None)
-            if found is None:
-                break
-            with h5py.File(found, "r") as transition_file:
-                energies.append(float(transition_file["conformer_transition_energies_eV"][()][0]))
-            transition += 1
-
-        if not energies:
-            print("No per transition crystal outputs found to group.")
-            sys.exit(1)
-
-        if parsed_args.group_size > 0:
-            clusters = [list(range(s, min(s + parsed_args.group_size, len(energies))))
-                        for s in range(0, len(energies), parsed_args.group_size)]
-        else:
-            clusters = cluster_monomer_transitions(np.array(energies),
-                                                   parsed_args.degeneracy_threshold)
-        parsed_args.transition_groups = [[i + 1 for i in cluster] for cluster in clusters]
-        parsed_args.n_groups = len(parsed_args.transition_groups)
-        parsed_args.grouped = any(len(g) > 1 for g in parsed_args.transition_groups)
-
-        print(f"{parsed_args.n_groups} groups from {len(energies)} monomer transitions:")
-        for index, group in enumerate(parsed_args.transition_groups):
-            mean_energy = float(np.mean([energies[i - 1] for i in group]))
-            print(f"  group {index + 1:2d}: transitions {group}, mean {mean_energy:.4f} eV")
-
-        if parsed_args.transition_indices is None:
-            parsed_args.transition_indices = ",".join(
-                str(group) for group in range(1, parsed_args.n_groups + 1))
 
     return parsed_args
 
@@ -864,7 +833,8 @@ def build_flm_style_map(modes):
     return style_map
 
 
-def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_map=None):
+def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_map=None,
+                   ylabel=None):
     """
     Plot the top N f^2_{lm}(q) modes on a single set of axes.
 
@@ -876,6 +846,7 @@ def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_
     - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
     - top_modes::list or None: Optional list of (l, m) modes to plot.
     - style_map::dict or None: Optional style map keyed by (l, m).
+    - ylabel::str or None: Optional y-axis label.
     """
     # Find the top modes if not provided.
     if top_modes is None:
@@ -892,14 +863,14 @@ def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_
 
     ax.axhline(0, color="k", lw=0.8, ls="--")
     ax.set_xlabel(r"$q\ [\mathrm{keV}]$")
-    ax.set_ylabel(r"$f^2_{\ell m}(q)$")
+    ax.set_ylabel(ylabel or r"$f^2_{\ell m}(q)$")
     ax.set_xlim(q_grid[0], q_grid[-1])
     ax.legend(fontsize=8, ncol=2, title=r"Dominant modes: $(\ell,\,m)$", title_fontsize=8)
     if title is not None:
         ax.set_title(title)
 
 
-def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
+def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8, ylabel=None):
     """
     Plot the top N f^2_{lm}(q) modes by integrated absolute area on a single set of axes.
     Lines are grouped by l (same colour) with distinct linestyles for different m.
@@ -909,16 +880,18 @@ def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8):
     - q_grid::np.ndarray: The |q| grid in keV.
     - output_dir::Path: Directory to save the output plot.
     - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
+    - ylabel::str or None: Optional y-axis label.
     """
     fig, ax = plt.subplots(figsize=(7, 4))
-    plot_flm_panel(ax, f_lm, q_grid, top_n=top_n)
+    plot_flm_panel(ax, f_lm, q_grid, top_n=top_n, ylabel=ylabel)
     fig.tight_layout()
 
     fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, output_dir, top_n=8):
+def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, output_dir, top_n=8,
+                           ylabel=None):
     """
     Plot the aggregate crystal f^2_{lm}(q) modes together with each conformer contribution.
 
@@ -929,6 +902,7 @@ def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, outpu
     - q_grid::np.ndarray: The |q| grid in keV.
     - output_dir::Path: Directory to save the output plot.
     - top_n::int: Number of top modes to plot per panel, ranked by integrated absolute area (default: 8).
+    - ylabel::str or None: Optional y-axis label for the aggregate crystal panel.
     """
     # Find the top modes for the whole crystal and each conformer.
     crystal_top_modes = get_top_flm_modes(f_lm, q_grid, top_n=top_n)
@@ -944,7 +918,8 @@ def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, outpu
     n_panels = 1 + len(conformer_titles)
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 4.5), squeeze=False, sharex=True)
 
-    plot_flm_panel(axes[0, 0], f_lm, q_grid, title="Crystal aggregate", top_n=top_n, top_modes=crystal_top_modes, style_map=style_map)
+    plot_flm_panel(axes[0, 0], f_lm, q_grid, title="Crystal aggregate", top_n=top_n,
+                   top_modes=crystal_top_modes, style_map=style_map, ylabel=ylabel)
     for panel_idx, conformer_title in enumerate(conformer_titles, start=1):
         plot_flm_panel(
             axes[0, panel_idx],
@@ -1021,7 +996,7 @@ def main():
     # The slices need the (q, θ, ϕ) grid. The f_lm modes and the bands do not.
     slices_available = not args.coherent or getattr(args, "has_grid", True)
     if not slices_available:
-        print("No f_s in the coherent output, so there are no slices to plot. Re-run with "
+        print("No f_s in the crystal output, so there are no slices to plot. Re-run with "
               "--compute-mode including form_factor if the group slice plots are wanted.")
 
     # Check if molecule directory exists.
@@ -1074,23 +1049,6 @@ def main():
             input_path = args.coherent_path
             output_dir = args.coherent_path.parent / (
                 f"group_{tidx}" if args.grouped else f"state_{tidx}")
-        elif getattr(args, "transition_groups", None) is not None:
-            group = int(tidx)
-            if not 1 <= group <= args.n_groups:
-                print(f"  Group {group} is out of range, the run has {args.n_groups}.")
-                return []
-            members = args.transition_groups[group - 1]
-            tdir = get_transition_dir(members[0])
-            base = "fs_grid"
-            input_path = None
-            for candidate in [tdir / f"{base}_f64.h5", tdir / f"{base}_f32.h5"]:
-                if candidate.exists():
-                    input_path = candidate
-                    break
-            if input_path is None:
-                print(f"No {args.method} form factor file found for transition {members[0]}.")
-                return []
-            output_dir = args.results_root / f"group_{group}"
         else:
             tdir = get_transition_dir(tidx)
             base = "fs_grid"
@@ -1130,19 +1088,28 @@ def main():
                             print(f"  Group {group} is out of range, the run has {args.n_groups}.")
                             return []
                         first, last = args.group_bounds[group - 1]
-                        # Per member normalisation, so groups of different size are comparable and
-                        # each plot is a per molecule intensity: |f|^2 sums divide by N, and an
-                        # unsquared f divides by sqrt(N) so that squaring it gives the same 1/N.
+                        # Normalise each plotted group per molecule. The coherent grid holds complex
+                        # state amplitudes, while each incoherent entry already holds an intensity
+                        # summed over every molecular image.
                         n_members = last - first
-                        if n_members == 1:
-                            # A single state keeps its phase, so the signed modes still work.
+                        stored_is_intensity = args.crystal_order == "incoherent" # If incoherent, then the stored data is |f|^2.
+
+                        if stored_is_intensity:
+                            f_s = None
+                            for state in range(first, last):
+                                contribution = ff_file["f_s"][:, :, :, state]
+                                f_s = contribution if f_s is None else f_s + contribution
+                            f_s = f_s / (args.n_molecules * n_members)
+                        elif n_members == 1:
+                            # A single state keeps its phase, so the signed modes still work, and
+                            # sqrt(1) leaves the amplitude alone.
                             f_s = ff_file["f_s"][:, :, :, first]
                         else:
                             f_s = None
                             for state in range(first, last):
                                 contribution = np.abs(ff_file["f_s"][:, :, :, state]) ** 2
                                 f_s = contribution if f_s is None else f_s + contribution
-                            f_s = f_s / n_members
+                            f_s = f_s / n_members # N_members = N_mol * N_degen for the coherent case.
                     else:
                         f_s = ff_file["f_s"][()]
 
@@ -1155,36 +1122,14 @@ def main():
                 f_lm = None
                 conformer_f_lm = None
                 conformer_titles = None
-                if args.plot_flm_modes and args.coherent and "state_f_lm" in ff_file:
-                    # In coherent mode the f_lm belongs to the crystal states, not to the monomer
-                    # transitions, so take the group's states and sum them. That is the same sum the
-                    # slices above show, so the two panels of a group describe the same object.
+                if args.plot_flm_modes and "state_f_lm" in ff_file:
+                    # Average the plotted group, matching the slice above. Incoherent entries just divided by N instad.
                     first, last = args.group_bounds[int(tidx) - 1]
                     f_lm = ff_file["state_f_lm"][:, :, first:last].mean(axis=2).T
+                    if args.crystal_order == "incoherent":
+                        f_lm = f_lm / args.n_molecules
                 elif args.plot_flm_modes and "f_lm" in ff_file:
                     f_lm = ff_file["f_lm"][()].T
-                    if getattr(args, "transition_groups", None) is not None:
-                        # Average the cluster, matching the coherent groups' per member norm.
-                        members = args.transition_groups[int(tidx) - 1]
-                        for member in members[1:]:
-                            member_dir = get_transition_dir(member)
-                            member_path = next(
-                                (member_dir / c for c in ("fs_grid_f64.h5", "fs_grid_f32.h5")
-                                 if (member_dir / c).exists()), None)
-                            if member_path is None:
-                                continue
-                            with h5py.File(member_path, "r") as member_file:
-                                f_lm = f_lm + member_file["f_lm"][()].T
-                        f_lm = f_lm / len(members)
-                    if "conformer_f_lm" in ff_file:
-                        conformer_f_lm = np.transpose(ff_file["conformer_f_lm"][()], (2, 1, 0))
-
-                    # Construct the titles for each conformer.
-                    if "conformer_labels" in ff_file:
-                        conformer_titles = [
-                            f"Conformer {label.decode('utf-8') if isinstance(label, bytes) else str(label)}"
-                            for label in ff_file["conformer_labels"][()]
-                        ]
                 elif args.plot_flm_modes:
                     print(f"  Warning: f_lm not found for transition {tidx}. Was f_lm_tensor included in COMPUTE_MODES?")
                 
@@ -1288,10 +1233,19 @@ def main():
             # Plot the f_lm^2 coefficients.
             elif plot_type == "flm_modes":
                 if run_outputs[5] is not None:
+                    flm_ylabel = None
+                    if args.crystal_order == "incoherent":
+                        flm_ylabel = (r"$\frac{1}{N}\sum_{(i,s)\in g} "
+                                      r"f^2_{\ell m,i s}(q)$")
+                    elif args.crystal_order == "coherent" and args.grouped:
+                        flm_ylabel = (r"$\frac{1}{N}\sum_{\Psi\in g} "
+                                      r"f^2_{\ell m,\Psi}(q)$")
                     if run_outputs[6] is not None and run_outputs[7] is not None:
-                        plot_crystal_flm_modes(run_outputs[5], run_outputs[6], run_outputs[7], run_outputs[3], output_dir)
+                        plot_crystal_flm_modes(run_outputs[5], run_outputs[6], run_outputs[7],
+                                               run_outputs[3], output_dir, ylabel=flm_ylabel)
                     else:
-                        plot_flm_modes(run_outputs[5], run_outputs[3], output_dir)
+                        plot_flm_modes(run_outputs[5], run_outputs[3], output_dir,
+                                       ylabel=flm_ylabel)
                 completed += 1
                 print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
                 continue
@@ -1338,9 +1292,26 @@ def main():
 
                     # Extract the domain data.
                     domain_is_complex = np.iscomplexobj(plane_data)
+                    already_squared = (args.crystal_order is not None
+                                       and not np.iscomplexobj(plane_data))
                     plot_data, cbar_label, cmap, symmetric = extract_domain_data(
-                        plane_data, mode, already_squared=args.coherent and args.grouped
+                        # The incoherent grid holds |f|^2 already.
+                        plane_data, mode, already_squared=already_squared
                     )
+
+                    if args.crystal_order == "incoherent":
+                        cbar_label = (r"$\frac{1}{N}\sum_{(i,s)\in g} "
+                                      r"|f_{i,s}(\mathbf{q})|^2$")
+                    elif args.crystal_order == "coherent" and already_squared:
+                        cbar_label = (r"$\frac{1}{N}\sum_{\Psi\in g} "
+                                      r"|f_{\Psi}(\mathbf{q})|^2$")
+                    elif args.crystal_order == "coherent":
+                        state_labels = {
+                            "modsq": r"$|f_{\Psi}(\mathbf{q})|^2$",
+                            "Re": r"$\mathrm{Re}[f_{\Psi}(\mathbf{q})]$",
+                            "Im": r"$\mathrm{Im}[f_{\Psi}(\mathbf{q})]$",
+                        }
+                        cbar_label = state_labels[mode]
 
                     # Apply the plot limits.
                     coord1, coord2, plot_data, xlim, ylim = apply_plot_limits(
@@ -1377,6 +1348,9 @@ def main():
                     ax.set_xlim(xlim)
                     ax.set_ylim(ylim)
                     ax.set_aspect("equal", adjustable="box")
+                    fixed_coordinate = {"xy": "z", "xz": "y", "yz": "x"}[plane]
+                    coordinate = "" if is_transition_density else "q_"
+                    ax.set_title(rf"${coordinate}{fixed_coordinate}=0$")
 
                     # Add the colourbar for each subplot.
                     cbar = fig.colorbar(pcm, ax=ax, pad=0.02, fraction=0.046)

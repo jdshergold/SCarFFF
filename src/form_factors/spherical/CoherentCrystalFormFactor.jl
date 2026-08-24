@@ -20,7 +20,8 @@ using ...ThreadChunks: chunk_count, chunk_range
 
 const VSDM = VectorSpaceDarkMatter
 
-export rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm
+export rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
+       compute_incoherent_crystal_f_lm
 
 function rotate_R_tensors(
         conformer_R_tensors::Vector{Array{Complex{T}, 3}},
@@ -102,6 +103,49 @@ function rotate_R_tensors(
     end
 
     return rotated
+end
+
+@inline function contract_monomer_amplitudes!(
+        amplitudes::Vector{Complex{T}},
+        rotated_R::Array{Complex{T}, 3},
+        q_idx::Int,
+        Yvals,
+        l_max::Int,
+        n_lambda::Int,
+    ) where {T<:AbstractFloat}
+    """
+    Contract the rotated coefficients with the spherical harmonics at one grid direction,
+
+        f^{(A_i,s)}(q) = Σ_{lμ} f̄^{(A_i,s)}_{lμ}(q) Y_l^μ(q̂),
+
+    giving the localised molecular amplitude of every λ = (A_i, s) at this q. The harmonics are
+    shared across λ, so they are evaluated once by the caller and passed in.
+
+    # Arguments:
+    - amplitudes::Vector{Complex{T}}: Output, one amplitude per λ.
+    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients, dimensions (n_lambda, n_q, n_keys).
+    - q_idx::Int: Which |q| point to contract.
+    - Yvals: The spherical harmonics at this direction, indexed by (l, m).
+    - l_max::Int: The maximum angular momentum mode.
+    - n_lambda::Int: The number of localised excitations.
+
+    # Returns:
+    - Nothing. amplitudes is written in place.
+    """
+
+    @inbounds for lambda in 1:n_lambda
+        amplitude = zero(Complex{T})
+        for l in 0:l_max
+            # Convert l to the key index, up to the factor of m.
+            key_base = l * l + l + 1
+            for m in -l:l
+                amplitude += rotated_R[lambda, q_idx, key_base + m] * Complex{T}(Yvals[(l, m)])
+            end
+        end
+        amplitudes[lambda] = amplitude
+    end
+
+    return nothing
 end
 
 function build_lambda_permutations(
@@ -305,18 +349,8 @@ function compute_coherent_crystal_form_factor(
 
                         # Contract the rotated coefficients with the shared spherical harmonics to
                         # get each localised molecular amplitude at this q.
-                        @inbounds for lambda in 1:n_lambda
-                            amplitude = zero(Complex{T})
-                            for l in 0:l_max
-                                # Convert l to the key index, up to the factor of m.
-                                key_base = l * l + l + 1
-                                for m in -l:l
-                                    # Form f_lm * Y_lm, the form factor (per molecule and transition) at this grid point.
-                                    amplitude += rotated_R[lambda, q_idx, key_base + m] * Complex{T}(Yvals[(l, m)])
-                                end
-                            end
-                            monomer_amplitude[lambda] = amplitude
-                        end
+                        contract_monomer_amplitudes!(monomer_amplitude, rotated_R, q_idx, Yvals,
+                                                     l_max, n_lambda)
 
                         # Apply the exp(i q . τ) phase that places each molecule in the cell.
                         # First compute the phase for each image.
@@ -387,6 +421,129 @@ function compute_coherent_crystal_form_factor(
 
     return f_sq, band_stats, f_s
 end
+
+
+function compute_incoherent_crystal_f_lm(
+        rotated_R::Array{Complex{T}, 3},
+        basis::CrystalExcitationBasis{T},
+        q_grid_invA::Vector{T},
+        theta_grid::Vector{T},
+        phi_grid::Vector{T},
+        l_max::Int;
+        q_block::Int = 8,
+        need_grid::Bool = false,
+    ) where {T<:AbstractFloat}
+    """
+    Compute the incoherent crystal form factor and project it onto real spherical harmonics.
+
+    This is the zeroth-order approximation: the images of the unit cell are added in intensity rather
+    than in amplitude, so per monomer transition s,
+
+        |f_{s,uc}(q)|² = Σ_{A_i} |f^{(A_i,s)}(q)|²,     f^{(A_i,s)}(q) = Σ_{lμ} f̄^{(A_i,s)}_{lμ}(q) Y_l^μ(q̂),
+
+    with no relative phases and no mixing between molecules.
+
+    # Arguments:
+    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients, dimensions (n_lambda, n_q, n_keys).
+    - basis::CrystalExcitationBasis{T}: The localised excitation basis.
+    - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
+    - theta_grid::Vector{T}: The θ grid, in radians.
+    - phi_grid::Vector{T}: The ϕ grid, in radians.
+    - l_max::Int: The maximum angular momentum mode.
+    - q_block::Int: How many q points to process at a time (default: 8).
+    - need_grid::Bool: Whether to also return |f|² on the full grid.
+
+    # Returns:
+    - f_lm::Array{T, 3}: The real spherical harmonic coefficients, dimensions (n_transitions, n_q, n_keys).
+    - f_s::Union{Array{T, 4}, Nothing}: |f|² on the grid if need_grid is set, with dimensions
+      (n_transitions, n_q, n_theta, n_phi), otherwise nothing. Unlike the coherent form factor this is
+      real: intensities are added, so there is no phase left to carry.
+    """
+
+    # Get the dimensions.
+    n_lambda = length(basis.energies)
+    n_transitions = basis.n_transitions
+    n_q = length(q_grid_invA)
+    n_theta = length(theta_grid)
+    n_phi = length(phi_grid)
+    n_keys = (l_max + 1)^2
+
+    # Check the dimensions are correct.
+    size(rotated_R, 3) == n_keys ||
+        error("The rotated coefficients have $(size(rotated_R, 3)) keys, which does not match l_max = $(l_max).")
+
+    A_real, A_imag = build_projection_matrices(theta_grid, phi_grid, l_max)
+    U_blocks = build_U_blocks(l_max, T)
+
+    f_lm = Array{T, 3}(undef, n_transitions, n_q, n_keys)
+    f_s = need_grid ? Array{T, 4}(undef, n_transitions, n_q, n_theta, n_phi) : nothing
+
+    transition_of_lambda = basis.transition_of
+
+    # Avoid BLAS oversubscription.
+    blas_threads = BLAS.get_num_threads()
+    BLAS.set_num_threads(1)
+    try
+
+    # Build the 3D grid.
+    for q_start in 1:q_block:n_q
+        q_stop = min(q_start + q_block - 1, n_q)
+        q_indices = q_start:q_stop
+        n_q_block = length(q_indices)
+
+        f_sq_block = Array{T, 4}(undef, n_transitions, n_q_block, n_theta, n_phi)
+
+        n_chunks = chunk_count(n_theta, nthreads())
+        @sync for chunk in 1:n_chunks
+            Threads.@spawn begin
+                Ylm_cache = SphericalHarmonics.cache(l_max, SphericalHarmonics.FullRange)
+                monomer_amplitude = Vector{Complex{T}}(undef, n_lambda)
+
+                for theta_idx in chunk_range(chunk, n_chunks, n_theta)
+                    theta = theta_grid[theta_idx]
+                    computePlmcostheta!(Ylm_cache, theta, l_max)
+
+                    for phi_idx in 1:n_phi
+                        computeYlm!(Ylm_cache, theta, phi_grid[phi_idx], l_max)
+                        Yvals = SphericalHarmonics.getY(Ylm_cache)
+
+                        for (q_local, q_idx) in enumerate(q_indices)
+                            contract_monomer_amplitudes!(monomer_amplitude, rotated_R, q_idx, Yvals,
+                                                         l_max, n_lambda)
+
+                            # Add in intensity, gathering the images of each monomer transition.
+                            @inbounds for transition in 1:n_transitions
+                                f_sq_block[transition, q_local, theta_idx, phi_idx] = zero(T)
+                            end
+                            @inbounds for lambda in 1:n_lambda
+                                transition = transition_of_lambda[lambda]
+                                f_sq_block[transition, q_local, theta_idx, phi_idx] +=
+                                    abs2(monomer_amplitude[lambda])
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        project_block!(f_lm, f_sq_block, A_real, A_imag, U_blocks, q_start, l_max)
+
+        if f_s !== nothing
+            @inbounds for phi_idx in 1:n_phi, theta_idx in 1:n_theta,
+                          (q_local, q_idx) in enumerate(q_indices), transition in 1:n_transitions
+                f_s[transition, q_idx, theta_idx, phi_idx] =
+                    f_sq_block[transition, q_local, theta_idx, phi_idx]
+            end
+        end
+    end
+
+    finally
+        BLAS.set_num_threads(blas_threads)
+    end
+
+    return f_lm, f_s
+end
+
 
 function compute_coherent_crystal_f_lm(
         rotated_R::Array{Complex{T}, 3},

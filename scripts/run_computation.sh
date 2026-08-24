@@ -8,7 +8,7 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="benzene_test_frenkel"     # Name for this run.
+RUN_NAME="benzene_test_norm_coherent"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
@@ -20,15 +20,16 @@ CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF fil
 # ==== Crystal parameters (crystal mode only). ====
 CRYSTAL_ORDER="coherent"    # How to combine the monomer form factors. "coherent" solves the Frenkel
                             # exciton Bloch problem and mixes amplitudes before squaring; "incoherent"
-                            # just adds |f|^2 over the images. Everything below is coherent-only.
+                            # just adds |f|^2 over the images. Both produce the same outputs, except
+                            # that only the coherent one has bands.
 BAND_MAP_PLANE="all"        # Cartesian plane(s) to sample the band energies E(k) over, matching the
                             # form factor slices: "all", or one of xy (k_z=0), xz (k_y=0), yz (k_x=0),
                             # or "none" to skip.
 
 
 # ==== TD-DFT parameters. ====
-BASIS="def2-svp"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="6-31g*"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
@@ -40,8 +41,8 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
-Q_MAX=25.0                 # Maximum momentum transfer in keV.
-N_Q=251                    # Number of |q| grid points.
+Q_MAX=20.0                 # Maximum momentum transfer in keV.
+N_Q=101                    # Number of |q| grid points.
 # Angular grid. Leave these at 0 to size them from L_MAX, which is what the projection onto
 # spherical harmonics actually needs: |f|^2 is quadratic in the form factor so it carries content up
 # to 2*L_MAX, giving 4*L_MAX+1 points. Setting them larger costs time and buys nothing.
@@ -49,11 +50,11 @@ N_THETA=0                  # Number of theta (polar angle) grid points, or 0 to 
 N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 to size from L_MAX.
 
 # Spherical harmonic expansion parameters.
-L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
+L_MAX=12                   # Maximum angular mode, l, to include in spherical harmonic expansion.
 COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
-COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor.
+COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor. Not supported for coherent crystals.
 M_GRID="1.0,1000.0,100"   # DM mass grid to use, in the form min_MeV,max_MeV,N (log-spaced). Only used if COMPUTE_RATES=true.
 N_ROTATIONS="12,6,12"     # Number of detector rotations to consider (n_alpha,n_beta,n_gamma). Only used if COMPUTE_RATES=true.
 
@@ -151,10 +152,16 @@ lowercase() {
 
 CARTESIAN_COMPUTE_MODE_LC="$(lowercase "$CARTESIAN_COMPUTE_MODE")"
 TRANSITION_INDICES_LC="$(lowercase "$TRANSITION_INDICES")"
+CRYSTAL_ORDER_LC="$(lowercase "$CRYSTAL_ORDER")"
 
 CRYSTAL_MODE=false
 if [ -n "$CIF_FILE" ] || [ -n "$CIF_DIR" ]; then
     CRYSTAL_MODE=true
+fi
+
+if [ "$CRYSTAL_MODE" = true ] && [ "$CRYSTAL_ORDER_LC" = "coherent" ] && [ "$COMPUTE_RATES" = true ]; then
+    echo "Error: scattering rates are not supported for coherent crystal form factors because the rate calculation does not yet use the crystal band energies." >&2
+    exit 1
 fi
 
 # Remove any CUDA entries from paths so that julia stops complaining.
@@ -566,15 +573,11 @@ else
             if [ "$CRYSTAL_MODE" = true ]; then
                 # Coherent crystal outputs get the grouped slices under group_n/ plus the band
                 # energies over the first Brillouin zone, in one pass.
-                if [ -d "$MOL_DIR/crystal/coherent" ]; then
-                    # The coherent output supersedes the incoherent one, which is not computed at
-                    # all under --crystal-order coherent, so there is nothing per transition to plot.
-                    $PYTHON_BIN plot_slices.py --run-name "$RUN_NAME" --molecule-number "$MOL_NUM" \
-                        --method spherical --results-dir crystal --coherent --group-states \
-                        $FLM_MODES_ARG || echo "  Coherent crystal plotting failed."
-                else
-                    run_slice_plots "$MOL_NUM" "crystal" true
-                fi
+                # Both crystal orders write one file with the same layout, and the plotting reads
+                # which order it holds from the file, so there is a single call either way.
+                $PYTHON_BIN plot_slices.py --run-name "$RUN_NAME" --molecule-number "$MOL_NUM" \
+                    --method spherical --results-dir crystal --group-states \
+                    $FLM_MODES_ARG || echo "  Crystal plotting failed."
                 for conformer_dir in "$MOL_DIR"/conformers/*; do
                     [ -d "$conformer_dir" ] || continue
                     conformer_label=$(basename "$conformer_dir")

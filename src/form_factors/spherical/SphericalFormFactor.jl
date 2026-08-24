@@ -44,7 +44,8 @@ using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings, 
                   image_translation_span
 using .CrystalSymmetry: SymmetryOperation, Stars, derive_symmetry_operations,
                         build_stars, star_reduction_factor, choose_compatible_phi_count
-using .CoherentCrystalFormFactor: rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm
+using .CoherentCrystalFormFactor: rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
+                                  compute_incoherent_crystal_f_lm
 
 using .ComputeRates: compute_rates, compute_rates_by_orientation, combine_crystal_rate_grids
 
@@ -52,7 +53,8 @@ using BenchmarkTools
 
 export compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids,
        build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis, rotate_R_tensors,
-       compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm, project_f_lm,
+       compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
+       compute_incoherent_crystal_f_lm, project_f_lm,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range, subtract_self_term!,
        image_translation_span, supercell_radius
 
