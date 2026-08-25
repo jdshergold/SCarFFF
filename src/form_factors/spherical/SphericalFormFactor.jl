@@ -10,6 +10,7 @@ include("../../precomputation/PrecomputeGaunt.jl")
 include("../../precomputation/PrecomputeATensor.jl")
 include("ConstructWTensor.jl")
 include("ConstructRTensor.jl")
+include("DensityFormFactors.jl")
 include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
@@ -34,27 +35,36 @@ using .PrecomputeGaunt: precompute_gaunt_coefficients
 using .PrecomputeATensor: precompute_A_tensor
 using .ConstructWTensor: construct_W_tensor
 using .ConstructRTensor: construct_R_tensor
+using .DensityFormFactors: split_density_R_tensors
 using .ContractSphericalGrid: contract_spherical_grid
 using .ConstructCrystalTensor: construct_crystal_f_lm_tensors
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
-using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range, supercell_radius
-using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis
+using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
+              compute_ewald_diagonal, supercell_radius
+using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis,
+                         set_diagonal_corrections!
 using .ProjectFLM: project_f_lm, default_angular_grid
-using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings, subtract_self_term!,
+using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings,
+                  compute_crystal_corrections, subtract_self_term!,
                   image_translation_span
 using .CrystalSymmetry: SymmetryOperation, Stars, derive_symmetry_operations,
                         build_stars, star_reduction_factor, choose_compatible_phi_count
-using .CoherentCrystalFormFactor: rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
+using .CoherentCrystalFormFactor: rotate_R_tensors, rotate_crystal_R_tensors,
+                                  compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
                                   compute_incoherent_crystal_f_lm
 
 using .ComputeRates: compute_rates, compute_rates_by_orientation, combine_crystal_rate_grids
 using ..StageTimings: print_stage_timings, time_stage!
 
-export compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids,
-       build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis, rotate_R_tensors,
+export compute_spherical_form_factor, compute_spherical_form_factor_with_densities,
+       compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids,
+       build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis,
+       set_diagonal_corrections!, compute_crystal_corrections,
+       rotate_R_tensors, rotate_crystal_R_tensors,
        compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
        compute_incoherent_crystal_f_lm, project_f_lm,
-       default_angular_grid, choose_ewald_parameters, build_ewald_long_range, subtract_self_term!,
+       default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
+       compute_ewald_diagonal, subtract_self_term!,
        image_translation_span, supercell_radius
 
 @inline function combine_gpu_R_tensor(R_pos, R_neg, l_max::Int)
@@ -106,7 +116,7 @@ export compute_spherical_form_factor, compute_rates, compute_rates_by_orientatio
     return combined
 end
 
-function compute_spherical_form_factor(
+function _compute_spherical_form_factor(
         q_grid::Vector{T},
         theta_grid::Vector{T},
         phi_grid::Vector{T},
@@ -119,7 +129,8 @@ function compute_spherical_form_factor(
         need_grid::Bool = true,
         need_R::Bool = true,
         need_flm::Bool = true,
-    )::Tuple{Union{Array{Complex{T}, 3}, Nothing}, Union{Array{Complex{T}, 4}, Nothing}, Union{Array{T, 3}, Nothing}, Vector{T}} where {T<:AbstractFloat}
+        need_xi_and_dN::Bool = false,
+    ) where {T<:AbstractFloat}
     """
     Compute the spherical form factor f_s(q, θ, ϕ) on a spherical grid up to some angular mode ℓ_max.
 
@@ -136,12 +147,14 @@ function compute_spherical_form_factor(
     - need_grid::Bool: Whether to contract the R tensor to compute the form factor on the grid (default: true).
     - need_R::Bool: Whether to save the R tensor (default: true).
     - need_flm::Bool: Whether to compute the f_lm tensor (default: false).
+    - need_xi_and_dN::Bool: Whether to also construct ΔN and Ξ for the crystal correction.
 
     # Returns:
     - R_tensor::Union{Array{Complex{T}, 3}, Nothing}: The prefactored R tensor keyed by ℓ^2 + (ℓ + m) + 1, or nothing if not requested for saving.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The form factor on the (q, θ, ϕ) grid with shape (n_transitions, n_q, n_θ, n_ϕ), or nothing if not requested.
     - f_lm::Union{Array{Complex{T}, 3}, Nothing}: The f_lm tensor, the ``squared'' verision of the R tensor, with shape (n_transitions, n_q, n_flm_keys), or nothing if not requested.
     - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
+    - xi_and_dN: The difference and neutral ground-charge R tensors, or nothing.
     """
 
     stage_times = Pair{String, Float64}[]
@@ -203,10 +216,17 @@ function compute_spherical_form_factor(
 
     # Extract the transition matrices for the requested transitions.
     transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
+    density_matrices = copy(transition_matrices)
+    if need_xi_and_dN
+        push!(density_matrices, mol.ground_state_matrix)
+        append!(density_matrices, [mol.difference_matrices[idx] for idx in transition_indices])
+    end
+    n_transitions = length(transition_matrices)
 
     R_lm = nothing
     f_s = nothing
     f_lm = nothing
+    xi_and_dN = nothing
 
     if use_gpu
         # Now construct the R tensor on the GPU.
@@ -224,7 +244,7 @@ function compute_spherical_form_factor(
                 lambda_max,
                 n_max,
                 gaunt_path,
-                transition_matrices,
+                density_matrices,
                 mol.cartesian_term_to_orbital;
                 threshold = threshold_T
             )
@@ -234,8 +254,11 @@ function compute_spherical_form_factor(
 
         if need_grid
             # Contract with the angular grid to get the form factor on the GPU.
+            transition_pos = need_xi_and_dN ? R_lm_pos[1:n_transitions, :, :] : R_lm_pos
+            transition_neg = need_xi_and_dN ? R_lm_neg[1:n_transitions, :, :] : R_lm_neg
             f_s_gpu = time_stage!(stage_times, "spherical grid (GPU)") do
-                result = ContractSphericalGridGPU.contract_spherical_grid_gpu(R_lm_pos, R_lm_neg, theta_grid, phi_grid)
+                result = ContractSphericalGridGPU.contract_spherical_grid_gpu(
+                    transition_pos, transition_neg, theta_grid, phi_grid)
                 CUDA.synchronize()
                 result
             end
@@ -243,11 +266,21 @@ function compute_spherical_form_factor(
                 Array(f_s_gpu)
             end
             CUDA.unsafe_free!(f_s_gpu)
+            need_xi_and_dN && CUDA.unsafe_free!(transition_pos)
+            need_xi_and_dN && CUDA.unsafe_free!(transition_neg)
         end
 
-        if need_R || need_flm
-            R_lm = time_stage!(stage_times, "copy and combine R tensor") do
+        if need_R || need_flm || need_xi_and_dN
+            all_R = time_stage!(stage_times, "copy and combine R tensor") do
                 combine_gpu_R_tensor(R_lm_pos, R_lm_neg, l_max)
+            end
+            if need_xi_and_dN
+                R_lm, difference_R, Xi_R = split_density_R_tensors(
+                    all_R, n_transitions, mol.atom_coordinates, mol.nuclear_charges,
+                    q_grid, l_max; threshold = threshold_T)
+                xi_and_dN = (difference_R = difference_R, Xi_R = Xi_R)
+            else
+                R_lm = all_R
             end
         end
 
@@ -269,7 +302,7 @@ function compute_spherical_form_factor(
 
     else
         # Construct R tensor on the CPU.
-        R_lm = time_stage!(stage_times, "R tensor") do
+        all_R = time_stage!(stage_times, need_xi_and_dN ? "R tensors (transition, ΔN, Ξ)" : "R tensor") do
             construct_R_tensor(
                 W_ij,
                 sigma_ij,
@@ -278,9 +311,17 @@ function compute_spherical_form_factor(
                 q_grid,
                 l_max,
                 gaunt_path,
-                transition_matrices,
+                density_matrices,
                 mol.cartesian_term_to_orbital,
             )
+        end
+        if need_xi_and_dN
+            R_lm, difference_R, Xi_R = split_density_R_tensors(
+                all_R, n_transitions, mol.atom_coordinates, mol.nuclear_charges,
+                q_grid, l_max; threshold = threshold_T)
+            xi_and_dN = (difference_R = difference_R, Xi_R = Xi_R)
+        else
+            R_lm = all_R
         end
 
         if need_grid
@@ -309,7 +350,37 @@ function compute_spherical_form_factor(
 
     print_stage_timings("Spherical form-factor stage timings", stage_times)
 
-    return R_lm, f_s, f_lm, transition_energies_eV
+    return R_lm, f_s, f_lm, transition_energies_eV, xi_and_dN
+end
+
+function compute_spherical_form_factor(args...; kwargs...)
+    """
+    Compute the molecular spherical form factor only.
+
+    # Arguments:
+    - args: Positional arguments accepted by _compute_spherical_form_factor.
+    - kwargs: Molecular form-factor keyword arguments.
+
+    # Returns:
+    - Tuple: R, the angular-grid form factor, f_lm and transition energies.
+    """
+    R_lm, f_s, f_lm, energies, _ = _compute_spherical_form_factor(
+        args...; kwargs..., need_xi_and_dN = false)
+    return R_lm, f_s, f_lm, energies
+end
+
+function compute_spherical_form_factor_with_densities(args...; kwargs...)
+    """
+    Compute the spherical form factor together with the ΔN and Ξ tensors used by a crystal.
+
+    # Arguments:
+    - args: Positional arguments accepted by _compute_spherical_form_factor.
+    - kwargs: Molecular form-factor keyword arguments.
+
+    # Returns:
+    - Tuple: The four molecular outputs and a named tuple containing difference_R and Xi_R.
+    """
+    return _compute_spherical_form_factor(args...; kwargs..., need_xi_and_dN = true)
 end
 
 end

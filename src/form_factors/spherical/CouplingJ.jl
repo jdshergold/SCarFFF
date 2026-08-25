@@ -15,11 +15,12 @@ using ..BlochHamiltonian: CrystalExcitationBasis, CrystalCouplings
 using ..ConstructRTensor: fill_spherical_bessel_column!
 using ..ConstructFLMTensor: load_gaunt_array
 using ..ProjectFLM: quadrature_weights
-using ..WignerRotations: wigner_d_blocks
+using ..WignerRotations: WignerDBuffers, wigner_d_blocks!
 using ...FastPowers: fast_i_pow, fast_neg1_pow
 
-export NeighbourCells, enumerate_neighbour_cells, compute_couplings, subtract_self_term!,
-       image_translation_span
+export NeighbourCells, enumerate_neighbour_cells, compute_couplings, compute_crystal_corrections,
+       subtract_self_term!,
+       image_translation_span, rotation_to_pair_frame
 
 function image_translation_span(basis::CrystalExcitationBasis{T})::T where {T<:AbstractFloat}
     """
@@ -111,9 +112,11 @@ function enumerate_neighbour_cells(lattice::CrystalLatticeData{T}, cutoff::Real)
     return NeighbourCells{T}(vectors, indices, negative_of)
 end
 
-function rotor_to_z(direction::SVector{3, T})::Quaternionic.Rotor{T} where {T<:AbstractFloat}
+function rotation_to_pair_frame(direction::SVector{3, T})::Quaternionic.Rotor{T} where {T<:AbstractFloat}
     """
-    The shortest rotation carrying a unit vector onto ẑ, as a rotor.
+    The pair-frame rotation S⁻¹ mapping a unit separation onto ẑ,
+
+        S⁻¹ d̂ = ẑ.
 
     A short note on quaternions. A quaternion (w, x, y, z) in our case represents
     a rotation about the axis (x, y, z), normalised, by an angle θ = 2 arccos(w).
@@ -122,7 +125,7 @@ function rotor_to_z(direction::SVector{3, T})::Quaternionic.Rotor{T} where {T<:A
     - direction::SVector{3, T}: A unit vector.
 
     # Returns:
-    - Quaternionic.Rotor{T}: The rotor R̃ with R̃ d̂ = ẑ.
+    - Quaternionic.Rotor{T}: The rotor representing S⁻¹.
     """
 
     # Get the cosine of the angle between the direction and z.
@@ -213,7 +216,122 @@ function build_pair_frame_kernel(gaunt_path::String, ::Type{T})::PairFrameKernel
     return PairFrameKernel{T}(triples, offsets, member_L, member_weight)
 end
 
-function compute_couplings(
+function fill_pair_kernel_table!(
+        kernel_table::Matrix{Complex{T}},
+        bessel_table::Matrix{T},
+        kernel::PairFrameKernel{T},
+        radial_weights::Vector{T},
+    ) where {T<:AbstractFloat}
+    """
+    Multiply the Gaunt part of K^∥ by its Bessel functions and radial weights.
+
+    # Arguments:
+    - kernel_table::Matrix{Complex{T}}: Preallocated K^∥(q) table to overwrite.
+    - bessel_table::Matrix{T}: j_L(qd), indexed by L and q.
+    - kernel::PairFrameKernel{T}: The grouped Gaunt coefficients for each (l, l_prime, mu).
+    - radial_weights::Vector{T}: Quadrature weights, including the Ewald short-range kernel.
+
+    # Returns:
+    - Nothing. kernel_table is overwritten.
+    """
+
+    n_q = size(kernel_table, 1)
+    @inbounds for triple in eachindex(kernel.triples)
+        # The triple is (l, l_prime, mu). Get the Gaunt coefficient indices for this set.
+        member_start = kernel.offsets[triple]
+        member_stop = kernel.offsets[triple + 1] - 1
+        for q_idx in 1:n_q
+            total = zero(Complex{T})
+            for member in member_start:member_stop
+                total += kernel.member_weight[member] *
+                         bessel_table[kernel.member_L[member] + 1, q_idx]
+            end
+            kernel_table[q_idx, triple] = radial_weights[q_idx] * total
+        end
+    end
+
+    return nothing
+end
+
+function add_diagonal_pair!(
+        diagonal::Vector{Complex{T}},
+        lambdas::Vector{Int},
+        difference_source::Array{Complex{T}, 3},
+        Xi_source::Matrix{Complex{T}},
+        blocks::Vector{Matrix{Complex{T}}},
+        kernel::PairFrameKernel{T},
+        kernel_table::Matrix{Complex{T}},
+        difference_pair::Array{Complex{T}, 3},
+        Xi_pair::Matrix{Complex{T}},
+        Xi_potential::Matrix{Complex{T}},
+        overlap::Vector{Complex{T}},
+        prefactor::Complex{T},
+        l_max::Int,
+    ) where {T<:AbstractFloat}
+    """
+    Add the pair contribution ΔN K Ξ* to a task-local diagonal vector.
+
+    K is applied once to Ξ rather than once to every ΔN_s, as it is independent of the transition.
+
+        V_a(q) = Σ_b K_ab(q) Ξ_b*(q),
+        D_s = Σ_a ΔN_s,a(q) V_a(q).
+
+    # Arguments:
+    - diagonal::Vector{Complex{T}}: Task-local D vector to accumulate into.
+    - lambdas::Vector{Int}: Excitation indices carried by the first image.
+    - difference_source::Array{Complex{T},3}: ΔN coefficients of the first image.
+    - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the second image.
+    - blocks::Vector{Matrix{Complex{T}}}: Wigner matrices for this pair frame.
+    - kernel::PairFrameKernel{T}: The grouped Gaunt part of K^∥.
+    - kernel_table::Matrix{Complex{T}}: K^∥(q) for this separation.
+    - difference_pair::Array{Complex{T},3}: Buffer for pair-frame ΔN.
+    - Xi_pair::Matrix{Complex{T}}: Buffer for pair-frame Ξ*.
+    - Xi_potential::Matrix{Complex{T}}: Buffer for K Ξ*.
+    - overlap::Vector{Complex{T}}: Buffer for all transition overlaps.
+    - prefactor::Complex{T}: The Coulomb prefactor in eV Angstrom.
+    - l_max::Int: The largest angular mode.
+
+    # Returns:
+    - Nothing. diagonal is accumulated in place.
+    """
+
+    n_transitions, n_q, n_keys = size(difference_pair)
+
+    @inbounds for l in 0:l_max
+        block = (l * l + 1):((l + 1) * (l + 1))
+        width = 2 * l + 1
+        D = blocks[l + 1]
+        mul!(reshape(view(difference_pair, :, :, block), n_transitions * n_q, width),
+             reshape(view(difference_source, :, :, block), n_transitions * n_q, width),
+             transpose(D))
+        # Ξ is stored conjugated, so its coefficient rotation uses D*.
+        mul!(view(Xi_pair, :, block), view(Xi_source, :, block), adjoint(D))
+    end
+
+    # Applying K to the single Xi object avoids repeating the expensive Gaunt contraction for
+    # every transition.
+    fill!(Xi_potential, zero(Complex{T}))
+    @inbounds for triple in eachindex(kernel.triples)
+        (l, l_prime, mu) = kernel.triples[triple]
+        key_first = l * l + (l + mu) + 1
+        key_second = l_prime * l_prime + (l_prime + mu) + 1
+        for q_idx in 1:n_q
+            Xi_potential[q_idx, key_first] +=
+                kernel_table[q_idx, triple] * Xi_pair[q_idx, key_second]
+        end
+    end
+
+    # Perform the multiplication ΔN K Ξ*, and accumulate into the diagonal.
+    mul!(overlap, reshape(difference_pair, n_transitions, n_q * n_keys),
+         reshape(Xi_potential, n_q * n_keys))
+    @inbounds for transition in 1:n_transitions
+        diagonal[lambdas[transition]] += prefactor * overlap[transition]
+    end
+
+    return nothing
+end
+
+function _compute_crystal_corrections(
         rotated_R::Array{Complex{T}, 3},
         basis::CrystalExcitationBasis{T},
         cells::NeighbourCells{T},
@@ -221,9 +339,11 @@ function compute_couplings(
         l_max::Int,
         gaunt_path::String;
         parameters::Union{Nothing, EwaldParameters{T}} = nothing,
-    )::CrystalCouplings{T} where {T<:AbstractFloat}
+        rotated_difference::Union{Nothing, Array{Complex{T}, 3}} = nothing,
+        rotated_Xi::Union{Nothing, Array{Complex{T}, 3}} = nothing,
+    ) where {T<:AbstractFloat}
     """
-    Compute the short-range Frenkel exciton couplings, in the frame of each pair αβ,
+    Compute the short-range Frenkel couplings and, when supplied, the diagonal correction in each pair frame.
 
         J^SR_{A_i s, B_j t}(ΔR) = (2 α_EM / π) Σ_{ℓ,ℓ'} Σ_μ ∫dq κ(q)
                                       f̄^{(A_i,s)}_{ℓμ,αβ}(q) K^{∥,A_iB_j}_{ℓℓ',μ}(q) f̄^{(B_j,t)*}_{ℓ'μ,αβ}(q),
@@ -245,9 +365,11 @@ function compute_couplings(
     - gaunt_path::String: Path to the coupling-shape Gaunt coefficients.
     - parameters::Union{Nothing, EwaldParameters{T}}: The Ewald split to use, or nothing for the bare
       Coulomb kernel and hence the full, only conditionally convergent, lattice sum.
+    - rotated_difference: The rotated ΔN coefficients, or nothing for a J-only calculation.
+    - rotated_Xi: The rotated neutral ground-charge coefficients, or nothing for a J-only calculation.
 
     # Returns:
-    - CrystalCouplings{T}: The couplings in eV, with their lattice vectors.
+    - Tuple: The couplings and short-range diagonal correction, both in eV.
     """
 
     # Get the dimensions.
@@ -256,6 +378,9 @@ function compute_couplings(
     n_cells = length(cells.vectors)
     n_keys = (l_max + 1)^2
     L_max = 2 * l_max
+    have_dN_and_Xi = rotated_difference !== nothing || rotated_Xi !== nothing
+    (rotated_difference === nothing) == (rotated_Xi === nothing) || error(
+        "Both the difference and Ξ tensors are required to compute D.")
 
     # Check that the rotated coefficients have the right dimensions.
     (l_max + 1)^2 == size(rotated_R, 3) ||
@@ -280,6 +405,13 @@ function compute_couplings(
         "$(length.(lambdas_of_image))."
     )
 
+    if have_dN_and_Xi
+        size(rotated_difference) == size(rotated_R) || error(
+            "The rotated difference tensor has size $(size(rotated_difference)), expected $(size(rotated_R)).")
+        size(rotated_Xi) == (n_images, n_q, n_keys) || error(
+            "The rotated Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, n_q, n_keys)).")
+    end
+
     # Store the rotated flm (R tensor) coefficients for all molecules in the unit cell.
     # The first are the unconjugated, second are conjugated. We store them with different indices to speed up
     # matmuls later, by saving on transposing and conjugating.
@@ -292,6 +424,24 @@ function compute_couplings(
             value = rotated_R[lambda, q_idx, key]
             first_coefficients[image_idx][slot, q_idx, key] = value
             second_coefficients[image_idx][q_idx, key, slot] = conj(value)
+        end
+    end
+
+    # Do the same as above for the difference and Ξ coefficients, difference = first, Xi = second.
+    difference_coefficients = have_dN_and_Xi ?
+        [Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) for _ in 1:n_images] : nothing
+    Xi_coefficients = have_dN_and_Xi ?
+        [Matrix{Complex{T}}(undef, n_q, n_keys) for _ in 1:n_images] : nothing
+    if have_dN_and_Xi
+        for image_idx in 1:n_images
+            @inbounds for (slot, lambda) in enumerate(lambdas_of_image[image_idx]),
+                          key in 1:n_keys, q_idx in 1:n_q
+                difference_coefficients[image_idx][slot, q_idx, key] =
+                    rotated_difference[lambda, q_idx, key]
+            end
+            @inbounds for key in 1:n_keys, q_idx in 1:n_q
+                Xi_coefficients[image_idx][q_idx, key] = conj(rotated_Xi[image_idx, q_idx, key])
+            end
         end
     end
 
@@ -315,18 +465,20 @@ function compute_couplings(
     end
 
     couplings = zeros(Complex{T}, n_cells, n_lambda, n_lambda)
+    n_chunks = min(nthreads(), max(length(jobs), 1))
+    diagonal_chunks = have_dN_and_Xi ? [zeros(Complex{T}, n_lambda) for _ in 1:n_chunks] : nothing
 
     # Avoid BLAS oversubscription.
     blas_threads = BLAS.get_num_threads()
     BLAS.set_num_threads(1)
     try
-        n_chunks = min(nthreads(), max(length(jobs), 1))
         @sync for chunk in 1:n_chunks
             Threads.@spawn begin
                 # Allocate buffers for each thread.
                 bessel_table = Array{T, 2}(undef, L_max + 1, n_q)
                 bessel_buffer = Vector{Float64}(undef, L_max + 1)
                 kernel_table = Matrix{Complex{T}}(undef, n_q, n_triples) # Stores K^∥ for each frame.
+                wigner_buffers = WignerDBuffers(T, l_max)
                 first = Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) # Stores rotated (now pair-frame) coefficients for the "first" molecule. "f1".
                 accum = Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) # Stores sum_ℓ f1 K^∥ for each q and (l', μ). "Σ f1 K^∥".
                 second = Array{Complex{T}, 3}(undef, n_q, n_keys, n_transitions) # Stores rotated (now pair-frame) coefficients for the "second" molecule. "f2".
@@ -334,6 +486,14 @@ function compute_couplings(
                 accum_matrix = reshape(accum, n_transitions, n_q * n_keys)
                 second_matrix = reshape(second, n_q * n_keys, n_transitions)
                 overlaps = Matrix{Complex{T}}(undef, n_transitions, n_transitions)
+
+                # The diagonal correction has n_transitions objects on the left and one Ξ on the right.
+                difference_pair = have_dN_and_Xi ?
+                    Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) : nothing
+                Xi_pair = have_dN_and_Xi ? Matrix{Complex{T}}(undef, n_q, n_keys) : nothing
+                Xi_potential = have_dN_and_Xi ? similar(Xi_pair) : nothing
+                diagonal_overlap = have_dN_and_Xi ? Vector{Complex{T}}(undef, n_transitions) : nothing
+                local_diagonal = have_dN_and_Xi ? diagonal_chunks[chunk] : nothing
 
                 for job_idx in chunk:n_chunks:length(jobs)
                     # Get the indices for the current job.
@@ -352,19 +512,11 @@ function compute_couplings(
                     end
 
                     # Build the full kernel by multiplying the Gaunt part by the Bessel functions.
-                    @inbounds for t in 1:n_triples
-                        span = kernel.offsets[t]:(kernel.offsets[t + 1] - 1)
-                        for q_idx in 1:n_q
-                            total = zero(Complex{T})
-                            for n in span
-                                total += kernel.member_weight[n] * bessel_table[kernel.member_L[n] + 1, q_idx]
-                            end
-                            kernel_table[q_idx, t] = radial_weights[q_idx] * total
-                        end
-                    end
+                    fill_pair_kernel_table!(kernel_table, bessel_table, kernel, radial_weights)
 
                     # Rotate to the pair frame.
-                    blocks = wigner_d_blocks(rotor_to_z(separation / distance), l_max)
+                    S_inverse = rotation_to_pair_frame(separation / distance)
+                    blocks = wigner_d_blocks!(wigner_buffers, S_inverse)
 
                     source_i = first_coefficients[image_i]
                     source_j = second_coefficients[image_j]
@@ -411,6 +563,26 @@ function compute_couplings(
                         # The Hermitian partner lives in the opposite cell.
                         couplings[cells.negative_of[cell_idx], lambda_prime, lambda] = conj(value)
                     end
+
+                    if have_dN_and_Xi
+                        # D_i += ΔN_i K Ξ_j*, in the pair frame already built for J_ij.
+                        add_diagonal_pair!(
+                            local_diagonal, lambdas_i, difference_coefficients[image_i],
+                            Xi_coefficients[image_j], blocks, kernel, kernel_table,
+                            difference_pair, Xi_pair, Xi_potential, diagonal_overlap,
+                            prefactor, l_max)
+
+                        # D_j += ΔN_j K Ξ_i*, at separation -d. Needs to be computed separately.
+                        if image_i != image_j
+                            reverse_S_inverse = rotation_to_pair_frame(-separation / distance)
+                            reverse_blocks = wigner_d_blocks!(wigner_buffers, reverse_S_inverse)
+                            add_diagonal_pair!(
+                                local_diagonal, lambdas_j, difference_coefficients[image_j],
+                                Xi_coefficients[image_i], reverse_blocks, kernel, kernel_table,
+                                difference_pair, Xi_pair, Xi_potential, diagonal_overlap,
+                                prefactor, l_max)
+                        end
+                    end
                 end
             end
         end
@@ -419,7 +591,94 @@ function compute_couplings(
         BLAS.set_num_threads(blas_threads)
     end
 
-    return CrystalCouplings{T}(couplings, cells.vectors)
+    # Sum the per-task D accumulators. It should be real, so check and then force it at the end.
+    diagonal = zeros(T, n_lambda)
+    if have_dN_and_Xi
+        total = zeros(Complex{T}, n_lambda)
+        for chunk_values in diagonal_chunks
+            total .+= chunk_values
+        end
+        scale = max(maximum(abs, real(total)), one(T))
+        imaginary_residual = maximum(abs, imag(total))
+        tolerance = T(1000) * eps(T) * scale
+        imaginary_residual <= tolerance || error(
+            "The short-range diagonal correction has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
+        diagonal .= real(total)
+    end
+
+    return CrystalCouplings{T}(couplings, cells.vectors), diagonal
+end
+
+function compute_couplings(
+        rotated_R::Array{Complex{T}, 3},
+        basis::CrystalExcitationBasis{T},
+        cells::NeighbourCells{T},
+        q_grid_invA::Vector{T},
+        l_max::Int,
+        gaunt_path::String;
+        parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+    )::CrystalCouplings{T} where {T<:AbstractFloat}
+    """
+    Compute the direct or Ewald short-range transition couplings J.
+
+    This is the J-only interface. It uses the same pair implementation as the combined
+    crystal correction without constructing or returning D.
+
+    # Arguments:
+    - rotated_R::Array{Complex{T},3}: Rotated transition coefficients for every lambda.
+    - basis::CrystalExcitationBasis{T}: The local excitation basis.
+    - cells::NeighbourCells{T}: Lattice cells included in the real-space sum.
+    - q_grid_invA::Vector{T}: The q grid, in inverse Angstroms.
+    - l_max::Int: The largest angular mode.
+    - gaunt_path::String: Path to the coupling Gaunt coefficients.
+    - parameters::Union{Nothing,EwaldParameters{T}}: The Ewald split, or nothing for direct J.
+
+    # Returns:
+    - CrystalCouplings{T}: J for every cell and pair of local excitations, in eV.
+    """
+
+    couplings, _ = _compute_crystal_corrections(
+        rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path; parameters = parameters)
+    return couplings
+end
+
+function compute_crystal_corrections(
+        rotated_R::Array{Complex{T}, 3},
+        rotated_difference::Array{Complex{T}, 3},
+        rotated_Xi::Array{Complex{T}, 3},
+        basis::CrystalExcitationBasis{T},
+        cells::NeighbourCells{T},
+        q_grid_invA::Vector{T},
+        l_max::Int,
+        gaunt_path::String;
+        parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+    ) where {T<:AbstractFloat}
+    """
+    Compute J and the short-range diagonal correction D in one pair pass.
+
+        J: R K R*,             D_SR: Delta N K Xi*.
+
+    The separation, Bessel table, pair kernel and pair-frame rotations are shared. For D, K is
+    applied once to Ξ and the resulting potential is dotted with every difference density.
+
+    # Arguments:
+    - rotated_R::Array{Complex{T},3}: Rotated transition coefficients for every lambda.
+    - rotated_difference::Array{Complex{T},3}: Rotated ΔN for every lambda.
+    - rotated_Xi::Array{Complex{T},3}: Rotated Ξ for every molecular image.
+    - basis::CrystalExcitationBasis{T}: The local excitation basis.
+    - cells::NeighbourCells{T}: Lattice cells included in the real-space sum.
+    - q_grid_invA::Vector{T}: The q grid, in inverse Angstroms.
+    - l_max::Int: The largest angular mode.
+    - gaunt_path::String: Path to the coupling Gaunt coefficients.
+    - parameters::Union{Nothing,EwaldParameters{T}}: The Ewald split, or nothing for direct sums.
+
+    # Returns:
+    - Tuple: CrystalCouplings J and the short-range diagonal vector D, both in eV.
+    """
+
+    return _compute_crystal_corrections(
+        rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path;
+        parameters = parameters, rotated_difference = rotated_difference, rotated_Xi = rotated_Xi)
 end
 
 function subtract_self_term!(

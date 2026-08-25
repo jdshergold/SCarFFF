@@ -20,7 +20,8 @@ using ...ThreadChunks: chunk_count, chunk_range
 
 const VSDM = VectorSpaceDarkMatter
 
-export rotate_R_tensors, compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
+export rotate_R_tensors, rotate_crystal_R_tensors,
+       compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
        compute_incoherent_crystal_f_lm
 
 function rotate_R_tensors(
@@ -103,6 +104,116 @@ function rotate_R_tensors(
     end
 
     return rotated
+end
+
+function rotate_crystal_R_tensors(
+        conformer_R_tensors::Vector{Array{Complex{T}, 3}},
+        conformer_difference_R::Vector{Array{Complex{T}, 3}},
+        conformer_Xi_R::Vector{Array{Complex{T}, 3}},
+        images::Vector{CrystalImage{T}},
+        basis::CrystalExcitationBasis{T},
+        l_max::Int,
+    ) where {T<:AbstractFloat}
+    """
+    Rotate the transition, difference and neutral ground-charge R tensors into every crystal image.
+
+    The Wigner matrices are built once per image and shared by all three objects.
+
+    # Arguments:
+    - conformer_R_tensors::Vector{Array{Complex{T},3}}: Transition R tensor for each conformer.
+    - conformer_difference_R::Vector{Array{Complex{T},3}}: Difference R tensor for each conformer.
+    - conformer_Xi_R::Vector{Array{Complex{T},3}}: One Xi R tensor for each conformer.
+    - images::Vector{CrystalImage{T}}: Molecular images in the unit cell.
+    - basis::CrystalExcitationBasis{T}: The image-major local excitation basis.
+    - l_max::Int: The largest angular mode.
+
+    # Returns:
+    - Tuple: Rotated transition, difference and Xi tensors for all images.
+    """
+
+    # Get the dimensions.
+    n_images = length(images)
+    n_transitions = basis.n_transitions
+    n_q = size(conformer_R_tensors[1], 2)
+    n_keys = (l_max + 1)^2
+    n_lambda = length(basis.energies)
+
+    # Allocate arrays to store the rotated tensors.
+    rotated_R = Array{Complex{T}, 3}(undef, n_lambda, n_q, n_keys)
+    rotated_difference = similar(rotated_R)
+    rotated_Xi = Array{Complex{T}, 3}(undef, n_images, n_q, n_keys)
+
+    # The D blocks depend only on the image, so build them once per image rather than per λ.
+    image_blocks = [wigner_d_blocks(image.rotation, l_max) for image in images]
+    n_chunks = chunk_count(n_images, nthreads())
+
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # Input stores the unrotated R tensor, output stores the rotated one.
+            input = Vector{Complex{T}}(undef, 2 * l_max + 1)
+            output = similar(input)
+
+            for image_idx in chunk_range(chunk, n_chunks, n_images)
+                image = images[image_idx]
+                blocks = image_blocks[image_idx]
+                # Pick out the reference R tensors for this image.
+                transition_R_for_conformer = conformer_R_tensors[image.conformer_index]
+                difference_R_for_conformer = conformer_difference_R[image.conformer_index]
+                Xi_R_for_conformer = conformer_Xi_R[image.conformer_index]
+
+                # Check that the conformer has the right number of transitions.
+                size(transition_R_for_conformer, 1) == n_transitions || error(
+                    "Conformer $(image.conformer_index) has $(size(transition_R_for_conformer, 1)) transitions, expected $(n_transitions).")
+                size(difference_R_for_conformer, 1) == n_transitions || error(
+                    "Conformer $(image.conformer_index) has the wrong number of difference densities.")
+                size(Xi_R_for_conformer, 1) == 1 || error("Each conformer should have one Ξ tensor.")
+
+                lambda_start = (image_idx - 1) * n_transitions
+                for l in 0:l_max
+                    key_start = l * l + 1
+                    width = 2 * l + 1
+                    D_l = blocks[l + 1]
+                    # Compute the parity of the for the rotation and l combination.
+                    parity = Complex{T}(image.det_rotation^l)
+                    input_view = @view input[1:width]
+                    output_view = @view output[1:width]
+
+                    for q_idx in 1:n_q
+                        # Rotate every transition and its difference density with the same D block.
+                        for transition in 1:n_transitions
+                            lambda = lambda_start + transition
+                            @inbounds for offset in 1:width
+                                input_view[offset] = transition_R_for_conformer[transition, q_idx, key_start + offset - 1]
+                            end
+                            mul!(output_view, D_l, input_view)
+                            @inbounds for offset in 1:width
+                                rotated_R[lambda, q_idx, key_start + offset - 1] = parity * output_view[offset]
+                            end
+
+                            @inbounds for offset in 1:width
+                                input_view[offset] = difference_R_for_conformer[transition, q_idx, key_start + offset - 1]
+                            end
+                            mul!(output_view, D_l, input_view)
+                            @inbounds for offset in 1:width
+                                rotated_difference[lambda, q_idx, key_start + offset - 1] = parity * output_view[offset]
+                            end
+                        end
+
+                        # Ξ only exists for the ground state, so no loop over transitions.
+                        @inbounds for offset in 1:width
+                            input_view[offset] = Xi_R_for_conformer[1, q_idx, key_start + offset - 1]
+                        end
+                        mul!(output_view, D_l, input_view)
+                        @inbounds for offset in 1:width
+                            rotated_Xi[image_idx, q_idx, key_start + offset - 1] = parity * output_view[offset]
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return rotated_R, rotated_difference, rotated_Xi
 end
 
 @inline function contract_monomer_amplitudes!(

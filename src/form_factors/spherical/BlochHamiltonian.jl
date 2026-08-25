@@ -11,7 +11,8 @@ using FastLapackInterface: HermitianEigenWs
 using ..Ewald: EwaldLongRangeData, EwaldLongRangeBuffers, add_long_range!
 
 export CrystalImage, CrystalExcitationBasis, build_excitation_basis, CrystalCouplings,
-       build_bloch_hamiltonian!, solve_bloch_hamiltonian!, BlochEigensystem
+       set_diagonal_corrections!, build_bloch_hamiltonian!, solve_bloch_hamiltonian!,
+       solve_bloch_energies!, BlochEigensystem
 
 struct CrystalCouplings{T<:AbstractFloat}
     """
@@ -62,12 +63,14 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     - image_of::Vector{Int}: The image index (A, i) for each λ.
     - transition_of::Vector{Int}: The transition index s for each λ, as a position in the requested transition list.
     - energies::Vector{T}: The monomer excitation energy E_{A,s} for each λ, in eV.
+    - diagonal_corrections::Vector{T}: The environment shift D_{A_i,s} for each λ, in eV.
     - images::Vector{CrystalImage{T}}: The images themselves.
     - n_transitions::Int: The number of transitions per image.
     """
     image_of::Vector{Int}
     transition_of::Vector{Int}
     energies::Vector{T}
+    diagonal_corrections::Vector{T}
     images::Vector{CrystalImage{T}}
     n_transitions::Int
 end
@@ -118,7 +121,30 @@ function build_excitation_basis(
         end
     end
 
-    return CrystalExcitationBasis{T}(image_of, transition_of, energies, images, n_transitions)
+    return CrystalExcitationBasis{T}(
+        image_of, transition_of, energies, zeros(T, n_lambda), images, n_transitions)
+end
+
+function set_diagonal_corrections!(
+        basis::CrystalExcitationBasis{T},
+        corrections::AbstractVector,
+    )::CrystalExcitationBasis{T} where {T<:AbstractFloat}
+    """
+    Store the diagonal crystal shifts D in the localised excitation basis.
+
+    # Arguments:
+    - basis::CrystalExcitationBasis{T}: The basis whose diagonal corrections are overwritten.
+    - corrections::AbstractVector: One finite correction in eV for every lambda.
+
+    # Returns:
+    - CrystalExcitationBasis{T}: The same basis, with its D vector updated.
+    """
+
+    length(corrections) == length(basis.energies) || error(
+        "There are $(length(corrections)) diagonal corrections for $(length(basis.energies)) localised excitations.")
+    all(isfinite, corrections) || error("The diagonal corrections contain a non-finite value.")
+    basis.diagonal_corrections .= T.(corrections)
+    return basis
 end
 
 struct BlochEigensystem{T<:AbstractFloat, W, E}
@@ -148,7 +174,25 @@ function BlochEigensystem(
         basis::CrystalExcitationBasis{T},
         long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing;
         n_cells::Int = 0,
+        vecs::Bool = true,
     ) where {T<:AbstractFloat}
+    """
+    Allocate everything one task needs to build and diagonalise H(k), so the loop over k does not.
+
+    Pass vecs = false when only the energies are wanted, as the band map does. This speeds up the
+    diagonalisation when we don't need the eigenvectors.
+
+    # Arguments:
+    - basis::CrystalExcitationBasis{T}: The localised excitation basis, which sets n_lambda.
+    - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing for
+      no reciprocal-space term.
+    - n_cells::Int: The number of neighbour cells, sizing the cell phase table.
+    - vecs::Bool: Whether the eigenvectors are needed as well as the energies.
+
+    # Returns:
+    - BlochEigensystem{T}: The buffers, sized for this basis.
+    """
+
     # Get the number of states.
     n_lambda = length(basis.energies)
 
@@ -157,11 +201,17 @@ function BlochEigensystem(
 
     # If there are long-range terms, allocate buffers for them.
     ewald_buffers = long_range === nothing ? nothing : EwaldLongRangeBuffers(long_range)
-    return BlochEigensystem{T, HermitianEigenWs{Complex{T}, Matrix{Complex{T}}, T}, typeof(ewald_buffers)}(
+
+    # Only allocate eigenvector storage if requested. This speeds up band map, where we only need energies.
+    eigen_buffers = HermitianEigenWs(H; vecs = vecs)
+    coefficients = vecs ? Matrix{Complex{T}}(undef, n_lambda, n_lambda) :
+                          Matrix{Complex{T}}(undef, 0, 0)
+
+    return BlochEigensystem{T, typeof(eigen_buffers), typeof(ewald_buffers)}(
         H,
-        Matrix{Complex{T}}(undef, n_lambda, n_lambda),
+        coefficients,
         Vector{T}(undef, n_lambda),
-        HermitianEigenWs(H; vecs = true),
+        eigen_buffers,
         ewald_buffers,
         Vector{Complex{T}}(undef, n_cells),
     )
@@ -200,11 +250,10 @@ end
     H = eigensystem.H
     fill!(H, zero(Complex{T}))
 
-    # Diagonal: the monomer excitation energy, plus the D_{A_i,s} environment shift.
-    # TODO: add D_{A_i,s}, the Coulomb interaction of this molecule's excited-minus-ground
-    # difference density with the ground state density and nuclei of every other molecule.
+    # Diagonal: the monomer excitation energy plus the environment shift.
     @inbounds for lambda in eachindex(basis.energies)
-        H[lambda, lambda] = Complex{T}(basis.energies[lambda])
+        H[lambda, lambda] = Complex{T}(
+            basis.energies[lambda] + basis.diagonal_corrections[lambda])
     end
 
     # Off-diagonal: the lattice-summed excitation transfer.
@@ -290,6 +339,40 @@ end
     # Store the energies and coefficients.
     eigensystem.energies .= values
     eigensystem.coefficients .= vectors
+
+    return nothing
+end
+
+@inline function solve_bloch_energies!(
+        eigensystem::BlochEigensystem{T},
+        basis::CrystalExcitationBasis{T},
+        k::SVector{3, T},
+        couplings::Union{Nothing, CrystalCouplings{T}} = nothing,
+        long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
+    ) where {T<:AbstractFloat}
+    """
+    Build H(k) and return its eigenvalues alone, for callers that never look at the coefficients.
+
+    Asking syevr for 'N' rather than 'V' skips eigenvector calculation.
+
+    # Arguments:
+    - eigensystem::BlochEigensystem{T}: The eigensystem, whose H and energies are overwritten.
+    - basis::CrystalExcitationBasis{T}: The localised excitation basis.
+    - k::SVector{3, T}: The Brillouin zone wavevector, in Å^{-1}.
+    - couplings::Union{Nothing, CrystalCouplings{T}}: The short-range couplings, or nothing.
+    - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing.
+
+    # Returns:
+    - Nothing. Only eigensystem.energies is modified, in ascending order.
+    """
+
+    build_bloch_hamiltonian!(eigensystem, basis, k, couplings, long_range)
+
+    values, _ = LinearAlgebra.LAPACK.syevr!(
+        eigensystem.eigen_buffers, 'N', 'A', 'U', eigensystem.H,
+        zero(T), zero(T), 0, 0, -one(T),
+    )
+    eigensystem.energies .= values
 
     return nothing
 end

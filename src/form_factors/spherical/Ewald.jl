@@ -9,7 +9,8 @@ using LinearAlgebra: norm, cross, dot, mul!, BLAS
 using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGSTROM
 
 export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
-       EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!, self_term_matrix
+       EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
+       compute_ewald_diagonal, self_term_matrix
 
 # Coefficients below this fraction of the largest one over the long-range q range are treated as
 # absent, which sets the max ℓ in the long-range sum. With this set to 1e-4, the error is around
@@ -332,6 +333,71 @@ function long_range_l_ceiling(
     return 0
 end
 
+function build_coefficient_table(
+        rotated_R::Array{Complex{T}, 3},
+        q_grid_invA::Vector{T},
+        l_max::Int,
+        Q_max::T,
+    ) where {T<:AbstractFloat}
+    """
+    Build the compact coefficient and Hermite-tangent tables used by a reciprocal sum.
+
+    # Arguments:
+    - rotated_R::Array{Complex{T},3}: Coefficients for every object on the full q grid.
+    - q_grid_invA::Vector{T}: Uniform q grid starting at zero, in inverse Angstroms.
+    - l_max::Int: The largest angular mode in rotated_R.
+    - Q_max::T: Reciprocal-space cutoff, in inverse Angstroms.
+
+    # Returns:
+    - Tuple: Compact coefficients, Hermite tangents, q spacing and retained l ceiling.
+    """
+
+    # Get the dimensions and grid spacing.
+    n_objects = size(rotated_R, 1)
+    n_q = length(q_grid_invA)
+    n_q >= 3 || error("The Ewald interpolation needs at least three q points, got $(n_q).")
+    
+    # Check the q grid is uniform and starts at zero.
+    q_step = q_grid_invA[2] - q_grid_invA[1]
+    abs(q_grid_invA[1]) < eps(T) || error("The Ewald q grid must start at zero.")
+    # Use sqrt(eps) here, to make sure it is compatible with float32. This will still be well below
+    # any meaningul deviations.
+    uniform_tolerance = sqrt(eps(T)) * q_step
+    all(abs(q_grid_invA[i + 1] - q_grid_invA[i] - q_step) < uniform_tolerance
+        for i in 1:(n_q - 1)) || error("The Ewald q grid must be uniform.")
+
+    # Check that we can actually reach Q_max with the grid and error settings.
+    q_grid_invA[end] >= Q_max || error(
+        "The Ewald cutoff $(Q_max) Å^-1 lies beyond the q grid at $(q_grid_invA[end]) Å^-1.")
+
+    # Trim to the q grid needed up to Q_max, ensuring we have the extra points for the interpolation.
+    n_q_lr = min(n_q, Int(ceil(Q_max / q_step)) + 3)
+    # Truncate l_max as well.
+    l_max_lr = long_range_l_ceiling(rotated_R, n_q_lr, l_max)
+    n_keys_lr = (l_max_lr + 1)^2
+
+    # Store the subset of rotated coefficients that we need for the LR sum.
+    table = Array{Complex{T}, 3}(undef, n_keys_lr, n_objects, n_q_lr)
+    @inbounds for q_idx in 1:n_q_lr, object in 1:n_objects, key in 1:n_keys_lr
+        table[key, object, q_idx] = rotated_R[object, q_idx, key]
+    end
+
+    # Also store the tangents for the Hermite interpolation. Premultiply by dx (i.e. don't divide by it) to save multiplying later.
+    # Endpoints use one directional difference, interior points use central difference, hence the 1/2 for them.
+    tangent = similar(table)
+    @inbounds for object in 1:n_objects, key in 1:n_keys_lr
+        tangent[key, object, 1] = table[key, object, 2] - table[key, object, 1]
+        for q_idx in 2:(n_q_lr - 1)
+            tangent[key, object, q_idx] =
+                (table[key, object, q_idx + 1] - table[key, object, q_idx - 1]) / 2
+        end
+        tangent[key, object, n_q_lr] =
+            table[key, object, n_q_lr] - table[key, object, n_q_lr - 1]
+    end
+
+    return table, tangent, q_step, l_max_lr
+end
+
 function build_ewald_long_range(
         rotated_R::Array{Complex{T}, 3},
         tau_of_lambda::Vector{SVector{3, T}},
@@ -540,6 +606,171 @@ function self_term_matrix(
     end
 
     return self_term
+end
+
+function compute_ewald_diagonal(
+        rotated_difference::Array{Complex{T}, 3},
+        rotated_Xi::Array{Complex{T}, 3},
+        q_grid_invA::Vector{T},
+        l_max::Int,
+        data::EwaldLongRangeData{T},
+    )::Vector{T} where {T<:AbstractFloat}
+    """
+    Compute the long-range diagonal correction
+
+        D_LR = D_reciprocal + D_boundary - D_self.
+
+    Xi is summed over the unit cell once for each G before it is contracted with every difference
+    density. The boundary term is omitted when data.include_dipole_term is false.
+
+    # Arguments:
+    - rotated_difference::Array{Complex{T},3}: Delta N for every local excitation.
+    - rotated_Xi::Array{Complex{T},3}: Xi for every molecular image.
+    - q_grid_invA::Vector{T}: Uniform q grid starting at zero, in inverse Angstroms.
+    - l_max::Int: The largest angular mode.
+    - data::EwaldLongRangeData{T}: The Ewald parameters, reciprocal vectors and image positions.
+
+    # Returns:
+    - Vector{T}: The real long-range correction for every lambda, in eV.
+    """
+
+    # Get the dimensions, and check the tensors match them.
+    n_lambda = length(data.image_of)
+    n_images = length(data.translations)
+    n_keys = (l_max + 1)^2
+    size(rotated_difference, 1) == n_lambda || error(
+        "There are $(size(rotated_difference, 1)) difference densities for $(n_lambda) excitations.")
+    size(rotated_difference, 2) == length(q_grid_invA) && size(rotated_difference, 3) == n_keys || error(
+        "The difference tensor has size $(size(rotated_difference)), expected $((n_lambda, length(q_grid_invA), n_keys)).")
+    size(rotated_Xi, 1) == n_images || error(
+        "There are $(size(rotated_Xi, 1)) Ξ tensors for $(n_images) images.")
+    size(rotated_Xi, 2) == length(q_grid_invA) && size(rotated_Xi, 3) == n_keys || error(
+        "The Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, length(q_grid_invA), n_keys)).")
+
+    # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
+    difference_table, difference_tangent, q_step, difference_l_max =
+        build_coefficient_table(rotated_difference, q_grid_invA, l_max, data.Q_max)
+    Xi_table, Xi_tangent, Xi_q_step, Xi_l_max =
+        build_coefficient_table(rotated_Xi, q_grid_invA, l_max, data.Q_max)
+    abs(q_step - Xi_q_step) <= eps(T) * max(q_step, one(T)) || error(
+        "The ΔN and Ξ interpolation grids do not match.")
+
+    # The two densities may keep different l ceilings, so the harmonics must cover the larger.
+    l_ceiling = max(difference_l_max, Xi_l_max)
+    harmonics = Vector{Complex{T}}(undef, (l_ceiling + 1)^2)
+    Ylm_cache = SphericalHarmonics.cache(l_ceiling, SphericalHarmonics.FullRange)
+    diagonal = zeros(Complex{T}, n_lambda)
+
+    @inbounds for G in data.G_vectors
+        # Here k = 0, so Q = G. Skip anything beyond the cutoff, and G = 0, which the boundary
+        # term below replaces.
+        G_norm = norm(G)
+        G_norm <= data.Q_max || continue
+        G_norm < T(Q_ZERO_TOLERANCE) && continue
+
+        # Compute the spherical harmonics for this G.
+        theta = acos(clamp(G[3] / G_norm, -one(T), one(T)))
+        phi = atan(G[2], G[1])
+        computePlmcostheta!(Ylm_cache, theta, l_ceiling)
+        computeYlm!(Ylm_cache, theta, phi, l_ceiling)
+        Yvals = SphericalHarmonics.getY(Ylm_cache)
+
+        # Flatten the harmonics.
+        for l in 0:l_ceiling
+            key_base = l * l + l + 1
+            for m in -l:l
+                harmonics[key_base + m] = Complex{T}(Yvals[(l, m)])
+            end
+        end
+
+        # Cubic Hermite stencil for |G| on the uniform q grid.
+        position = G_norm / q_step
+        difference_node = min(Int(floor(position)) + 1, size(difference_table, 3) - 1)
+        Xi_node = min(Int(floor(position)) + 1, size(Xi_table, 3) - 1)
+        s = position - (difference_node - 1)
+        s2 = s * s
+        s3 = s2 * s
+        h00 = 2 * s3 - 3 * s2 + one(T)
+        h10 = s3 - 2 * s2 + s
+        h01 = -2 * s3 + 3 * s2
+        h11 = s3 - s2
+
+        # Sum the Ξ over all B_j once for this G, then use it for every λ.
+        total_Xi = zero(Complex{T})
+        for image in 1:n_images
+            amplitude = zero(Complex{T})
+            @simd for key in 1:size(Xi_table, 1)
+                amplitude += (h00 * Xi_table[key, image, Xi_node] +
+                              h10 * Xi_tangent[key, image, Xi_node] +
+                              h01 * Xi_table[key, image, Xi_node + 1] +
+                              h11 * Xi_tangent[key, image, Xi_node + 1]) * harmonics[key]
+            end
+            total_Xi += cis(dot(G, data.translations[image])) * amplitude
+        end
+
+        # Contract ΔN with the shared Ξ sum, phased onto each molecule's position in the cell.
+        weight = data.prefactor * exp(-(G_norm / (2 * data.eta))^2) / (G_norm * G_norm)
+        for lambda in 1:n_lambda
+            amplitude = zero(Complex{T})
+            @simd for key in 1:size(difference_table, 1)
+                amplitude += (h00 * difference_table[key, lambda, difference_node] +
+                              h10 * difference_tangent[key, lambda, difference_node] +
+                              h01 * difference_table[key, lambda, difference_node + 1] +
+                              h11 * difference_tangent[key, lambda, difference_node + 1]) * harmonics[key]
+            end
+            phase = cis(dot(G, data.translations[data.image_of[lambda]]))
+            diagonal[lambda] += weight * phase * amplitude * conj(total_Xi)
+        end
+    end
+
+    # The G = 0 term, replaced by the angular-averaged dipole product. This is the boundary choice.
+    if data.include_dipole_term
+        difference_slopes = dipole_slope_matrix(rotated_difference, q_grid_invA, l_max)
+        Xi_slopes = dipole_slope_matrix(rotated_Xi, q_grid_invA, l_max)
+        total_Xi_slopes = vec(sum(Xi_slopes, dims = 1))
+        boundary_weight = data.prefactor / T(4 * π)
+        @inbounds for lambda in 1:n_lambda
+            total = zero(Complex{T})
+            for component in 1:3
+                total += difference_slopes[lambda, component] * conj(total_Xi_slopes[component])
+            end
+            diagonal[lambda] += boundary_weight * total
+        end
+    end
+
+    # The reciprocal lattice sum includes the same molecule at ΔR = 0, which D excludes, so subtract it.
+    n_q = length(q_grid_invA)
+    radial_weights = Vector{T}(undef, n_q)
+    @inbounds for q_idx in 1:n_q
+        # Endpoints use one directional difference, interior use central difference.
+        step = q_idx == 1 ? q_grid_invA[2] - q_grid_invA[1] :
+               q_idx == n_q ? q_grid_invA[n_q] - q_grid_invA[n_q - 1] :
+               (q_grid_invA[q_idx + 1] - q_grid_invA[q_idx - 1]) / 2
+        # Endpoint and interior weights are different from interior.
+        radial_weights[q_idx] = (q_idx == 1 || q_idx == n_q ? step / 2 : step) *
+                                exp(-(q_grid_invA[q_idx] / (2 * data.eta))^2)
+    end
+    # At d = 0 orthonormality collapses the angular integral to an inner product over keys.
+    self_prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
+    @inbounds for lambda in 1:n_lambda
+        image = data.image_of[lambda]
+        self = zero(Complex{T})
+        for key in 1:n_keys, q_idx in 1:n_q
+            self += radial_weights[q_idx] * rotated_difference[lambda, q_idx, key] *
+                    conj(rotated_Xi[image, q_idx, key])
+        end
+        diagonal[lambda] -= self_prefactor * self
+    end
+
+    # D is real, being a diagonal element of a Hermitian H, so the imaginary part is round-off.
+    # Check that before discarding it.
+    scale = max(maximum(abs, real(diagonal)), one(T))
+    imaginary_residual = maximum(abs, imag(diagonal))
+    tolerance = T(1000) * eps(T) * scale
+    imaginary_residual <= tolerance || error(
+        "The Ewald diagonal correction has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
+
+    return real(diagonal)
 end
 
 @inline function add_long_range!(

@@ -3,7 +3,8 @@ module ReadBasisSet
 using HDF5
 
 include("DensityMatrices.jl")
-using .DensityMatrices: build_transition_matrix, to_real_density
+using .DensityMatrices: build_transition_matrix, build_ground_state_matrix,
+                        build_difference_matrix, to_real_density
 
 export get_molecular_data, MoleculeData
 
@@ -121,6 +122,18 @@ const L_MAP = Dict{Char, Int}(
 
 const AU_TO_ANGSTROM = 0.529177 # For converting Bohr radii to Angstroms.
 
+# Element order gives the atomic number.
+const ELEMENT_SYMBOLS = (
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+    "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
+    "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
+    "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+    "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
+    "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
+)
+const ATOMIC_NUMBERS = Dict(symbol => Z for (Z, symbol) in enumerate(ELEMENT_SYMBOLS))
+
 @inline function canonical_basis_name(name::AbstractString)
     return replace(lowercase(strip(name)), "*" => "s", r"[-_\s\(\)]" => "")
 end
@@ -190,6 +203,8 @@ struct MoleculeData{T<:AbstractFloat}
     normalised_coefficients::Vector{T} # Fully normalised primitive prefactors d_μ ξ_μ N_α.
 
     # Atom coordinates and edges of a cuboid about the molecule.
+    atom_symbols::Vector{String} # Element symbols in the same order as the coordinates.
+    nuclear_charges::Vector{Int} # Nuclear charges Z_I in the same order.
     atom_coordinates::Array{T, 2} # Coordinates of the atoms in the molecule.
     molecule_cuboid::Array{T, 2} # Cuboid edges for the entire molecule (min and max coordinates).
 
@@ -212,9 +227,10 @@ struct MoleculeData{T<:AbstractFloat}
     cartesian_c::Vector{Int} # Power of z in each Cartesian term.
     cartesian_prefactor::Vector{T} # Prefactor for each Cartesian term (e.g., 2.0, -1.0).
 
-
     # Transition matrices for excited states.
     transition_matrices::Vector{Array{T, 2}}
+    ground_state_matrix::Array{T, 2}
+    difference_matrices::Vector{Array{T, 2}}
 
     # Transition energies in eV.
     transition_energies_eV::Vector{T}
@@ -243,7 +259,11 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     coefficients = T[]
     normalised_coefficients = T[]
 
-    # Convert atom coordinates from Bohr to Angstrom.
+    # Convert atom coordinates from Bohr to Angstrom, and turn their symbols into Z_I.
+    atom_symbols = String.(h5_data["atom_symbols"])
+    nuclear_charges = [get(ATOMIC_NUMBERS, symbol) do
+        error("Unknown element symbol '$(symbol)' in the TD-DFT data.")
+    end for symbol in atom_symbols]
     atom_coordinates = h5_data["atom_coordinates"] .* T(AU_TO_ANGSTROM)
     molecule_cuboid = Array{T}(undef, 0, 3)
     primitive_to_orbital = Int[]
@@ -260,6 +280,7 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     cartesian_term_to_orbital = Int[]
     cartesian_term_to_atom = Int[]
     transition_matrices = Vector{Array{T, 2}}(undef, 0)
+    difference_matrices = Vector{Array{T, 2}}(undef, 0)
     transition_energies_eV = T[]
 
     # Now that we have the atom coordinates, we can determine the number of atoms and cuboid.
@@ -270,12 +291,18 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     # take the real part, which is checked rather than assumed.
     mo_coeff_occ = h5_data["mo_coeff_occ"]
     mo_coeff_vir = h5_data["mo_coeff_vir"]
+    ground_state_matrix = to_real_density(
+        build_ground_state_matrix(mo_coeff_occ), T; label = "ground-state density matrix")
     n_transitions = length(h5_data["X_matrices"])
     for idx in 1:n_transitions
+        X = h5_data["X_matrices"][idx]
+        Y = h5_data["Y_matrices"][idx]
         transition_matrix = build_transition_matrix(
-            h5_data["X_matrices"][idx], h5_data["Y_matrices"][idx], mo_coeff_occ, mo_coeff_vir
+            X, Y, mo_coeff_occ, mo_coeff_vir
         )
+        difference_matrix = build_difference_matrix(X, Y, mo_coeff_occ, mo_coeff_vir)
         push!(transition_matrices, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
+        push!(difference_matrices, to_real_density(difference_matrix, T; label = "difference density matrix for state $(idx)"))
         push!(transition_energies_eV, h5_data["energies_ev"][idx])
     end
 
@@ -362,6 +389,8 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         widths,
         coefficients,
         normalised_coefficients,
+        atom_symbols,
+        nuclear_charges,
         atom_coordinates,
         molecule_cuboid,
         primitive_to_orbital,
@@ -378,6 +407,8 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         cartesian_c,
         cartesian_prefactor,
         transition_matrices,
+        ground_state_matrix,
+        difference_matrices,
         transition_energies_eV,
         n_primitives,
         n_orbitals,

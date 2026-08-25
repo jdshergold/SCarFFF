@@ -13,16 +13,22 @@ using Quaternionic
 using StaticArrays
 using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
 using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_crystal_lattice,
-                                  rotate_R_tensors, compute_coherent_crystal_f_lm,
+                                  compute_spherical_form_factor_with_densities,
+                                  rotate_R_tensors, rotate_crystal_R_tensors,
+                                  compute_coherent_crystal_f_lm,
                                   compute_incoherent_crystal_f_lm, project_f_lm,
-                                  enumerate_neighbour_cells, compute_couplings, default_angular_grid,
-                                  choose_ewald_parameters, build_ewald_long_range, subtract_self_term!,
+                                  enumerate_neighbour_cells, compute_couplings,
+                                  compute_crystal_corrections, default_angular_grid,
+                                  choose_ewald_parameters, build_ewald_long_range,
+                                  compute_ewald_diagonal, subtract_self_term!,
                                   image_translation_span, supercell_radius,
+                                  set_diagonal_corrections!,
                                   derive_symmetry_operations, build_stars,
                                   star_reduction_factor, choose_compatible_phi_count
 using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
 using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
-using SCarFFF.SphericalFormFactor.BlochHamiltonian: BlochEigensystem, solve_bloch_hamiltonian!
+using SCarFFF.SphericalFormFactor.BlochHamiltonian: BlochEigensystem, solve_bloch_hamiltonian!,
+                                                    solve_bloch_energies!
 using SCarFFF.ThreadChunks: chunk_count, chunk_range
 using SCarFFF.StageTimings: print_stage_timings
 using Base.Threads
@@ -72,13 +78,27 @@ function sample_band_plane(
     energies = fill(T(NaN), n_states, n_points, n_points)
     n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
 
-    # Rebuild the Hamiltonian and diagonalise for the energies at each k. 
+    # Time reversal gives E(k) = E(-k) for any crystal, and the axes are symmetric about zero, so the
+    # antipode of sample (i, j) is exactly sample (n + 1 - i, n + 1 - j). We get this for free.
+    antipode(i, j) = (n_points + 1 - i, n_points + 1 - j)
+    to_be_solved = falses(n_points, n_points)
+    @inbounds for i in 1:n_points, j in 1:n_points
+        # Of each (k, -k) pair, the one reached first does the work and the other copies it later.
+        # k = 0 is its own partner, so it has nothing to copy from and must solve itself.
+        partner = antipode(i, j)
+        to_be_solved[i, j] = partner >= (i, j)
+    end
+
+    # Rebuild the Hamiltonian and diagonalise for the energies at each k. Only the energies are ever
+    # read, so don't solve for the eigenvectors.
     n_chunks = chunk_count(n_points, nthreads())
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
-            eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells)
+            eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells, vecs = false)
             for i in chunk_range(chunk, n_chunks, n_points)
                 for j in 1:n_points
+                    to_be_solved[i, j] || continue
+
                     components = zeros(T, 3)
                     components[first_axis] = axis_a_invA[i]
                     components[second_axis] = axis_b_invA[j]
@@ -89,12 +109,22 @@ function sample_band_plane(
                                  for axis in 1:3)
                     inside || continue
 
-                    solve_bloch_hamiltonian!(eigensystem, basis, k_vector, couplings, long_range)
+                    solve_bloch_energies!(eigensystem, basis, k_vector, couplings, long_range)
                     @inbounds for state in 1:n_states
                         energies[state, i, j] = eigensystem.energies[state]
                     end
                 end
             end
+        end
+    end
+
+    # Mirror the solved half onto its antipodes. The zone test is symmetric under k -> -k, so a NaN
+    # simply carries across and the blank region outside the zone is preserved.
+    @inbounds for i in 1:n_points, j in 1:n_points
+        to_be_solved[i, j] && continue
+        mirror_i, mirror_j = antipode(i, j)
+        for state in 1:n_states
+            energies[state, i, j] = energies[state, mirror_i, mirror_j]
         end
     end
 
@@ -168,11 +198,12 @@ function parse_commandline()::Dict{String, Any}
                    "yz is k_x = 0. Use 'all' for all three, or 'none' to skip it."
             default = "none"
         "--band-map-points"
-            help = "Samples along each axis of the band map plane."
+            help = "Samples along each axis of the band map plane. Prefer an odd value, so that k = 0 is " *
+                   "sampled and the time-reversal pairing has a fixed point rather than a gap."
             arg_type = Int
-            default = 401
+            default = 101
         "--no-couplings"
-            help = "Switch the intermolecular couplings off entirely (coherent crystal mode), leaving the bands flat and recovering the zeroth-order limit."
+            help = "Switch the intermolecular corrections J and D off entirely (coherent crystal mode), leaving the bands flat at the monomer energies and recovering the zeroth-order limit."
             action = :store_true
         "--method"
             help = "Computation method for the form factor. Options: 'spherical', 'fft', or 'cartesian'."
@@ -707,21 +738,42 @@ function main()
                         error("No conformer TD-DFT results found at $(td_h5).")
                     end
 
-                    # Get the form factor for this conformer.
-                    R_tensor, f_s, f_lm, transition_energies_eV = compute_spherical_form_factor(
-                        q_grid,
-                        theta_grid,
-                        phi_grid,
-                        l_max,
-                        td_h5,
-                        transition_indices=transition_indices,
-                        force_recomputation=force_recomp,
-                        threshold=threshold_val,
-                        use_gpu=use_gpu,
-                        need_grid=need_grid,
-                        need_R=need_R,
-                        need_flm=true
-                    )
+                    # The coherent correction also needs ΔN and Ξ. They go through the same R
+                    # contraction, but remain internal rather than changing the molecular output.
+                    need_xi_and_dN = crystal_order == "coherent" && !no_couplings
+                    xi_and_dN = nothing
+                    if need_xi_and_dN
+                        R_tensor, f_s, f_lm, transition_energies_eV, xi_and_dN =
+                            compute_spherical_form_factor_with_densities(
+                                q_grid,
+                                theta_grid,
+                                phi_grid,
+                                l_max,
+                                td_h5,
+                                transition_indices=transition_indices,
+                                force_recomputation=force_recomp,
+                                threshold=threshold_val,
+                                use_gpu=use_gpu,
+                                need_grid=need_grid,
+                                need_R=need_R,
+                                need_flm=true
+                            )
+                    else
+                        R_tensor, f_s, f_lm, transition_energies_eV = compute_spherical_form_factor(
+                            q_grid,
+                            theta_grid,
+                            phi_grid,
+                            l_max,
+                            td_h5,
+                            transition_indices=transition_indices,
+                            force_recomputation=force_recomp,
+                            threshold=threshold_val,
+                            use_gpu=use_gpu,
+                            need_grid=need_grid,
+                            need_R=need_R,
+                            need_flm=true
+                        )
+                    end
 
                     push!(conformer_f_lm, f_lm)
                     conformer_results[conformer_label] = (
@@ -729,6 +781,7 @@ function main()
                         f_s = f_s,
                         f_lm = f_lm,
                         transition_energies_eV = transition_energies_eV,
+                        xi_and_dN = xi_and_dN,
                     )
 
                     # Write the results to HDF5 for this conformer.
@@ -856,8 +909,22 @@ function main()
                     # Rotate each conformer's coefficients into every image's orientation using D matrices.
                     # This keeps all images on the same unrotated q grid.
                     stage_times = Pair{String, Float64}[]
-                    rotate_timing = @timed rotate_R_tensors(conformer_R_tensors, images, basis, l_max)
-                    rotated_R = rotate_timing.value
+                    rotated_difference = nothing
+                    rotated_Xi = nothing
+                    if crystal_order == "coherent" && !no_couplings
+                        conformer_difference = [conformer_results[label].xi_and_dN.difference_R
+                                                for label in conformer_labels]
+                        conformer_Xi = [conformer_results[label].xi_and_dN.Xi_R
+                                        for label in conformer_labels]
+                        rotate_timing = @timed rotate_crystal_R_tensors(
+                            conformer_R_tensors, conformer_difference, conformer_Xi,
+                            images, basis, l_max)
+                        rotated_R, rotated_difference, rotated_Xi = rotate_timing.value
+                    else
+                        rotate_timing = @timed rotate_R_tensors(
+                            conformer_R_tensors, images, basis, l_max)
+                        rotated_R = rotate_timing.value
+                    end
                     push!(stage_times, "rotate R tensors" => rotate_timing.time)
 
                     # The Brillouin zone folding works in inverse Angstroms, matching the lattice.
@@ -898,7 +965,7 @@ function main()
                     crystal_long_range = nothing
                     cells = nothing
                     if no_couplings
-                        println("Intermolecular couplings are switched off, so the bands will be flat.")
+                        println("Intermolecular corrections J and D are switched off, so the bands will be flat at the monomer energies.")
                     else
                         if coupling_method == "ewald"
                             ewald_parameters = choose_ewald_parameters(
@@ -919,11 +986,13 @@ function main()
                         end
 
                         if ewald_parameters === nothing
-                            println("Computing intermolecular couplings directly out to $(coupling_cutoff) Å ($(length(cells.vectors)) cells).")
-                            coupling_timing = @timed compute_couplings(
-                                rotated_R, basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
-                            crystal_couplings = coupling_timing.value
-                            push!(stage_times, "couplings J(ΔR)" => coupling_timing.time)
+                            println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.vectors)) cells).")
+                            correction_timing = @timed compute_crystal_corrections(
+                                rotated_R, rotated_difference, rotated_Xi,
+                                basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
+                            crystal_couplings, diagonal_corrections = correction_timing.value
+                            set_diagonal_corrections!(basis, diagonal_corrections)
+                            push!(stage_times, "couplings J and diagonal D" => correction_timing.time)
                         else
                             tau_of_lambda = [basis.images[basis.image_of[lambda]].translation
                                              for lambda in 1:length(basis.energies)]
@@ -947,12 +1016,20 @@ function main()
                                     "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
                             no_dipole_term && println("The Q = 0 term is dropped, so this is the conducting boundary condition.")
 
-                            coupling_timing = @timed compute_couplings(
-                                rotated_R, basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
+                            correction_timing = @timed compute_crystal_corrections(
+                                rotated_R, rotated_difference, rotated_Xi,
+                                basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
                                 parameters = ewald_parameters)
-                            crystal_couplings = coupling_timing.value
-                            push!(stage_times, "couplings J(ΔR)" => coupling_timing.time)
+                            crystal_couplings, diagonal_short_range = correction_timing.value
+                            push!(stage_times, "short-range J and D(ΔR)" => correction_timing.time)
                             subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
+
+                            diagonal_timing = @timed compute_ewald_diagonal(
+                                rotated_difference, rotated_Xi, q_grid_invA, l_max,
+                                crystal_long_range)
+                            set_diagonal_corrections!(
+                                basis, diagonal_short_range .+ diagonal_timing.value)
+                            push!(stage_times, "Ewald long-range D" => diagonal_timing.time)
                         end
                     end
 
@@ -1056,10 +1133,12 @@ function main()
                             write(io, "band_energy_mean_eV", crystal_results.band_summary[:, 3])
                         end
 
-                        # Unperturbed monomer energies, to compare against the bands above. Indexed by
-                        # λ, so compare as sets rather than element by element. These are the diag(E)
-                        # of H(k) below.
+                        # Unperturbed monomer energies are present for both crystal orders. The
+                        # environment shifts belong only to the coherent Frenkel Hamiltonian.
                         write(io, "localised_energies_eV", coherent_basis.energies)
+                        if crystal_results.order == "coherent"
+                            write(io, "diagonal_corrections_eV", coherent_basis.diagonal_corrections)
+                        end
 
                         # Save the lattice vectors and image translations.
                         write(io, "lattice_A", Matrix{T}(crystal_results.lattice.direct))
@@ -1070,7 +1149,7 @@ function main()
                         # Save everything needed to rebuild H(k), and hence E_Ψ(k) and C(k), at any k
                         # later:
                         #
-                        #     H(k) = diag(E) + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
+                        #     H(k) = diag(E + D) + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
                         if crystal_results.couplings !== nothing
                             couplings_group = create_group(io, "couplings")
                             write(couplings_group, "method", coupling_method)
