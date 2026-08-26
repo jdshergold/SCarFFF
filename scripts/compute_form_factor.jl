@@ -35,6 +35,93 @@ using Base.Threads
 using LinearAlgebra: norm, dot
 
 
+
+function manifold_spreads(uncoupled::Vector{T}, coupled::Vector{T}) where {T<:AbstractFloat}
+    """
+    The spread of the coupled energies within each degenerate block of the uncoupled ones.
+
+    A monomer transition appears once per molecule in the cell, so each block is one Davydov
+    multiplet: D moves its mean, J sets its width.
+
+    # Arguments:
+    - uncoupled::Vector{T}: The uncoupled energies, ascending.
+    - coupled::Vector{T}: The coupled energies, ascending.
+
+    # Returns:
+    - Vector{T}: One spread per block, in eV.
+    """
+
+    spreads = T[]
+    start = 1
+    for state in 2:(length(uncoupled) + 1)
+        if state > length(uncoupled) || !isapprox(uncoupled[state], uncoupled[start]; rtol = 1e-8)
+            block = @view coupled[start:(state - 1)]
+            push!(spreads, maximum(block) - minimum(block))
+            start = state
+        end
+    end
+
+    return spreads
+end
+
+function print_gamma_point_shifts(
+        basis, lattice, couplings, long_range, ::Type{T},
+    ) where {T<:AbstractFloat}
+    """
+    Print the crystal states at Γ beside the monomer energies they came from.
+
+    With no couplings H is diag(E), so its spectrum is just the monomer energies repeated once per
+    molecule in the cell. Turning J and D on and solving at k = 0 gives the crystal spectrum. Both
+    are sorted ascending, so comparing them state by state shows what the crystal did.
+
+    # Arguments:
+    - basis: The localised excitation basis.
+    - lattice: The crystal lattice, unused beyond matching the solver signature.
+    - couplings: The real-space couplings, or nothing.
+    - long_range: The Ewald long-range data, or nothing.
+    - T::Type: The floating point type.
+
+    # Returns:
+    - Nothing. The table is printed.
+    """
+
+    # Get the crystal spectrum at the Gamma point.
+    n_lambda = length(basis.energies)
+    n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
+    eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells, vecs = false)
+    solve_bloch_energies!(eigensystem, basis, SVector{3, T}(0, 0, 0), couplings, long_range)
+
+    # Get the monomer spectrum at the Gamma point.
+    uncoupled = sort(basis.energies)
+    coupled = eigensystem.energies
+
+    # Fixed-width columns, with a rule between manifolds so the Davydov blocks are visible.
+    cell(x) = lpad(string(round(x, digits = 4)), 15)
+    rule = "  " * "\u2500"^7 * "\u253c" * "\u2500"^16 * "\u253c" * "\u2500"^16 * "\u253c" * "\u2500"^16
+
+    println("\nCrystal states at \u0393 (k = 0)")
+    println("  " * rpad("state", 7) * "\u2502" * lpad("no coupling", 16) * "\u2502" *
+            lpad("with coupling", 16) * "\u2502" * lpad("\u0394", 16))
+    println("  " * rpad("", 7) * "\u2502" * lpad("[eV]", 16) * "\u2502" *
+            lpad("[eV]", 16) * "\u2502" * lpad("[eV]", 16))
+    println(rule)
+    for state in 1:n_lambda
+        if state > 1 && !isapprox(uncoupled[state], uncoupled[state - 1]; rtol = 1e-8)
+            println(rule)
+        end
+        println("  " * rpad(state, 7) * "\u2502" * cell(uncoupled[state]) * " \u2502" *
+                cell(coupled[state]) * " \u2502" * cell(coupled[state] - uncoupled[state]) * " ")
+    end
+    println(rule)
+
+    spreads = manifold_spreads(uncoupled, coupled)
+    println("  largest shift " * string(round(maximum(abs, coupled .- uncoupled), digits = 4)) *
+            " eV, largest Davydov splitting " * string(round(maximum(spreads), digits = 4)) * " eV")
+
+    return nothing
+end
+
+
 function sample_band_plane(
         basis, lattice, couplings, long_range, plane::String, n_points::Int, ::Type{T},
     ) where {T<:AbstractFloat}
@@ -1080,6 +1167,10 @@ function main()
                     end
 
                     print_stage_timings("Crystal stage timings", stage_times)
+
+                    # Show what the crystal did to the monomer energies.
+                    print_gamma_point_shifts(
+                        basis, lattice, crystal_couplings, crystal_long_range, T)
                     println()
 
                     crystal_results = (
