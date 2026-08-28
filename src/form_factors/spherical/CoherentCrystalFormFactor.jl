@@ -13,9 +13,10 @@ using LinearAlgebra: mul!, dot, BLAS
 using ..CrystalLattice: CrystalLatticeData, fold_to_bz
 using ..Ewald: EwaldLongRangeData
 using ..BlochHamiltonian: CrystalImage, CrystalExcitationBasis, BlochEigensystem, CrystalCouplings, solve_bloch_hamiltonian!
-using ..ProjectFLM: build_projection_matrices, build_U_blocks, project_block!
+using ..ProjectFLM: build_projection_matrix, build_U_blocks, project_block!
 using ..WignerRotations: wigner_d_blocks
 using ..CrystalSymmetry: Stars, SymmetryOperation
+using ..StructureFactor: EnergyGrid, accumulate_delta!
 using ...ThreadChunks: chunk_count, chunk_range
 
 const VSDM = VectorSpaceDarkMatter
@@ -318,6 +319,8 @@ function compute_coherent_crystal_form_factor(
         need_grid::Bool = false,
         couplings::Union{Nothing, CrystalCouplings{T}} = nothing,
         long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
+        energy_grid::Union{Nothing, EnergyGrid{T}} = nothing,
+        structure_factor_buffer::Union{Nothing, Array{T, 4}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Build the coherent unit-cell form factor for each crystal excitation Ψ,
@@ -354,6 +357,11 @@ function compute_coherent_crystal_form_factor(
     - need_grid::Bool: Whether to also return the unsquared complex form factor (default: false).
     - couplings::Union{Nothing, CrystalCouplings{T}}: The "short-range" J_{λλ'}(ΔR), or nothing for no coupling.
     - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing.
+    - energy_grid::Union{Nothing, EnergyGrid{T}}: The energy grid to compute the structure function on, or
+      nothing to skip the structure function.
+    - structure_factor_buffer::Union{Nothing, Array{T, 4}}: The array the structure factor is built
+      in, holding one block of q at a time, with dimensions (n_energy, q_block, n_theta, n_phi). The
+      whole q grid at once would be several GB. Required when energy_grid is given.
 
     # Returns:
     - f_sq::Array{T, 4}: |f_{Ψ,uc}(q)|² with dimensions (n_states, length(q_indices), n_theta, n_phi).
@@ -361,6 +369,13 @@ function compute_coherent_crystal_form_factor(
       (min, max, sum). The full block can be recovered from the Hamiltonian later if needed.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The unsquared f_{Ψ,uc}(q) if need_grid is set, with
       the same dimensions as f_sq, otherwise nothing.
+    - block::Union{AbstractArray{T, 4}, Nothing}: The structure factor Σ_Ψ |f_{Ψ,uc}(q)|² δ(E - E_Ψ(q))
+      over this block of q, with the delta broadened. Dimensions (n_energy, length(q_indices),
+      n_theta, n_phi). This is a part of structure_factor_buffer, not a copy of it.
+    - occupancy::Matrix{Bool}: Which (energy bin, q) of that array hold anything at all, so the
+      projection can skip the rest.
+    - outside::Int: How many states landed off the ends of the energy axis. Should be zero, otherwise
+      the stride over stars and q was too broad.
     """
 
     # Get the dimensions.
@@ -378,6 +393,20 @@ function compute_coherent_crystal_form_factor(
     f_sq = Array{T, 4}(undef, n_lambda, n_q_block, n_theta, n_phi)
     f_s = need_grid ? Array{Complex{T}, 4}(undef, n_lambda, n_q_block, n_theta, n_phi) : nothing
 
+    # The structure factor over the whole q grid is never needed, and would be too big, several GB. Instead
+    # compute_coherent_crystal_f_lm makes one reusable array big enough for a block of q, and we take the
+    # piece of it this block (which may be smaller near the endpoints) needs. This is then projected
+    # onto spherical harmonics before being zeroed at each step.
+    n_energy = energy_grid === nothing ? 0 : length(energy_grid.energies)
+    block = nothing
+    if energy_grid !== nothing
+        structure_factor_buffer === nothing &&
+            error("An energy grid was given with nowhere to accumulate it.")
+        # A part of the buffer, not a copy of it. The last block has fewer q than the rest.
+        block = @view structure_factor_buffer[:, 1:n_q_block, :, :]
+        fill!(block, zero(T))
+    end
+
     # Build the arrays τ(A_i) and Λ(λ).
     image_translations = [image.translation for image in basis.images]
     n_images = length(image_translations)
@@ -392,6 +421,10 @@ function compute_coherent_crystal_form_factor(
     chunk_min = [fill(T(Inf), n_lambda) for _ in 1:n_chunks]
     chunk_max = [fill(T(-Inf), n_lambda) for _ in 1:n_chunks]
     chunk_sum = [zeros(T, n_lambda) for _ in 1:n_chunks]
+
+    # Create an array of "false" for each task, which will be used to mark where the bands are and skip empty regions.
+    chunk_occupancy = [zeros(Bool, n_energy, n_q_block) for _ in 1:n_chunks]
+    chunk_outside = zeros(Int, n_chunks)
 
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
@@ -412,6 +445,8 @@ function compute_coherent_crystal_form_factor(
             local_min = chunk_min[chunk]
             local_max = chunk_max[chunk]
             local_sum = chunk_sum[chunk]
+            local_occupancy = chunk_occupancy[chunk]
+            outside_count = 0
 
             # Thread over stars.
             for star_idx in chunk_range(chunk, n_chunks, n_stars)
@@ -509,7 +544,17 @@ function compute_coherent_crystal_form_factor(
                                 if f_s !== nothing
                                     f_s[state_idx, q_local, write_theta, write_phi] = total
                                 end
-                                
+
+                                # Spread this value out along energies using the almost-delta function.
+                                # The function returns the number of points, if any, that were outside
+                                # the energy range. In theory this should never happen.
+                                if block !== nothing
+                                    outside_count += accumulate_delta!(
+                                                      block, local_occupancy,
+                                                      energy_grid, energy, magnitude,
+                                                      q_local, write_theta, write_phi)
+                                end
+
                                 # Track the band statistics for each chunk.
                                 local_min[state_idx] = min(local_min[state_idx], energy)
                                 local_max[state_idx] = max(local_max[state_idx], energy)
@@ -519,6 +564,8 @@ function compute_coherent_crystal_form_factor(
                     end
                 end
             end
+
+            chunk_outside[chunk] = outside_count
         end
     end
 
@@ -530,7 +577,13 @@ function compute_coherent_crystal_form_factor(
         band_stats[state_idx, 3] = sum(chunk_sum[chunk][state_idx] for chunk in 1:n_chunks)
     end
 
-    return f_sq, band_stats, f_s
+    # Mark which energies and q points are occupied.
+    occupancy = zeros(Bool, n_energy, n_q_block)
+    @inbounds for chunk in 1:n_chunks, index in eachindex(occupancy)
+        occupancy[index] |= chunk_occupancy[chunk][index] # a |= b means a = a | b. 
+    end
+
+    return f_sq, band_stats, f_s, block, occupancy, sum(chunk_outside)
 end
 
 
@@ -583,7 +636,7 @@ function compute_incoherent_crystal_f_lm(
     size(rotated_R, 3) == n_keys ||
         error("The rotated coefficients have $(size(rotated_R, 3)) keys, which does not match l_max = $(l_max).")
 
-    A_real, A_imag = build_projection_matrices(theta_grid, phi_grid, l_max)
+    A = build_projection_matrix(theta_grid, phi_grid, l_max)
     U_blocks = build_U_blocks(l_max, T)
 
     f_lm = Array{T, 3}(undef, n_transitions, n_q, n_keys)
@@ -637,7 +690,7 @@ function compute_incoherent_crystal_f_lm(
             end
         end
 
-        project_block!(f_lm, f_sq_block, A_real, A_imag, U_blocks, q_start, l_max)
+        project_block!(f_lm, f_sq_block, A, U_blocks, q_start, l_max)
 
         if f_s !== nothing
             @inbounds for phi_idx in 1:n_phi, theta_idx in 1:n_theta,
@@ -669,6 +722,7 @@ function compute_coherent_crystal_f_lm(
         need_grid::Bool = false,
         couplings::Union{Nothing, CrystalCouplings{T}} = nothing,
         long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
+        energy_grid::Union{Nothing, EnergyGrid{T}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Compute the coherent crystal form factor and project it onto real spherical harmonics,
@@ -688,6 +742,8 @@ function compute_coherent_crystal_f_lm(
       (default: false).
     - couplings::Union{Nothing, CrystalCouplings{T}}: The J_{λλ'}(ΔR), or nothing for no coupling.
     - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing.
+    - energy_grid::Union{Nothing, EnergyGrid{T}}: The energy axis for the structure function, or
+      nothing to skip it.
 
     # Returns:
     - f_lm::Array{T, 3}: The real spherical harmonic coefficients of |f_{Ψ,uc}|², with dimensions (n_states, n_q, n_keys).
@@ -696,6 +752,9 @@ function compute_coherent_crystal_f_lm(
       the monomer energies with zero bandwidth, which is itself a useful check.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The unsquared f_{Ψ,uc}(q) on the full grid if
       need_grid is set, with dimensions (n_states, n_q, n_theta, n_phi), otherwise nothing.
+    - structure_factor::Union{Array{T, 3}, Nothing}: f²_{ℓm}(q, E) in eV^{-1}, with dimensions
+      (n_energy, n_q, n_keys), or nothing. Unlike f_lm this is summed over states.
+    - outside_grid::Int: How many states fell off the ends of the energy axis, which should be zero.
     """
 
     n_states = length(basis.energies)
@@ -705,17 +764,28 @@ function compute_coherent_crystal_f_lm(
     n_keys = (l_max + 1)^2
 
     # The projection matrices and the complex-to-real transformation are shared across all blocks.
-    A_real, A_imag = build_projection_matrices(theta_grid, phi_grid, l_max)
+    A = build_projection_matrix(theta_grid, phi_grid, l_max)
     U_blocks = build_U_blocks(l_max, T)
 
     f_lm = Array{T, 3}(undef, n_states, n_q, n_keys)
     f_s = need_grid ? Array{Complex{T}, 4}(undef, n_states, n_q, n_theta, n_phi) : nothing
+
+    # Get the length of the energy axis, and allocate the array for the structure factor (ℓ,m) coefficients.
+    n_energy = energy_grid === nothing ? 0 : length(energy_grid.energies)
+    structure_factor = energy_grid === nothing ? nothing : zeros(T, n_energy, n_q, n_keys)
+
+    # We don't compute the whole structure factor in one go, as it would be too big in memory.
+    # Instead we build a small q subset and then project this onto spherical harmoncis before throwing it away.
+    # This is the buffer for that.
+    structure_factor_buffer = energy_grid === nothing ? nothing :
+        Array{T, 4}(undef, n_energy, min(q_block, n_q), n_theta, n_phi)
 
     # Running band statistics, accumulated across blocks.
     band_min = fill(T(Inf), n_states)
     band_max = fill(T(-Inf), n_states)
     band_sum = zeros(T, n_states)
     band_count = 0
+    outside_grid = 0
 
     # Avoid BLAS oversubscription.
     blas_threads = BLAS.get_num_threads()
@@ -728,11 +798,20 @@ function compute_coherent_crystal_f_lm(
 
         # Compute the coherent crystal form factor for this block of q, streaming over θ and ϕ so the
         # full |f|² grid is never held in memory at once.
-        f_sq_block, block_stats, f_s_block = compute_coherent_crystal_form_factor(
-            rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max, stars, q_indices;
-            need_grid = need_grid, couplings = couplings, long_range = long_range)
+        f_sq_block, block_stats, f_s_block, structure_factor_block, energy_occupancy, block_outside =
+            compute_coherent_crystal_form_factor(
+                rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max, stars,
+                q_indices; need_grid = need_grid, couplings = couplings, long_range = long_range,
+                energy_grid = energy_grid, structure_factor_buffer = structure_factor_buffer)
 
-        project_block!(f_lm, f_sq_block, A_real, A_imag, U_blocks, q_start, l_max)
+        # Now project the block onto spherical harmonics.
+        BLAS.set_num_threads(blas_threads)
+        project_block!(f_lm, f_sq_block, A, U_blocks, q_start, l_max)
+        if structure_factor !== nothing
+            project_block!(structure_factor, structure_factor_block, A, U_blocks,
+                           q_start, l_max; occupancy = energy_occupancy)
+        end
+        BLAS.set_num_threads(1)
 
         # Store the unsquared form factor on the full grid if requested, so it can be plotted later.
         if f_s !== nothing
@@ -746,6 +825,7 @@ function compute_coherent_crystal_f_lm(
             band_sum[state_idx] += block_stats[state_idx, 3]
         end
         band_count += length(q_indices) * length(theta_grid) * length(phi_grid)
+        outside_grid += block_outside
     end
 
     # Reset the BLAS thread count to its original value.
@@ -761,7 +841,7 @@ function compute_coherent_crystal_f_lm(
         band_summary[state_idx, 3] = band_sum[state_idx] / band_count
     end
 
-    return f_lm, band_summary, f_s
+    return f_lm, band_summary, f_s, structure_factor, outside_grid
 end
 
 end

@@ -23,6 +23,7 @@ include("ProjectFLM.jl")
 include("WignerRotations.jl")
 include("CouplingJ.jl")
 include("CrystalSymmetry.jl")
+include("StructureFactor.jl")
 include("CoherentCrystalFormFactor.jl")
 include("ComputeRates.jl")
 
@@ -49,6 +50,9 @@ using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings,
                   image_translation_span
 using .CrystalSymmetry: SymmetryOperation, Stars, derive_symmetry_operations,
                         build_stars, star_reduction_factor, choose_compatible_phi_count
+using .StructureFactor: EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
+                        incoherent_structure_factor, integrate_energy, trim_energy_axis,
+                        describe_energy_grid, kernel_shape
 using .CoherentCrystalFormFactor: rotate_R_tensors, rotate_crystal_R_tensors,
                                   compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
                                   compute_incoherent_crystal_f_lm
@@ -63,6 +67,9 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        rotate_R_tensors, rotate_crystal_R_tensors,
        compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
        compute_incoherent_crystal_f_lm, project_f_lm,
+       EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
+       incoherent_structure_factor, integrate_energy, trim_energy_axis, describe_energy_grid,
+       kernel_shape,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        compute_ewald_diagonal, subtract_self_term!,
        image_translation_span, supercell_radius

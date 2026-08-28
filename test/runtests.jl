@@ -460,3 +460,134 @@ end
         @test ewald_values[1] ≈ only(direct_D) rtol = 1.5e-2 atol = 2e-5
     end
 end
+
+@testset "Structure function energy axis" begin
+    # Check that the grid spans from 5 eV to 8 eV, with a σ_E = 3 dE buffer on either end.
+    grid = SF.build_energy_grid(5.0, 8.0, 0.01)
+
+    @test grid.step ≈ 0.01
+    @test grid.sigma ≈ 3 * grid.step
+    @test grid.half_window == 3
+
+    # Check that there are either 5 or 6 points (for σ_E = 3 ΔE)
+    for offset in range(0, grid.step, length = 9)[1:8]
+        buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
+        occupancy = zeros(Bool, length(grid.energies), 1)
+        SF.accumulate_delta!(buffer, occupancy, grid, 6.5 + offset, 1.0, 1, 1, 1)
+        @test count(!iszero, buffer) in (5, 6)
+    end
+    @test first(grid.energies) ≈ 5.0 - grid.sigma
+    @test last(grid.energies) >= 8.0 + grid.sigma
+    @test all(diff(grid.energies) .≈ 0.01)
+
+    # σ_E is where the mollifier reaches zero, with nothing at all beyond it. Check this.
+    @test SF.kernel_shape(grid, grid.sigma) == 0.0
+    @test SF.kernel_shape(grid, 1.01 * grid.sigma) == 0.0
+    @test SF.kernel_shape(grid, 0.99 * grid.sigma) > 0.0
+
+    # Check that halving the grid spacing halves σ_E.
+    finer = SF.build_energy_grid(5.0, 8.0, 0.005)
+
+    @test finer.sigma ≈ grid.sigma / 2
+    @test length(finer.energies) > length(grid.energies)
+
+    # Reject ΔE that are too small, as we would need too many grid points.
+    @test_throws ErrorException SF.build_energy_grid(5.0, 8.0, 1e-7)
+    @test_throws ErrorException SF.build_energy_grid(5.0, 8.0, -0.01)
+
+    # Check that the delta approximation preserves the normalisation.
+    for energy in (5.0, 6.5, 8.0, first(grid.energies), last(grid.energies))
+        buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
+        occupancy = zeros(Bool, length(grid.energies), 1)
+        SF.accumulate_delta!(buffer, occupancy, grid, energy, 3.25, 1, 1, 1)
+        @test sum(buffer) * grid.step ≈ 3.25
+    end
+
+    # Check everything in the structure factor is zero away from where the bands are.
+    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.energies), 1)
+    SF.accumulate_delta!(buffer, occupancy, grid, 6.5, 1.0, 1, 1, 1)
+    outside = abs.(grid.energies .- 6.5) .> grid.sigma
+
+    @test all(buffer[outside, 1, 1, 1] .== 0.0)
+
+    # Also check that it nonzero where it should be.
+    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.energies), 1)
+    SF.accumulate_delta!(buffer, occupancy, grid, 6.5, 1.0, 1, 1, 1)
+    weights = buffer[:, 1, 1, 1]
+    mean_energy = sum(weights .* grid.energies) / sum(weights)
+
+    @test mean_energy ≈ 6.5 atol = 1e-6
+    @test grid.energies[argmax(weights)] ≈ 6.5 atol = grid.step
+
+    # Check that the variance is what we expect.
+    variance = sum(weights .* (grid.energies .- mean_energy).^2) / sum(weights)
+    @test sqrt(variance) ≈ 0.3976350541 * grid.sigma rtol = 5e-2
+
+    # Check that multiple states are actually accumulated, and don't overwrite one another.
+    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.energies), 1)
+    for (energy, magnitude) in ((5.5, 1.0), (6.0, 2.0), (7.25, 0.5))
+        SF.accumulate_delta!(buffer, occupancy, grid, energy, magnitude, 1, 1, 1)
+    end
+    @test sum(buffer) * grid.step ≈ 3.5
+
+    # Make sure that all of the bins with stuff in are marked as occupied.
+    @test all(buffer[.!occupancy[:, 1], 1, 1, 1] .== 0.0)
+    @test count(occupancy) < length(grid.energies)
+
+    # The incoherent route spreads fixed transition energies, and integrating E must give back the
+    # coefficients it started from.
+    f_lm = reshape(collect(1.0:12.0), 2, 2, 3)
+    energies = [5.5, 7.0]
+    structure_factor = SF.incoherent_structure_factor(f_lm, energies, grid)
+    integral = SF.integrate_energy(structure_factor, grid)
+
+    @test size(structure_factor) == (length(grid.energies), 2, 3)
+    @test integral ≈ dropdims(sum(f_lm, dims = 1), dims = 1)
+end
+
+@testset "Energy axis trimming" begin
+    # The axis is built wider than the bands need, so the empty ends come off before anything is
+    # saved to disk.
+    grid = SF.build_energy_grid(5.0, 8.0, 0.01)
+    n_energy = length(grid.energies)
+    structure_factor = zeros(Float64, n_energy, 2, 3)
+
+    # Put some nonzero physics in two bins.
+    low_bin, high_bin = 20, n_energy - 15
+    structure_factor[low_bin, 1, 1] = 1.0
+    structure_factor[high_bin, 2, 3] = 2.0
+
+    # Trim the grid.
+    trimmed, trimmed_grid = SF.trim_energy_axis(structure_factor, grid)
+
+    # Check the trimmed size is correct.
+    @test size(trimmed) == (high_bin - low_bin + 1, 2, 3)
+    @test length(trimmed_grid.energies) == high_bin - low_bin + 1
+    @test trimmed_grid.energies[1] ≈ grid.energies[low_bin]
+    @test trimmed_grid.energies[end] ≈ grid.energies[high_bin]
+
+    # Check that the trimming didn't drop anything nonzero.
+    @test trimmed_grid.sigma == grid.sigma
+    @test trimmed_grid.step == grid.step
+    @test sum(trimmed) == sum(structure_factor)
+
+    # Check that there are the right number of gaps in the middle.
+    @test count(iszero, trimmed) == length(trimmed) - 2
+
+    # Nothing to trim leaves the arrays alone rather than copying them.
+    full = ones(Float64, n_energy, 2, 3)
+    untrimmed, untrimmed_grid = SF.trim_energy_axis(full, grid)
+
+    @test untrimmed === full
+    @test untrimmed_grid === grid
+
+    # An empty structure function is returned as it stands rather than trimmed to nothing.
+    empty_factor = zeros(Float64, n_energy, 2, 3)
+    unchanged, unchanged_grid = SF.trim_energy_axis(empty_factor, grid)
+
+    @test unchanged === empty_factor
+    @test length(unchanged_grid.energies) == n_energy
+end

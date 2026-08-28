@@ -8,6 +8,7 @@ from pathlib import Path
 import h5py
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.colors import SymLogNorm
 import numpy as np
 import warnings
 
@@ -129,6 +130,71 @@ def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean)
 
     return lines
 
+
+
+def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
+    """
+    Draw the structure function f^2_{lm}(q, E) over the (q, dE) plane, one panel per mode.
+
+    # Arguments:
+    - coherent_path::Path: The crystal HDF5, carrying structure_factor_f_lm and energy_grid_eV.
+    - output_dir::Path: Directory to write the figure into.
+    - top_n::int: How many of the dominant (l, m) modes to draw beside the monopole.
+    - dpi::int: Figure resolution.
+
+    # Returns:
+    - None.
+    """
+
+    with h5py.File(coherent_path, "r") as crystal_file:
+        # Julia writes (n_energy, n_q, n_keys), and HDF5 reverses it.
+        structure_factor = np.array(crystal_file["structure_factor_f_lm"]).T
+        energy_grid = crystal_file["energy_grid_eV"][()]
+        q_grid = crystal_file["q_grid"][()]
+
+    # Compute the step size.
+    step = (energy_grid[-1] - energy_grid[0]) / (len(energy_grid) - 1)
+
+    # Use the same top modes as the energy-independent form factor, since their integrated weight should be the same.
+    integrated = structure_factor.sum(axis=0) * step
+    modes = [mode for mode in get_top_flm_modes(integrated, q_grid, top_n=top_n + 1)
+             if mode != (0, 0)][:top_n]
+
+    # Always plot the isotropic mode first.
+    panels = [(0, 0)] + modes
+    n_columns = min(3, len(panels))
+    n_rows = int(np.ceil(len(panels) / n_columns))
+
+    figure, axes = plt.subplots(n_rows, n_columns, figsize=(4.6 * n_columns, 3.6 * n_rows),
+                                squeeze=False, sharex=True, sharey=True, layout="constrained")
+    extent = [q_grid[0], q_grid[-1], energy_grid[0], energy_grid[-1]]
+
+    # Use the same scale for all modes, to makew them easier to compare.
+    limit = max(np.abs(structure_factor[:, :, l * l + (l + m)]).max() for l, m in panels) or 1.0
+    norm = SymLogNorm(linthresh=limit * 1e-3, vmin=-limit, vmax=limit, base=10)
+
+    image = None
+    for index, (l, m) in enumerate(panels):
+        row, column = divmod(index, n_columns)
+        axis = axes[row][column]
+        image = axis.imshow(structure_factor[:, :, l * l + (l + m)], origin="lower", extent=extent,
+                            aspect="auto", cmap="RdBu_r", norm=norm)
+        axis.set_title(rf"$\ell = {l},\ m = {m}$")
+        if row == n_rows - 1:
+            axis.set_xlabel(r"$q$ (keV)")
+        if column == 0:
+            axis.set_ylabel(r"$\Delta E$ (eV)")
+
+    # Any panels left over on the last row would otherwise render as empty axes.
+    for index in range(len(panels), n_rows * n_columns):
+        row, column = divmod(index, n_columns)
+        axes[row][column].axis("off")
+
+    figure.colorbar(image, ax=axes, shrink=0.6,
+                    label=r"$f^2_{\ell m}(q, \Delta E)\,[\mathrm{eV}^{-1}]$")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_dir / "structure_factor_qE.png", dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
 
 
 def plot_band_energies(coherent_path, output_dir, dpi=200):
@@ -404,8 +470,6 @@ def parse_cli_args():
             band_min = coherent_file["band_energy_min_eV"][()] if has_bands else None
             band_max = coherent_file["band_energy_max_eV"][()] if has_bands else None
             band_mean = coherent_file["band_energy_mean_eV"][()] if has_bands else None
-
-        # CHECKED TO HERE.
 
         # Coherent groups run over crystal states, so each monomer transition contributes n_cell of
         # them; incoherent groups run over the monomer transitions themselves, so n_cell is 1 and the
@@ -1385,11 +1449,20 @@ def main():
     if args.coherent and args.coherent_path is not None:
         with h5py.File(args.coherent_path, "r") as coherent_file:
             has_bands = "band_map" in coherent_file
+            has_structure_factor = "structure_factor_f_lm" in coherent_file
         if has_bands:
             plot_band_energies(args.coherent_path, args.coherent_path.parent / "bands")
         else:
             print("No band_map group in the coherent output, so no band energy figures. Re-run the "
                   "form factor with --band-map-plane to get them.")
+
+        # Automatically plot the structure factor if it exists.
+        if has_structure_factor:
+            plot_structure_factor(args.coherent_path,
+                                  args.coherent_path.parent / "structure_factor")
+        else:
+            print("No structure_factor_f_lm in the crystal output, so no (q, dE) figures. Re-run "
+                  "the form factor without --no-structure-factor to get them.")
 
 
 if __name__ == "__main__":

@@ -8,13 +8,13 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="benzene_test_norm_coherent"     # Name for this run.
+RUN_NAME="salicylic_acid_test_norm_coherent"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
 CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
 SMILES=""        # Single molecule mode. SMILES string for the molecule.
-CIF_FILE="examples/benzene_1423904.cif"                 # Single crystal mode. Path to a CIF file.
+CIF_FILE="examples/our_favourite_molecules/ACSALA07.cif"                 # Single crystal mode. Path to a CIF file.
 CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
 
 # ==== Crystal parameters (crystal mode only). ====
@@ -25,6 +25,10 @@ CRYSTAL_ORDER="coherent"    # How to combine the monomer form factors. "coherent
 BAND_MAP_PLANE="all"        # Cartesian plane(s) to sample the band energies E(k) over, matching the
                             # form factor slices: "all", or one of xy (k_z=0), xz (k_y=0), yz (k_x=0),
                             # or "none" to skip.
+DELTA_E=0.01                # Bin width in eV of the energy axis of the structure function
+                            # f^2_lm(q, E). This determines the width of the mollifier too, sigma_E = 3 * DELTA_E.
+BAND_RANGE_STAR_STRIDE=8    # Stride over stars to use to estimate the band energy range. If any warnings are raised and points are lost, reduce this. ~8 is fine usually.
+BAND_RANGE_Q_STRIDE=4       # Stride over |q| to use to estimate the band energy range. If any warnings are raised and points are lost, reduce this. ~4 is fine usually.
 
 
 # ==== TD-DFT parameters. ====
@@ -50,7 +54,7 @@ N_THETA=0                  # Number of theta (polar angle) grid points, or 0 to 
 N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 to size from L_MAX.
 
 # Spherical harmonic expansion parameters.
-L_MAX=12                   # Maximum angular mode, l, to include in spherical harmonic expansion.
+L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
 COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
@@ -328,6 +332,11 @@ else
         JULIA_CMD="$JULIA_CMD --l-max $L_MAX"
         if [ "$CRYSTAL_MODE" = true ] && [ "$CRYSTAL_ORDER" = "coherent" ]; then
             JULIA_CMD="$JULIA_CMD --band-map-plane $BAND_MAP_PLANE"
+        fi
+        if [ "$CRYSTAL_MODE" = true ]; then
+            JULIA_CMD="$JULIA_CMD --dE $DELTA_E"
+            JULIA_CMD="$JULIA_CMD --band-range-star-stride $BAND_RANGE_STAR_STRIDE"
+            JULIA_CMD="$JULIA_CMD --band-range-q-stride $BAND_RANGE_Q_STRIDE"
         fi
         JULIA_CMD="$JULIA_CMD --threshold $THRESHOLD"
         COMPUTE_MODE_ARG=$(IFS=','; echo "${COMPUTE_MODES[*]}")

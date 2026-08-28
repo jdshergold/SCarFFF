@@ -10,7 +10,8 @@ using LinearAlgebra: mul!
 using ..ConstructFLMTensor: U
 using ...ThreadChunks: chunk_count, chunk_range
 
-export project_f_lm, build_projection_matrices, build_U_blocks, project_block!, default_angular_grid
+export project_f_lm, build_projection_matrices, build_projection_matrix, build_U_blocks,
+       project_block!, default_angular_grid
 
 function default_angular_grid(l_max::Int)::Tuple{Int, Int}
     """
@@ -83,6 +84,49 @@ function quadrature_weights(grid::Vector{T}, periodic::Bool)::Vector{T} where {T
 
     return weights
 end
+
+# Key for (ℓ, m ≥ 0) coefficients.
+@inline positive_key(l::Int, m::Int) = (l * (l + 1)) ÷ 2 + m + 1
+
+
+function build_projection_matrix(
+        theta_grid::Vector{T},
+        phi_grid::Vector{T},
+        l_max::Int,
+    )::Matrix{T} where {T<:AbstractFloat}
+    """
+    Build the projection matrix that takes |f(vec q)|² to its complex harmonic
+    coefficients, keeping only μ ≥ 0 and stacking the real and imaginary parts into one matrix.
+    The μ < 0 components can be found from c_{ℓ,-μ} = (-1)^μ conj(c_{ℓμ}).
+
+    # Arguments:
+    - theta_grid::Vector{T}: The θ grid, in radians.
+    - phi_grid::Vector{T}: The ϕ grid, in radians.
+    - l_max::Int: The maximum angular momentum mode.
+
+    # Returns:
+    - Matrix{T}: The stacked matrix, dimensions (2 * n_keys_pos, n_theta * n_phi).
+    """
+
+    # Build the projection matrices, and the key for the positive m part of the matrix.
+    A_real, A_imag = build_projection_matrices(theta_grid, phi_grid, l_max)
+    n_keys_pos = ((l_max + 1) * (l_max + 2)) ÷ 2
+    n_points = size(A_real, 2)
+
+    A = Matrix{T}(undef, 2 * n_keys_pos, n_points)
+    @inbounds for l in 0:l_max, m in 0:l
+        source = l * l + l + m + 1
+        target = positive_key(l, m)
+        for point_idx in 1:n_points
+            # Put the real and imaginary parts into a single matrix, n_keys apart.
+            A[target, point_idx] = A_real[source, point_idx]
+            A[n_keys_pos + target, point_idx] = A_imag[source, point_idx]
+        end
+    end
+
+    return A
+end
+
 
 function build_projection_matrices(
         theta_grid::Vector{T},
@@ -181,12 +225,12 @@ end
 
 function project_block!(
         f_lm::Array{T, 3},
-        f_sq_block::Array{T, 4},
-        A_real::Matrix{T},
-        A_imag::Matrix{T},
+        f_sq_block::AbstractArray{T, 4},
+        A::Matrix{T},
         U_blocks::Vector{Matrix{Complex{T}}},
         q_offset::Int,
-        l_max::Int,
+        l_max::Int;
+        occupancy::Union{Nothing, Matrix{Bool}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Project one block of q points and accumulate the result into the output f_lm tensor.
@@ -194,62 +238,93 @@ function project_block!(
     Splitting the projection this way streams over q rather than materialising the
     whole squared form factor, which could be very large.
 
+    The first axis is either the transition index for the form factor, or the energy value for the structure function.
+
     # Arguments:
     - f_lm::Array{T, 3}: The output tensor, with dimensions (n_states, n_q, n_keys).
-    - f_sq_block::Array{T, 4}: The squared form factor for this block, with dimensions (n_states, n_q_block, n_theta, n_phi).
-    - A_real::Matrix{T}: The real part of the weighted conjugate harmonics.
-    - A_imag::Matrix{T}: The imaginary part of the weighted conjugate harmonics.
+    - f_sq_block::AbstractArray{T, 4}: The squared form factor for this block, with dimensions (n_states, n_q_block, n_theta, n_phi).
+    - A::Matrix{T}: The stacked (real, then imaginary, n_keys apart) μ ≥ 0 projection matrix from build_projection_matrix.
     - U_blocks::Vector{Matrix{Complex{T}}}: The complex-to-real transformation blocks.
     - q_offset::Int: The index in f_lm of the first q point in this block.
     - l_max::Int: The maximum angular momentum mode.
+    - occupancy::Union{Nothing, Matrix{Bool}}: Which (state, q) of this block hold anything, with
+      dimensions (n_states, n_q_block). The rest are skipped, as they are exactly zero.
 
     # Returns:
     - Nothing. f_lm is modified in place.
     """
 
-    # Get the block sizes and number of keys.
+    # Get the block sizes.
     n_states, n_q_block, n_theta, n_phi = size(f_sq_block)
-    n_keys = (l_max + 1)^2
     n_points = n_theta * n_phi
-    n_columns = n_states * n_q_block
 
-    # Flatten (state, q) into columns and (θ, ϕ) into rows, matching the point ordering used when
-    # the projection matrices were built.
+    # Take the columns that hold something, keeping the (q, state) order the unmasked path uses.
+    column_q = Vector{Int}(undef, n_states * n_q_block)
+    column_state = Vector{Int}(undef, n_states * n_q_block)
+    n_columns = 0
+    # For the structure function, state is now the energy value.
+    @inbounds for q_local in 1:n_q_block, state_idx in 1:n_states
+        (occupancy === nothing || occupancy[state_idx, q_local]) || continue # Skip empty energy values.
+        n_columns += 1
+        column_q[n_columns] = q_local
+        column_state[n_columns] = state_idx
+    end
+    n_columns == 0 && return nothing
+
+    # A Julia trick, stops lots of lookups later.
+    used_columns = n_columns
+
+    # Flatten the kept (state, q) into columns and (θ, ϕ) into rows, matching the point ordering used
+    # when the projection matrices were built.
     B = Matrix{T}(undef, n_points, n_columns)
     @inbounds for phi_idx in 1:n_phi, theta_idx in 1:n_theta
         point_idx = (phi_idx - 1) * n_theta + theta_idx
-        for q_local in 1:n_q_block
-            base = (q_local - 1) * n_states
-            for state_idx in 1:n_states
-                B[point_idx, base + state_idx] = f_sq_block[state_idx, q_local, theta_idx, phi_idx]
-            end
+        for column in 1:n_columns
+            B[point_idx, column] =
+                f_sq_block[column_state[column], column_q[column], theta_idx, phi_idx]
         end
     end
 
-    # Two real GEMMs give the real and imaginary parts of the complex coefficients. |f|² is real, so
-    # keeping BLAS in real arithmetic is both faster and avoids a complex copy of the input.
-    C_real = Matrix{T}(undef, n_keys, n_columns)
-    C_imag = Matrix{T}(undef, n_keys, n_columns)
-    mul!(C_real, A_real, B)
-    mul!(C_imag, A_imag, B)
+    # One real GEMM gives the real and imaginary parts of the μ ≥ 0 coefficients together. |f|² is
+    # real, so keeping BLAS in real arithmetic is both faster and avoids a complex copy of the input.
+    n_keys_pos = ((l_max + 1) * (l_max + 2)) ÷ 2
+    C = Matrix{T}(undef, 2 * n_keys_pos, n_columns)
+    mul!(C, A, B)
 
-    # Rotate the complex coefficients into the real harmonic basis.
-    @inbounds for column in 1:n_columns
-        q_local = (column - 1) ÷ n_states + 1
-        state_idx = (column - 1) % n_states + 1
-        q_idx = q_offset + q_local - 1
+    # Rotate the complex coefficients into the real harmonic basis. We thread over columns,
+    # which are either (q, E) for the structure function, or (q, transition) for the form factor.
+    n_chunks = chunk_count(used_columns, nthreads())
+    @sync for chunk in 1:n_chunks
+        Threads.@spawn begin
+            # μ < 0 is found once per (column, ℓ) from c_{ℓ,-μ} = (-1)^μ conj(c_{ℓμ}).
+            coefficients = Vector{Complex{T}}(undef, 2 * l_max + 1)
 
-        for l in 0:l_max
-            key_base = l * l + l + 1
-            U_l = U_blocks[l + 1]
-            for m in -l:l
-                total = zero(Complex{T})
-                for mu in -l:l
-                    coefficient = Complex{T}(C_real[key_base + mu, column], C_imag[key_base + mu, column])
-                    total += coefficient * U_l[mu + l + 1, m + l + 1]
+            for column in chunk_range(chunk, n_chunks, used_columns)
+                q_idx = q_offset + column_q[column] - 1
+                state_idx = column_state[column]
+
+                @inbounds for l in 0:l_max
+                    key_base = l * l + l + 1
+                    U_l = U_blocks[l + 1]
+
+                    for mu in 0:l
+                        key = positive_key(l, mu)
+                        coefficient = Complex{T}(C[key, column], C[n_keys_pos + key, column])
+                        coefficients[mu + l + 1] = coefficient
+                        mu == 0 && continue
+                        coefficients[l + 1 - mu] =
+                            isodd(mu) ? -conj(coefficient) : conj(coefficient)
+                    end
+
+                    for m in -l:l
+                        total = zero(Complex{T})
+                        for mu in 1:(2 * l + 1)
+                            total += coefficients[mu] * U_l[mu, m + l + 1]
+                        end
+                        # |f|² is real, so f_lm is real by construction and any imaginary part is noise.
+                        f_lm[state_idx, q_idx, key_base + m] = real(total)
+                    end
                 end
-                # |f|² is real, so f_lm is real by construction and any imaginary part is noise.
-                f_lm[state_idx, q_idx, key_base + m] = real(total)
             end
         end
     end
@@ -297,7 +372,7 @@ function project_f_lm(
 
     # Build the projection matrices and U blocks.
     # The U blocks map from complex to real spherical harmonics.
-    A_real, A_imag = build_projection_matrices(theta_grid, phi_grid, l_max)
+    A = build_projection_matrix(theta_grid, phi_grid, l_max)
     U_blocks = build_U_blocks(l_max, T)
 
     f_lm = Array{T, 3}(undef, n_states, n_q, n_keys)
@@ -306,7 +381,7 @@ function project_f_lm(
     for q_start in 1:q_block:n_q
         q_stop = min(q_start + q_block - 1, n_q)
         block = f_sq[:, q_start:q_stop, :, :]
-        project_block!(f_lm, block, A_real, A_imag, U_blocks, q_start, l_max)
+        project_block!(f_lm, block, A, U_blocks, q_start, l_max)
     end
 
     return f_lm

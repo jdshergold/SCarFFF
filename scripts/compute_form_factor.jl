@@ -17,6 +17,8 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   rotate_R_tensors, rotate_crystal_R_tensors,
                                   compute_coherent_crystal_f_lm,
                                   compute_incoherent_crystal_f_lm, project_f_lm,
+                                  band_energy_range, build_energy_grid, describe_energy_grid,
+                                  incoherent_structure_factor, integrate_energy, trim_energy_axis,
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
@@ -273,6 +275,23 @@ function parse_commandline()::Dict{String, Any}
             default = 1.0
         "--no-dipole-term"
             help = "Drop the Q = 0 term of the Ewald reciprocal sum instead of replacing it with the angular-averaged transition dipole product, which is the conducting boundary condition."
+            action = :store_true
+        "--dE"
+            help = "Bin width in eV of the energy axis of the structure function f^2_lm(q, E). This is the only energy knob: the delta is a mollifier whose support is three bins, so a finer axis both resolves more and narrows the delta towards a true delta function, and the number of points follows from the band range. Cost downstream is linear in it."
+            arg_type = Float64
+            default = 0.005
+        "--band-range-star-stride"
+            help = "Sample every this many star representatives when finding the band energy range that sets the structure function's energy axis. Sweeping every wavevector means diagonalising H(k) a second time at every point the form factor already visits, for two numbers; the bands are smooth, so a strided sample finds the same extremes far cheaper. Use 1 to sweep them all."
+            arg_type = Int
+            default = 8
+            range_tester = value -> value >= 1
+        "--band-range-q-stride"
+            help = "Sample every this many |q| points when finding the band energy range, alongside --band-range-star-stride."
+            arg_type = Int
+            default = 4
+            range_tester = value -> value >= 1
+        "--no-structure-factor"
+            help = "Skip the energy-resolved structure function f^2_lm(q, E) and write only the per-state f^2_lm(q)."
             action = :store_true
         "--coupling-cutoff"
             help = "Real-space cutoff in Angstroms for the intermolecular coupling sum, used only by --coupling-method direct. Under Ewald the cutoff is derived from --ewald-epsilon instead. A cutoff of 0 still couples the molecules within the unit cell, since those sit at zero lattice vector; it just excludes neighbouring cells. Use --no-couplings to switch the correction off entirely."
@@ -589,6 +608,10 @@ function main()
     ewald_cost_ratio = args["ewald-cost-ratio"]
     ewald_cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(ewald_cost_ratio).")
     no_dipole_term = args["no-dipole-term"]
+    energy_step = args["dE"]
+    need_structure_factor = !args["no-structure-factor"]
+    band_range_star_stride = args["band-range-star-stride"]
+    band_range_q_stride = args["band-range-q-stride"]
     band_map_plane = lowercase(args["band-map-plane"])
     band_map_points = args["band-map-points"]
     band_map_plane in ("none", "all", "xy", "xz", "yz") ||
@@ -1026,7 +1049,25 @@ function main()
                     crystal_state_f_lm, crystal_f_s = incoherent_timing.value
                     push!(stage_times, "incoherent f_lm" => incoherent_timing.time)
 
+                    # Build the energy axis and spread the f_lm coefficients over it.
+                    # We use the raw monomer energies here for the energy grid, since there are no bands.
+                    crystal_structure_factor = nothing
+                    crystal_energy_grid = nothing
+                    if need_structure_factor
+                        # Basis.energies is indexed by λ, and the first n_trans entries are just the energies for one molecule. 
+                        transition_energies = basis.energies[1:basis.n_transitions]
+                        crystal_energy_grid = build_energy_grid(
+                            minimum(transition_energies), maximum(transition_energies),
+                            T(energy_step))
+                        structure_timing = @timed incoherent_structure_factor(
+                            crystal_state_f_lm, transition_energies, crystal_energy_grid)
+                        crystal_structure_factor = structure_timing.value
+                        push!(stage_times, "structure function f_lm(q, E)" => structure_timing.time)
+                    end
+
                     print_stage_timings("Crystal stage timings", stage_times)
+                    crystal_energy_grid === nothing ||
+                        println("\n" * describe_energy_grid(crystal_energy_grid))
 
                     crystal_results = (
                         order = "incoherent",
@@ -1036,6 +1077,8 @@ function main()
                         dominant_occupancy = dominant_occupancy,
                         state_f_lm = crystal_state_f_lm,
                         f_s = crystal_f_s,
+                        structure_factor = crystal_structure_factor,
+                        energy_grid = crystal_energy_grid,
                         band_summary = nothing,
                         couplings = nothing,
                         cells = nothing,
@@ -1139,6 +1182,27 @@ function main()
                         "points and roughly half the symmetry operations are unusable. An odd N_phi " *
                         "(the default is 4 * l_max + 1) would recover them at no cost in accuracy.")
 
+                    # Build the energy grid by sampling the bands. We don't do all k points or stars as this is
+                    # too expensive, but instead stride over them, and then buffer a bit. In practice, this is
+                    # usually exact, or close to. The extra points cost no computation or memory at the end, as they
+                    # are skipped in calculation, and trimmed.
+                    crystal_energy_grid = nothing
+                    if need_structure_factor
+                        range_timing = @timed band_energy_range(
+                            basis, lattice, q_grid_invA, stars, crystal_couplings,
+                            crystal_long_range; star_stride = band_range_star_stride,
+                            q_stride = band_range_q_stride)
+                        energy_low, energy_high, energy_margin = range_timing.value
+                        crystal_energy_grid = build_energy_grid(
+                            energy_low - energy_margin, energy_high + energy_margin, T(energy_step))
+                        push!(stage_times, "band energy range" => range_timing.time)
+                        println("\nSampled band range $(round(energy_low, digits = 4)) to " *
+                                "$(round(energy_high, digits = 4)) eV from every " *
+                                "$(band_range_star_stride) star and every " *
+                                "$(band_range_q_stride) q, widened by " *
+                                "$(round(1000 * energy_margin, digits = 1)) meV each side.")
+                    end
+
                     # This streams over q internally, projecting each block onto real spherical
                     # harmonics as it goes, so the full |f|^2 grid is never held in memory. Overwritten
                     # need grid is specfied.
@@ -1146,8 +1210,20 @@ function main()
                         rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max,
                         stars;
                         need_grid = need_grid, couplings = crystal_couplings,
-                        long_range = crystal_long_range)
-                    crystal_state_f_lm, crystal_band_summary, crystal_f_s = coherent_timing.value
+                        long_range = crystal_long_range, energy_grid = crystal_energy_grid)
+                    crystal_state_f_lm, crystal_band_summary, crystal_f_s, crystal_structure_factor,
+                        crystal_outside_grid = coherent_timing.value
+
+                    # The axis was built wider than the bands need, so trim the empty ends if necessary.
+                    if crystal_structure_factor !== nothing
+                        built_points = length(crystal_energy_grid.energies)
+                        crystal_structure_factor, crystal_energy_grid =
+                            trim_energy_axis(crystal_structure_factor, crystal_energy_grid)
+                        trimmed_points = built_points - length(crystal_energy_grid.energies)
+                        trimmed_points == 0 ||
+                            println("  Trimmed $(trimmed_points) empty bins of $(built_points) " *
+                                    "off the ends of the energy axis.")
+                    end
                     push!(stage_times, "coherent f_lm (H(k), diagonalise, project)" => coherent_timing.time)
 
                     # Optionally sample E_Ψ(k) over a plane of the first Brillouin zone, for plotting.
@@ -1168,9 +1244,24 @@ function main()
 
                     print_stage_timings("Crystal stage timings", stage_times)
 
-                    # Show what the crystal did to the monomer energies.
+                    # Show what the crystal did to the monomer energies, at least at the gamma point.
                     print_gamma_point_shifts(
                         basis, lattice, crystal_couplings, crystal_long_range, T)
+
+                    # Check that ∫ dE f²_lm(q, E) = Σ_Ψ f²_lm(q), which should hold exactly in theory.
+                    if crystal_energy_grid !== nothing
+                        println("\n" * describe_energy_grid(crystal_energy_grid))
+
+                        # Make sure that no point fell outside the energy axis.
+                        crystal_outside_grid == 0 ||
+                            println("  WARNING: $(crystal_outside_grid) states fell outside the " *
+                                    "energy axis and were pinned to its ends. Decrease sweep size.")
+                        integrated = integrate_energy(crystal_structure_factor, crystal_energy_grid)
+                        summed = dropdims(sum(crystal_state_f_lm, dims = 1), dims = 1)
+                        residual = maximum(abs, integrated .- summed) / maximum(abs, summed)
+                        println("  sum rule, ∫dE f²_lm(q, E) against Σ_Ψ f²_lm(q): " *
+                                string(round(residual, sigdigits = 3)) * " relative.")
+                    end
                     println()
 
                     crystal_results = (
@@ -1182,6 +1273,8 @@ function main()
                         band_summary = crystal_band_summary,
                         state_f_lm = crystal_state_f_lm,
                         f_s = crystal_f_s,
+                        structure_factor = crystal_structure_factor,
+                        energy_grid = crystal_energy_grid,
                         couplings = crystal_couplings,
                         cells = cells,
                         ewald_parameters = ewald_parameters,
@@ -1211,6 +1304,14 @@ function main()
                         # Coherent: crystal states Ψ, ordered by ascending energy at each q.
                         # Incoherent: monomer transitions.
                         write(io, "state_f_lm", crystal_results.state_f_lm)
+
+                        # The structure function, summed over states. Units of eV^-1.
+                        if crystal_results.structure_factor !== nothing
+                            write(io, "structure_factor_f_lm", crystal_results.structure_factor)
+                            write(io, "energy_grid_eV", crystal_results.energy_grid.energies)
+                            # The width of the broadening function, used in place of the delta.
+                            write(io, "sigma_E_eV", crystal_results.energy_grid.sigma)
+                        end
 
                         # The unsquared form factor on the (q, θ, ϕ) grid, if it was asked for.
                         if crystal_results.f_s !== nothing
