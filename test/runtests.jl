@@ -420,6 +420,14 @@ end
     difference_R = T(0.6) .* density
     Xi_R = T(-0.9) .* density
 
+    # The dipole of the Q = 0 term is read off a single small q.
+    q_bc = T(1e-4)
+    density_bc = zeros(Complex{T}, 1, 1, 4)
+    density_bc[1, 1, 1] = T(0.8) * q_bc * q_bc * exp(-q_bc * q_bc / 2)
+    transition_R_bc = copy(density_bc)
+    difference_R_bc = T(0.6) .* density_bc
+    Xi_R_bc = T(-0.9) .* density_bc
+
     identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
     image = BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(0, 0, 0))
     basis = BH.build_excitation_basis([image], [T[2.0]])
@@ -443,13 +451,14 @@ end
                 lattice, T(1e-8); eta = eta)
             short_cells = CJ.enumerate_neighbour_cells(lattice, parameters.R_max)
             long_range = SF.Ewald.build_ewald_long_range(
-                transition_R, [image.translation], basis.image_of, lattice,
-                q_grid, l_max, parameters)
+                transition_R, transition_R_bc, [image.translation], basis.image_of, lattice,
+                q_grid, q_bc, l_max, parameters)
             _, short_D = CJ.compute_crystal_corrections(
                 transition_R, difference_R, Xi_R, basis, short_cells,
                 q_grid, l_max, gaunt_path; parameters = parameters)
             long_D = SF.Ewald.compute_ewald_diagonal(
-                difference_R, Xi_R, q_grid, l_max, long_range)
+                difference_R, Xi_R, difference_R_bc, Xi_R_bc,
+                q_grid, q_bc, l_max, long_range)
             push!(ewald_values, only(short_D .+ long_D))
         end
 

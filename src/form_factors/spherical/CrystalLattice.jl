@@ -7,13 +7,17 @@ using StaticArrays
 using LinearAlgebra: det, inv
 
 export CrystalLatticeData, build_crystal_lattice, fold_to_bz,
-       KEV_TO_INV_ANGSTROM, ALPHA_EM, HBAR_C_EV_ANGSTROM
+       KEV_TO_INV_ANGSTROM, ALPHA_EM, HBAR_C_EV_ANGSTROM, HARTREE_EV, BOHR_ANGSTROM
 
 const KEV_TO_INV_ANGSTROM = 1.0 / 1.973269804  # Multiplicative factor to convert keV to inverse Å.
 
 # The fine structure constant, and the conversion from inverse Angstroms to eV in natural units.
 const ALPHA_EM = 1.0 / 137.035999084
 const HBAR_C_EV_ANGSTROM = 1973.269804
+
+# Atomic units, needed to compare a dipole against the oscillator strength that TD-DFT reports.
+const HARTREE_EV = 27.211386245988
+const BOHR_ANGSTROM = 0.529177210903
 
 struct CrystalLatticeData{T<:AbstractFloat}
     direct::SMatrix{3, 3, T, 9}      # Rows are the direct lattice vectors a_1, a_2, a_3, in Å.

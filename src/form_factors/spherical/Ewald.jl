@@ -6,11 +6,12 @@ using StaticArrays
 using SphericalHarmonics
 using LinearAlgebra: norm, cross, dot, mul!, BLAS
 
-using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGSTROM
+using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGSTROM,
+                        HARTREE_EV, BOHR_ANGSTROM
 
 export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
-       compute_ewald_diagonal, self_term_matrix
+       compute_ewald_diagonal, self_term_matrix, check_dipole_against_oscillator_strength
 
 # Coefficients below this fraction of the largest one over the long-range q range are treated as
 # absent, which sets the max ℓ in the long-range sum. With this set to 1e-4, the error is around
@@ -400,10 +401,12 @@ end
 
 function build_ewald_long_range(
         rotated_R::Array{Complex{T}, 3},
+        rotated_R_bc::Array{Complex{T}, 3},
         tau_of_lambda::Vector{SVector{3, T}},
         image_of::Vector{Int},
         lattice::CrystalLatticeData{T},
         q_grid_invA::Vector{T},
+        q_bc_invA::T,
         l_max::Int,
         parameters::EwaldParameters{T};
         include_dipole_term::Bool = true,
@@ -424,11 +427,14 @@ function build_ewald_long_range(
 
     # Arguments:
     - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f̄, with dimensions (n_lambda, n_q, n_keys).
+    - rotated_R_bc::Array{Complex{T}, 3}: The same coefficients at q_bc alone, which is where the
+      transition dipole of the Q = 0 term is read off.
     - tau_of_lambda::Vector{SVector{3, T}}: The translation τ_{A,i} for each λ, in Å. Only the
       distinct values are stored, since the phase depends on the molecule rather than on λ.
     - image_of::Vector{Int}: The image index for each λ, which fixes which pairs share a molecule.
     - lattice::CrystalLatticeData{T}: The crystal lattice.
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å. Must be uniform and start at zero.
+    - q_bc_invA::T: The |q| at which the transition dipole is read off, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
     - parameters::EwaldParameters{T}: The splitting parameter and cutoffs.
     - include_dipole_term::Bool: Whether to use the dipole average at Q = 0, or set it to zero, which
@@ -444,8 +450,11 @@ function build_ewald_long_range(
 
     # Check that we have enough points for interpolation.
     n_q >= 3 || error("The Ewald long-range sum needs at least three q points, got $(n_q).")
+    # The dipole coefficients cover the same λ, but only the one q point they were evaluated at.
+    size(rotated_R_bc, 1) == n_lambda && size(rotated_R_bc, 3) == size(rotated_R, 3) || error(
+        "The dipole coefficients have size $(size(rotated_R_bc)), expected $((n_lambda, 1, size(rotated_R, 3))).")
     q_step = q_grid_invA[2] - q_grid_invA[1]
-    # The Hermite interpolation and the dipole slopes both assume a uniform grid anchored at zero.
+    # The Hermite interpolation assumes a uniform grid anchored at zero.
     abs(q_grid_invA[1]) < eps(T) ||
         error("The Ewald long-range sum expects a q grid starting at zero, got $(q_grid_invA[1]).")
     # Use sqrt(eps) here, to make sure it is compatible with float32. This will still be well below
@@ -488,7 +497,7 @@ function build_ewald_long_range(
     G_vectors = enumerate_reciprocal_vectors(lattice, parameters.Q_max + brillouin_zone_radius(lattice))
 
     # Compute the q -> 0 term, and self-interaction term.
-    dipole_slopes = dipole_slope_matrix(rotated_R, q_grid_invA, l_max)
+    dipole_slopes = dipole_slope_matrix(rotated_R_bc, q_bc_invA, l_max)
     self_term = self_term_matrix(rotated_R, image_of, q_grid_invA, l_max, parameters.eta)
 
     prefactor = T(4 * π * ALPHA_EM * HBAR_C_EV_ANGSTROM) / lattice.volume
@@ -505,16 +514,17 @@ function build_ewald_long_range(
 end
 
 function dipole_slope_matrix(
-        rotated_R::Array{Complex{T}, 3},
-        q_grid_invA::Vector{T},
+        rotated_R_bc::Array{Complex{T}, 3},
+        q_bc_invA::T,
         l_max::Int,
     )::Matrix{Complex{T}} where {T<:AbstractFloat}
     """
-    Extract lim_{q→0} f̄_{1m}(q)/q for every λ and m using a two point fit, f/q = a + b q.
+    Read lim_{q→0} f̄_{1m}(q)/q for every λ and m off a single evaluation at q_bc.
 
     # Arguments:
-    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f̄, with dimensions (n_lambda, n_q, n_keys).
-    - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
+    - rotated_R_bc::Array{Complex{T}, 3}: The rotated coefficients f̄ at q_bc alone, with
+      dimensions (n_lambda, 1, n_keys).
+    - q_bc_invA::T: The |q| at which the dipole is read off, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
 
     # Returns:
@@ -522,24 +532,84 @@ function dipole_slope_matrix(
     """
 
     l_max >= 1 || error("The Ewald Q = 0 term needs the ℓ = 1 coefficients, but l_max = $(l_max).")
+    size(rotated_R_bc, 2) == 1 || error(
+        "The dipole coefficients should sit on a single q point, got $(size(rotated_R_bc, 2)).")
+    q_bc_invA > 0 || error("The dipole evaluation point must be positive, got $(q_bc_invA).")
 
-    n_lambda = size(rotated_R, 1)
+    n_lambda = size(rotated_R_bc, 1)
     slopes = Matrix{Complex{T}}(undef, n_lambda, 3)
-
-    q_1 = q_grid_invA[2]
-    q_2 = q_grid_invA[3]
 
     @inbounds for (column, m) in enumerate(-1:1)
         key = 1 * 1 + (1 + m) + 1
         for lambda in 1:n_lambda
-            ratio_1 = rotated_R[lambda, 2, key] / q_1
-            ratio_2 = rotated_R[lambda, 3, key] / q_2
-            # Linear extrapolation of the ratio back to q = 0.
-            slopes[lambda, column] = ratio_1 + (ratio_1 - ratio_2) * q_1 / (q_2 - q_1)
+            slopes[lambda, column] = rotated_R_bc[lambda, 1, key] / q_bc_invA
         end
     end
 
     return slopes
+end
+
+function check_dipole_against_oscillator_strength(
+        R_bc::Array{Complex{T}, 3},
+        q_bc_invA::T,
+        transition_energies_eV::Vector{T},
+        f_osc::Vector{T},
+        l_max::Int;
+        tolerance::T = T(1e-2),
+        f_osc_floor::T = T(1e-3),
+    )::T where {T<:AbstractFloat}
+    """
+    Check the dipole read off f̄_{1m}(q_bc)/q_bc against the oscillator strength from TD-DFT.
+
+    TD-DFT gives f_osc = (2/3) ΔE |μ|² in atomic units without reference to the form factor.
+    The ℓ = 1 coefficients give the same number through|μ|² = (3/4π) Σ_m |f̄_{1m}(q_bc)/q_bc|²,
+    so the two disagreeing means the ℓ = 1 coefficients are wrong.
+
+    # Arguments:
+    - R_bc::Array{Complex{T}, 3}: Coefficients at q_bc alone, with dimensions (n_transitions, 1, n_keys).
+    - q_bc_invA::T: The |q| at which the dipole is read off, in inverse Å.
+    - transition_energies_eV::Vector{T}: The transition energies ΔE, in eV.
+    - f_osc::Vector{T}: The oscillator strength of each transition, dimensionless.
+    - l_max::Int: The maximum angular momentum mode of the form factor.
+    - tolerance::T: The largest fractional disagreement allowed on any checked transition.
+    - f_osc_floor::T: Transitions with an oscillator strength below this are not checked.
+
+    # Returns:
+    - T: The worst fractional disagreement found, or zero if no transition was strong enough.
+    """
+
+    # Get the dipole moments from the ℓ = 1 coefficients.
+    slopes = dipole_slope_matrix(R_bc, q_bc_invA, l_max)
+    n_transitions = size(R_bc, 1)
+    length(transition_energies_eV) == n_transitions || error(
+        "There are $(length(transition_energies_eV)) energies for $(n_transitions) transitions.")
+    length(f_osc) == n_transitions || error(
+        "There are $(length(f_osc)) oscillator strengths for $(n_transitions) transitions.")
+
+    worst_error = zero(T)
+    worst_transition = 0
+    for transition in 1:n_transitions
+        f_osc[transition] >= f_osc_floor || continue
+        # Sum the three m components.
+        total = sum(abs2(slopes[transition, column]) for column in 1:3)
+        dipole_from_form_factor = sqrt(T(3 / (4 * π)) * total)
+        # |μ|² = (3/2) f_osc / ΔE in atomic units, converted from Bohr to Å.
+        energy_hartree = transition_energies_eV[transition] / T(HARTREE_EV)
+        dipole_from_f_osc = sqrt(T(1.5) * f_osc[transition] / energy_hartree) * T(BOHR_ANGSTROM)
+        relative_error = abs(dipole_from_form_factor - dipole_from_f_osc) / dipole_from_f_osc
+        if relative_error > worst_error
+            worst_error = relative_error
+            worst_transition = transition
+        end
+    end
+
+    worst_error <= tolerance || error(
+        "The ℓ = 1 coefficients disagree with the oscillator strength by $(round(worst_error * 100, digits = 3))% " *
+        "on transition $(worst_transition), which is more than the $(round(tolerance * 100, digits = 3))% allowed. " *
+        "Either q_bc = $(q_bc_invA) Å^-1 is too large, or the ℓ = 1 coefficients are wrong."
+    )
+
+    return worst_error
 end
 
 function self_term_matrix(
@@ -611,7 +681,10 @@ end
 function compute_ewald_diagonal(
         rotated_difference::Array{Complex{T}, 3},
         rotated_Xi::Array{Complex{T}, 3},
+        rotated_difference_bc::Array{Complex{T}, 3},
+        rotated_Xi_bc::Array{Complex{T}, 3},
         q_grid_invA::Vector{T},
+        q_bc_invA::T,
         l_max::Int,
         data::EwaldLongRangeData{T},
     )::Vector{T} where {T<:AbstractFloat}
@@ -626,7 +699,10 @@ function compute_ewald_diagonal(
     # Arguments:
     - rotated_difference::Array{Complex{T},3}: Delta N for every local excitation.
     - rotated_Xi::Array{Complex{T},3}: Xi for every molecular image.
+    - rotated_difference_bc::Array{Complex{T},3}: Delta N at q_bc alone, for the boundary term.
+    - rotated_Xi_bc::Array{Complex{T},3}: Xi at q_bc alone, for the boundary term.
     - q_grid_invA::Vector{T}: Uniform q grid starting at zero, in inverse Angstroms.
+    - q_bc_invA::T: The |q| at which the boundary term's dipoles are read off, in inverse Angstroms.
     - l_max::Int: The largest angular mode.
     - data::EwaldLongRangeData{T}: The Ewald parameters, reciprocal vectors and image positions.
 
@@ -646,6 +722,11 @@ function compute_ewald_diagonal(
         "There are $(size(rotated_Xi, 1)) Ξ tensors for $(n_images) images.")
     size(rotated_Xi, 2) == length(q_grid_invA) && size(rotated_Xi, 3) == n_keys || error(
         "The Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, length(q_grid_invA), n_keys)).")
+    # The boundary tensors cover the same λ and images, but only the one q point they sit on.
+    size(rotated_difference_bc) == (n_lambda, 1, n_keys) || error(
+        "The boundary ΔN tensor has size $(size(rotated_difference_bc)), expected $((n_lambda, 1, n_keys)).")
+    size(rotated_Xi_bc) == (n_images, 1, n_keys) || error(
+        "The boundary Ξ tensor has size $(size(rotated_Xi_bc)), expected $((n_images, 1, n_keys)).")
 
     # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
     difference_table, difference_tangent, q_step, difference_l_max =
@@ -725,8 +806,8 @@ function compute_ewald_diagonal(
 
     # The G = 0 term, replaced by the angular-averaged dipole product. This is the boundary choice.
     if data.include_dipole_term
-        difference_slopes = dipole_slope_matrix(rotated_difference, q_grid_invA, l_max)
-        Xi_slopes = dipole_slope_matrix(rotated_Xi, q_grid_invA, l_max)
+        difference_slopes = dipole_slope_matrix(rotated_difference_bc, q_bc_invA, l_max)
+        Xi_slopes = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
         total_Xi_slopes = vec(sum(Xi_slopes, dims = 1))
         boundary_weight = data.prefactor / T(4 * π)
         @inbounds for lambda in 1:n_lambda

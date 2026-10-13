@@ -41,7 +41,8 @@ using .ContractSphericalGrid: contract_spherical_grid
 using .ConstructCrystalTensor: construct_crystal_f_lm_tensors
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
 using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
-              compute_ewald_diagonal, supercell_radius
+              compute_ewald_diagonal, supercell_radius,
+              check_dipole_against_oscillator_strength
 using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis,
                          set_diagonal_corrections!
 using .ProjectFLM: project_f_lm, default_angular_grid
@@ -72,6 +73,7 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        kernel_shape,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        compute_ewald_diagonal, subtract_self_term!,
+       check_dipole_against_oscillator_strength,
        image_translation_span, supercell_radius
 
 @inline function combine_gpu_R_tensor(R_pos, R_neg, l_max::Int)

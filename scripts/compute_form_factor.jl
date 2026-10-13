@@ -23,6 +23,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
                                   compute_ewald_diagonal, subtract_self_term!,
+                                  check_dipole_against_oscillator_strength,
                                   image_translation_span, supercell_radius,
                                   set_diagonal_corrections!,
                                   derive_symmetry_operations, build_stars,
@@ -276,6 +277,10 @@ function parse_commandline()::Dict{String, Any}
         "--no-dipole-term"
             help = "Drop the Q = 0 term of the Ewald reciprocal sum instead of replacing it with the angular-averaged transition dipole product, which is the conducting boundary condition."
             action = :store_true
+        "--q-bc"
+            help = "The |q| in keV at which the transition dipole of the Ewald Q = 0 term is read off. Smaller is better, but it already agrees by the default value, 1e-4 keV."
+            arg_type = Float64
+            default = 1.0e-4
         "--dE"
             help = "Bin width in eV of the energy axis of the structure function f^2_lm(q, E). This is the only energy knob: the delta is a mollifier whose support is three bins, so a finer axis both resolves more and narrows the delta towards a true delta function, and the number of points follows from the band range. Cost downstream is linear in it."
             arg_type = Float64
@@ -608,6 +613,8 @@ function main()
     ewald_cost_ratio = args["ewald-cost-ratio"]
     ewald_cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(ewald_cost_ratio).")
     no_dipole_term = args["no-dipole-term"]
+    q_bc = args["q-bc"]
+    q_bc > 0 || error("The dipole evaluation point q_bc must be positive, got $(q_bc).")
     energy_step = args["dE"]
     need_structure_factor = !args["no-structure-factor"]
     band_range_star_stride = args["band-range-star-stride"]
@@ -841,6 +848,9 @@ function main()
                 conformer_results = Dict{String, Any}()
                 conformer_f_lm = Array{T, 3}[]
 
+                # Only the Ewald split has a Q = 0 term, so only it needs the dipole at q_bc.
+                need_q_bc = crystal_order == "coherent" && !no_couplings && coupling_method == "ewald"
+
                 # Compute the spherical form factor for each conformer group.
                 for conformer_label in conformer_labels
                     td_h5 = joinpath(mol_output_dir, "conformers", conformer_label, "td_dft_results$(type_suffix).h5")
@@ -885,6 +895,43 @@ function main()
                         )
                     end
 
+                    # The Ewald Q = 0 term needs the transition dipole, which is the q → 0 limit off̄_{1m}(q)/q.
+                    R_bc = nothing
+                    difference_bc = nothing
+                    Xi_bc = nothing
+                    if need_q_bc
+                        # We have to include the q = 0 point since there's a check for neutrality at the origin.
+                        R_both, _, _, _, xi_and_dN_bc =
+                            compute_spherical_form_factor_with_densities(
+                                T[0, q_bc],
+                                theta_grid,
+                                phi_grid,
+                                l_max,
+                                td_h5,
+                                transition_indices=transition_indices,
+                                force_recomputation=force_recomp,
+                                threshold=threshold_val,
+                                use_gpu=use_gpu,
+                                need_grid=false,
+                                need_R=true,
+                                need_flm=false
+                            )
+                        R_bc = R_both[:, 2:2, :]
+                        difference_bc = xi_and_dN_bc.difference_R[:, 2:2, :]
+                        Xi_bc = xi_and_dN_bc.Xi_R[:, 2:2, :]
+
+                        # TD-DFT reports the oscillator strength, which fixes the dipole without
+                        # going near the form factor, so it catches a broken ℓ = 1 coefficient.
+                        f_osc = h5open(td_h5, "r") do io
+                            T.(read(io, "f_osc"))[transition_indices]
+                        end
+                        dipole_error = check_dipole_against_oscillator_strength(
+                            R_bc, T(q_bc * KEV_TO_INV_ANGSTROM),
+                            T.(transition_energies_eV), f_osc, l_max)
+                        println("Conformer $(conformer_label): the dipole at q_bc = $(q_bc) keV matches " *
+                                "the oscillator strength to $(round(dipole_error * 100, digits = 4))%.")
+                    end
+
                     push!(conformer_f_lm, f_lm)
                     conformer_results[conformer_label] = (
                         R_tensor = R_tensor,
@@ -892,6 +939,9 @@ function main()
                         f_lm = f_lm,
                         transition_energies_eV = transition_energies_eV,
                         xi_and_dN = xi_and_dN,
+                        R_bc = R_bc,
+                        difference_bc = difference_bc,
+                        Xi_bc = Xi_bc,
                     )
 
                     # Write the results to HDF5 for this conformer.
@@ -1021,6 +1071,9 @@ function main()
                     stage_times = Pair{String, Float64}[]
                     rotated_difference = nothing
                     rotated_Xi = nothing
+                    rotated_R_bc = nothing
+                    rotated_difference_bc = nothing
+                    rotated_Xi_bc = nothing
                     if crystal_order == "coherent" && !no_couplings
                         conformer_difference = [conformer_results[label].xi_and_dN.difference_R
                                                 for label in conformer_labels]
@@ -1037,8 +1090,20 @@ function main()
                     end
                     push!(stage_times, "rotate R tensors" => rotate_timing.time)
 
+                    # Rotate the dipole terms.
+                    if need_q_bc
+                        conformer_R_bc = [conformer_results[label].R_bc for label in conformer_labels]
+                        conformer_difference_bc = [conformer_results[label].difference_bc
+                                                   for label in conformer_labels]
+                        conformer_Xi_bc = [conformer_results[label].Xi_bc for label in conformer_labels]
+                        rotated_R_bc, rotated_difference_bc, rotated_Xi_bc = rotate_crystal_R_tensors(
+                            conformer_R_bc, conformer_difference_bc, conformer_Xi_bc,
+                            images, basis, l_max)
+                    end
+
                     # The Brillouin zone folding works in inverse Angstroms, matching the lattice.
                     q_grid_invA = T(KEV_TO_INV_ANGSTROM) .* q_grid
+                    q_bc_invA = T(q_bc * KEV_TO_INV_ANGSTROM)
 
                 if crystal_order != "coherent"
                     # Nothing here depends on k, so there is no Bloch problem to solve: no couplings,
@@ -1127,7 +1192,8 @@ function main()
                             tau_of_lambda = [basis.images[basis.image_of[lambda]].translation
                                              for lambda in 1:length(basis.energies)]
                             long_range_timing = @timed build_ewald_long_range(
-                                rotated_R, tau_of_lambda, basis.image_of, lattice, q_grid_invA, l_max,
+                                rotated_R, rotated_R_bc, tau_of_lambda, basis.image_of, lattice,
+                                q_grid_invA, q_bc_invA, l_max,
                                 ewald_parameters; include_dipole_term = !no_dipole_term)
                             crystal_long_range = long_range_timing.value
                             push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
@@ -1155,7 +1221,9 @@ function main()
                             subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
 
                             diagonal_timing = @timed compute_ewald_diagonal(
-                                rotated_difference, rotated_Xi, q_grid_invA, l_max,
+                                rotated_difference, rotated_Xi,
+                                rotated_difference_bc, rotated_Xi_bc,
+                                q_grid_invA, q_bc_invA, l_max,
                                 crystal_long_range)
                             set_diagonal_corrections!(
                                 basis, diagonal_short_range .+ diagonal_timing.value)
