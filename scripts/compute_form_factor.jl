@@ -19,6 +19,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   compute_incoherent_crystal_f_lm, project_f_lm,
                                   band_energy_range, build_energy_grid, describe_energy_grid,
                                   incoherent_structure_factor, integrate_energy, trim_energy_axis,
+                                  apply_structure_function_prefactor!,
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
@@ -1127,6 +1128,8 @@ function main()
                         structure_timing = @timed incoherent_structure_factor(
                             crystal_state_f_lm, transition_energies, crystal_energy_grid)
                         crystal_structure_factor = structure_timing.value
+                        # The 2π/V_cell that makes this the structure function rather than the bare sum.
+                        apply_structure_function_prefactor!(crystal_structure_factor, lattice.volume)
                         push!(stage_times, "structure function f_lm(q, E)" => structure_timing.time)
                     end
 
@@ -1284,6 +1287,8 @@ function main()
 
                     # The axis was built wider than the bands need, so trim the empty ends if necessary.
                     if crystal_structure_factor !== nothing
+                        # The 2π/V_cell that makes this the structure function rather than the bare sum.
+                        apply_structure_function_prefactor!(crystal_structure_factor, lattice.volume)
                         built_points = length(crystal_energy_grid.energies)
                         crystal_structure_factor, crystal_energy_grid =
                             trim_energy_axis(crystal_structure_factor, crystal_energy_grid)
@@ -1325,9 +1330,11 @@ function main()
                             println("  WARNING: $(crystal_outside_grid) states fell outside the " *
                                     "energy axis and were pinned to its ends. Decrease sweep size.")
                         integrated = integrate_energy(crystal_structure_factor, crystal_energy_grid)
-                        summed = dropdims(sum(crystal_state_f_lm, dims = 1), dims = 1)
+                        # S_lm carries the 2π/V_cell, so the states it integrates back to need it too.
+                        summed = dropdims(sum(crystal_state_f_lm, dims = 1), dims = 1) .*
+                                 (T(2 * π) / lattice.volume)
                         residual = maximum(abs, integrated .- summed) / maximum(abs, summed)
-                        println("  sum rule, ∫dE f²_lm(q, E) against Σ_Ψ f²_lm(q): " *
+                        println("  sum rule, ∫dE S_lm(q, E) against (2π/V_cell) Σ_Ψ f²_lm(q): " *
                                 string(round(residual, sigdigits = 3)) * " relative.")
                     end
                     println()

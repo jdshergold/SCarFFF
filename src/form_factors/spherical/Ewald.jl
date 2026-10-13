@@ -60,11 +60,11 @@ function choose_ewald_parameters(
 
     The two cutoffs are related by G_max R_max = -2 ln ε, and the total work
 
-        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_uc,   N_G ≃ V_uc G_max³ / 6π²,
+        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π²,
 
     is minimised at
 
-        R_max ≃ √(-2 ln ε) (V_uc² c_G / 8π³ c_R)^{1/6},
+        R_max ≃ √(-2 ln ε) (V_cell² c_G / 8π³ c_R)^{1/6},
 
     and η then satisfies η² = G_max / 2R_max. We currently assume a cost ratio of 1.
 
@@ -167,7 +167,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     - self_term::Matrix{Complex{T}}: J^LR_{λλ'}(0) for λ, λ' on the same image, in eV.
     - eta::T: The splitting parameter η, in Å^{-1}.
     - G_max::T: The reciprocal-space cutoff, in Å^{-1}.
-    - prefactor::T: 4π α_EM ħc / V_uc, in eV Å^{-2}.
+    - prefactor::T: 4π α_EM ħc / V_cell, in eV Å^{-2}.
     - include_dipole_term::Bool: Boundary choice: whether the Q = 0 term is the dipole average or zero.
     """
     lattice::CrystalLatticeData{T}
@@ -416,7 +416,7 @@ function build_ewald_long_range(
     """
     Assemble everything the long-range sum
 
-        𝒥^LR_{λλ'}(k) = (4π α_EM ħc / V_uc) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) u_λ(Q) conj(u_{λ'}(Q)),
+        𝒥^LR_{λλ'}(k) = (4π α_EM ħc / V_cell) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) u_λ(Q) conj(u_{λ'}(Q)),
         
     with
         

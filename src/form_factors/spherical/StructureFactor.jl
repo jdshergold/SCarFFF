@@ -14,7 +14,8 @@ using ..CrystalSymmetry: Stars
 using ...ThreadChunks: chunk_count, chunk_range
 
 export EnergyGrid, build_energy_grid, accumulate_delta!, incoherent_structure_factor,
-       integrate_energy, trim_energy_axis, describe_energy_grid, kernel_shape
+       integrate_energy, trim_energy_axis, describe_energy_grid, kernel_shape,
+       apply_structure_function_prefactor!
 
 # We use a mollifier in place of the delta function, with width either side of the band σ_E = 3 ΔE.
 const MOLLIFIER_SUPPORT_BINS = 3
@@ -334,6 +335,31 @@ function incoherent_structure_factor(
     return structure_factor
 end
 
+
+function apply_structure_function_prefactor!(
+        structure_factor::Array{T, 3},
+        V_cell::T,
+    )::Array{T, 3} where {T<:AbstractFloat}
+    """
+    Scale the summed f²_{ℓm}(q, E) up to the dynamic structure function,
+
+        S(q, E) = (2π/V_cell) Σ_Ψ |f_Ψ(q)|² δ(E - E_Ψ(q)),
+
+    so what comes out is S_{ℓm} rather than the bare sum over states.
+
+    # Arguments:
+    - structure_factor::Array{T, 3}: Σ_Ψ f²_{ℓm}(q) δ(E - E_Ψ), dimensions (n_energy, n_q, n_keys).
+    - V_cell::T: The unit cell volume, in Å³.
+
+    # Returns:
+    - Array{T, 3}: S_{ℓm}(q, E), in Å^{-3} eV^{-1}. Modified in place.
+    """
+
+    V_cell > 0 || error("The unit cell volume must be positive, got $(V_cell).")
+    structure_factor .*= T(2 * π) / V_cell
+
+    return structure_factor
+end
 
 function trim_energy_axis(
         structure_factor::Array{T, 3},
