@@ -423,13 +423,12 @@ function build_stars(
     usable = SymmetryOperation{T}[]
     image_tables = Vector{Vector{Int}}()
     for operation in operations
-        inverse = inv(operation.rotation)
         sign = operation.conjugate ? -one(T) : one(T) # Change sign if this is a time reversed operation.
         table = Vector{Int}(undef, n_directions)
         closed = true
         for index in 1:n_directions
-            # Find the image of the direction: sign * R^{-1} * direction.
-            target = nearest_direction(sign .* (inverse * direction_vectors[index]))
+            # Find the image of the direction: sign * R * direction, matching k_i = R_i k.
+            target = nearest_direction(sign .* (operation.rotation * direction_vectors[index]))
             if target == 0
                 closed = false
                 break

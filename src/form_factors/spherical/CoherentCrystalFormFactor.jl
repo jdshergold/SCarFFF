@@ -474,8 +474,8 @@ function compute_coherent_crystal_form_factor(
                     permutation = permutations[member.operation]
                     direction = member.direction
 
-                    # k_Λ = R_Λ^{-1} k, with a further sign when the operation carries time reversal.
-                    inverse_rotation = transpose(operation.rotation)
+                    # k_Λ = R_Λ k, with a further sign when the operation carries time reversal.
+                    star_rotation = operation.rotation
                     reversal = operation.conjugate ? -one(T) : one(T) # -1 for time reversal.
 
                     # Several (θ, ϕ) indices can point in the same direction, ̂n. For examople: the two poles
@@ -510,7 +510,7 @@ function compute_coherent_crystal_form_factor(
                         end
 
                         # Now compute the eigenvectors for the star.
-                        k_lambda = reversal * (inverse_rotation * star_wavevectors[q_local])
+                        k_lambda = reversal * (star_rotation * star_wavevectors[q_local])
                         @inbounds for lambda in 1:n_lambda
                             # Compute e^{-i k_Λ . L_{Λ,A_i}} that rephases eigenvectors/mixing coefficients.
                             phase_star = cis(-dot(k_lambda, operation.offsets[image_of_lambda[lambda]]))

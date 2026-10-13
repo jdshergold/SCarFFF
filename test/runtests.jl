@@ -717,7 +717,7 @@ end
     """
     The reduction solves H(k) once per star and reconstructs the rest from
     
-        H_{Λ(a) Λ(b)}(k_Λ) = H_{ab}(k) exp[-i k_Λ · (L_a - L_b)],    k_Λ = R_Λ^{-1} k,
+        H_{Λ(a) Λ(b)}(k_Λ) = H_{ab}(k) exp[-i k_Λ · (L_a - L_b)],    k_Λ = R_Λ k,
 
     so we check that this holds.
     """
@@ -760,9 +760,9 @@ end
 
         # And at each of its symmetry partners.
         for operation in operations
-            # k_Λ = R_Λ^{-1} k, and time reversal flips the sign on top of that.
+            # k_Λ = R_Λ k, and time reversal flips the sign on top of that.
             reversal = operation.conjugate ? -one(T) : one(T)
-            k_lambda = reversal * (transpose(operation.rotation) * k)
+            k_lambda = reversal * (operation.rotation * k)
             BH.build_bloch_hamiltonian!(at_k_lambda, basis, k_lambda, couplings)
             H_lambda = Matrix(Hermitian(copy(at_k_lambda.H), :U))
 
@@ -788,6 +788,70 @@ end
                 expected = operation.conjugate ? conj(H[a, b]) * phase : H[a, b] * phase
 
                 # Check the symmetry holds.
+                @test H_lambda[mapped_a, mapped_b] ≈ expected atol = 1e-10
+            end
+        end
+    end
+end
+
+@testset "Symmetry relation on H(k) with a fourfold axis" begin
+    """
+    The same relation as above, on a cell whose operations are not all their own inverse.
+
+    Every cell tested elsewhere has an all-involution Laue group, mmm or 2/m, where R = R^{-1} and
+    k_Λ = R k cannot be told apart from k_Λ = R^{-1} k. A fourfold axis separates them.
+    """
+
+    T = Float64
+
+    # Tetragonal cell, four molecules related by successive quarter turns about z.
+    lattice = SF.build_crystal_lattice(T[10 0 0; 0 10 0; 0 0 14], T)
+    quarter_turn = Quaternionic.rotor(T[cos(π / 4), 0, 0, sin(π / 4)])
+    turns = [quarter_turn^(index - 1) for index in 1:4]
+    base = SVector{3, T}(3, 1, 0)
+    images = [SF.CrystalImage{T}(1, turns[index], one(T),
+                                 SVector{3, T}(Quaternionic.to_rotation_matrix(turns[index]) * base))
+              for index in 1:4]
+    operations = SF.derive_symmetry_operations(images, lattice)
+
+    # The cell has to actually supply an operation that is not its own inverse.
+    @test any(maximum(abs, operation.rotation * operation.rotation - I) > 1e-10
+              for operation in operations)
+
+    basis = BH.build_excitation_basis(images, [T[4.10, 4.65]])
+    n_lambda = length(basis.energies)
+    couplings = dipole_couplings(basis, images, lattice,
+        [SVector{3, T}[SVector{3, T}(0.9, 0.2, -0.3), SVector{3, T}(-0.1, 0.7, 0.5)]])
+
+    at_k = BH.BlochEigensystem(basis)
+    at_k_lambda = BH.BlochEigensystem(basis)
+
+    for k in (SVector{3, T}(0.11, -0.05, 0.13), SVector{3, T}(-0.07, 0.17, 0.09))
+        BH.build_bloch_hamiltonian!(at_k, basis, k, couplings)
+        H = Matrix(Hermitian(copy(at_k.H), :U))
+
+        for operation in operations
+            reversal = operation.conjugate ? -one(T) : one(T)
+            k_lambda = reversal * (operation.rotation * k)
+            BH.build_bloch_hamiltonian!(at_k_lambda, basis, k_lambda, couplings)
+            H_lambda = Matrix(Hermitian(copy(at_k_lambda.H), :U))
+
+            for a in 1:n_lambda, b in 1:n_lambda
+                mapped_a = 0
+                mapped_b = 0
+                for lambda in 1:n_lambda
+                    basis.transition_of[lambda] == basis.transition_of[a] &&
+                        basis.image_of[lambda] == operation.image_of[basis.image_of[a]] &&
+                        (mapped_a = lambda)
+                    basis.transition_of[lambda] == basis.transition_of[b] &&
+                        basis.image_of[lambda] == operation.image_of[basis.image_of[b]] &&
+                        (mapped_b = lambda)
+                end
+
+                phase = cis(-dot(k_lambda, operation.offsets[basis.image_of[a]] -
+                                           operation.offsets[basis.image_of[b]]))
+                expected = operation.conjugate ? conj(H[a, b]) * phase : H[a, b] * phase
+
                 @test H_lambda[mapped_a, mapped_b] ≈ expected atol = 1e-10
             end
         end
