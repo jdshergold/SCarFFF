@@ -9,7 +9,7 @@ import LinearAlgebra: mul!
 import Logging: NullLogger, with_logger
 
 include("../../utils/DMModels.jl")
-using .DMModels: spherical_halo, v_max
+using .DMModels: standard_halo, v_max
 
 const VSDM = VectorSpaceDarkMatter
 const G_CACHE = Ref{Union{Nothing, Matrix{Float64}}}(nothing)
@@ -134,7 +134,7 @@ function compute_rates_by_orientation(
         m_grid::Vector{T},
         transition_energies::Vector{T},
         N_rotations::Union{Nothing,Tuple{Int,Int,Int}}=nothing,
-        model=spherical_halo(),
+        model=standard_halo(),
     )::Array{T, 2} where {T<:AbstractFloat}
     """
     Compute the DM scattering rate using VSDM for a set of detector orientations. Currently
@@ -146,7 +146,7 @@ function compute_rates_by_orientation(
     - m_grid::Vector{T}: The DM mass grid in MeV.
     - transition_energies::Vector{T}: The transition energies in eV.
     - N_rotations::Tuple{Int,Int,Int}: The number of (α,β,γ) detector rotations to consider. If unset, considers only the identity.
-    - model::Function: The DM velocity model function (default: spherical_halo).
+    - model::Function: The DM velocity model function (default: standard_halo).
 
     # Returns:
     - rate_grid::Array{T, 2}: The dimensionless rate for each DM mass and detector orientation.
@@ -269,7 +269,7 @@ function compute_rates(
         m_grid::Vector{T},
         transition_energies::Vector{T},
         N_rotations::Union{Nothing,Tuple{Int,Int,Int}}=nothing,
-        model=spherical_halo(),
+        model=standard_halo(),
     ) where {T<:AbstractFloat}
     """
     Compute the DM scattering rate using VSDM for a set of detector orientations. Currently
@@ -281,7 +281,7 @@ function compute_rates(
     - m_grid::Vector{T}: The DM mass grid in MeV.
     - transition_energies::Vector{T}: The transition energies in eV.
     - N_rotations::Tuple{Int,Int,Int}: The number of (α,β,γ) detector rotations to consider. If unset, considers only the identity.
-    - model::Function: The DM velocity model function (default: spherical_halo).
+    - model::Function: The DM velocity model function (default: standard_halo).
 
     # Returns:
     - results::Vector{NamedTuple{(:mchi_MeV, :rate_max, :rate_min, :rate_mean), NTuple{4,T}}}: The dimensionless rates for each DM mass, after summing over transitions and taking the max/min/mean over orientations.

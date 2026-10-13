@@ -591,3 +591,205 @@ end
     @test unchanged === empty_factor
     @test length(unchanged_grid.energies) == n_energy
 end
+
+function two_molecule_cell(::Type{T}, offset::SVector{3, T},
+                           conformers::Vector{Int}) where {T<:AbstractFloat}
+    """
+    Build a unit cell holding two molecules that are unrelated by symmetry, each with a real image.
+
+    Molecule two is molecule one translated by offset, which is the arrangement that makes the pair
+    look interchangeable.
+
+    # Arguments:
+    - T::Type: The floating point type.
+    - offset::SVector{3, T}: Where the second molecule sits relative to the first, in Å.
+    - conformers::Vector{Int}: The conformer label of each of the four images.
+
+    # Returns:
+    - CrystalLatticeData{T}: The lattice.
+    - Vector{CrystalImage{T}}: The four images.
+    """
+
+    # Construct the lattice and images.
+    lattice = SF.build_crystal_lattice(T[12 0 -4; 0 6 0; 0 0 14], T)
+    upright = Quaternionic.rotor(T[1, 0, 0, 0]) # Identity quaternion.
+    turned = Quaternionic.rotor(T[0, 0, 1, 0]) # 180° rotation about y.
+    first_place = SVector{3, T}(0, 3, 0) # Position of the first molecule.
+    partner_place = SVector{3, T}(0, 0, 7) # Position of its symmetry partner.
+    places = [first_place, partner_place, first_place + offset, partner_place + offset]
+    rotations = [upright, turned, upright, turned]
+    parities = T[1, -1, 1, -1] # Turns the rotation into a mirror op. 
+    images = [SF.CrystalImage{T}(conformers[i], rotations[i], parities[i], places[i])
+              for i in 1:4]
+    return lattice, images
+end
+
+@testset "Symmetry with two independent molecules" begin
+    T = Float64
+
+    # Check that an offset that does not line up with the lattice does not produce any symops.
+    runaway_offset = SVector{3, T}(12 * sqrt(2) / 4, 0, 0)
+    lattice, images = two_molecule_cell(T, runaway_offset, [1, 1, 2, 2])
+    operations = SF.derive_symmetry_operations(images, lattice)
+
+    # Only 1 and 2, and 3 and 4 should be partners.
+    @test length(operations) == 4
+    for operation in operations
+        @test operation.image_of in ([1, 2, 3, 4], [2, 1, 4, 3])
+    end
+
+    # Now an offset of exactly half the a vector. This closes the lattice, but the conformer
+    # labels are different, so they shouldn't be registered as partners.
+    half_cell = SVector{3, T}(6, 0, -2)
+    lattice, images = two_molecule_cell(T, half_cell, [1, 1, 2, 2])
+    operations = SF.derive_symmetry_operations(images, lattice)
+
+    # Check that each operation maps a molecule to its partner, and that the conformer labels match.
+    for operation in operations, image in 1:length(images)
+        @test images[image].conformer_index ==
+              images[operation.image_of[image]].conformer_index
+    end
+
+    # Now we say they're all the same conformer, so it should find that all are images of one another.
+    _, merged = two_molecule_cell(T, half_cell, [1, 1, 1, 1])
+    merged_operations = SF.derive_symmetry_operations(merged, lattice)
+
+    @test length(merged_operations) > length(operations)
+    @test any(operation.image_of[1] > 2 for operation in merged_operations)
+end
+
+function dipole_couplings(basis, images, lattice, reference_dipoles::Vector{Vector{SVector{3, T}}},
+                          ) where {T<:AbstractFloat}
+    """
+    Build point dipole couplings J_{λλ'}(ΔR) for a cell, so that H(k) has off-diagonal structure.
+
+    # Arguments:
+    - basis: The localised excitation basis.
+    - images: The images in the unit cell.
+    - lattice: The crystal lattice.
+    - reference_dipoles::Vector{Vector{SVector{3,T}}}: A dipole per conformer, per transition.
+
+    # Returns:
+    - CrystalCouplings{T}: The couplings, over the 3x3x3 block of neighbouring cells.
+    """
+
+    # Go up to 10 Å, which is enough to include the nearest neighbour of each molecule in the cell.
+    cutoff = T(10)
+    cell_vectors = SVector{3, T}[]
+    # Build the cell vectors for the 5^3 block.
+    for n1 in -2:2, n2 in -2:2, n3 in -2:2
+        push!(cell_vectors, SVector{3, T}(n1 * lattice.direct[1, :] + n2 * lattice.direct[2, :] +
+                                          n3 * lattice.direct[3, :]))
+    end
+
+    n_lambda = length(basis.energies)
+    dipoles = Vector{SVector{3, T}}(undef, n_lambda)
+    for lambda in 1:n_lambda
+        image = images[basis.image_of[lambda]]
+        operation = SF.CrystalSymmetry.cartesian_operation(image)
+        # Compute the dipoles for each image, by rotating hte reference dipoles.
+        dipoles[lambda] = operation *
+            reference_dipoles[image.conformer_index][basis.transition_of[lambda]]
+    end
+
+    values = zeros(Complex{T}, length(cell_vectors), n_lambda, n_lambda)
+    for (cell_idx, cell) in enumerate(cell_vectors),
+        lambda_prime in 1:n_lambda, lambda in 1:n_lambda
+
+        separation = images[basis.image_of[lambda]].translation -
+                     images[basis.image_of[lambda_prime]].translation - cell
+        distance = norm(separation)
+        # A molecule does not couple to itself in its own cell, and nothing couples past the cutoff.
+        (distance < 1e-8 || distance > cutoff) && continue
+        direction = separation / distance
+        first_dipole = dipoles[lambda]
+        second_dipole = dipoles[lambda_prime]
+        # Set J_{λλ'}(ΔR) = (d_λ · d_λ') / |distance|^3.
+        values[cell_idx, lambda, lambda_prime] = Complex{T}(
+            (dot(first_dipole, second_dipole) -
+             3 * dot(first_dipole, direction) * dot(second_dipole, direction)) / distance^3)
+    end
+
+    return BH.CrystalCouplings{T}(values, cell_vectors)
+end
+
+@testset "Symmetry relation on H(k)" begin
+    """
+    The reduction solves H(k) once per star and reconstructs the rest from
+    
+        H_{Λ(a) Λ(b)}(k_Λ) = H_{ab}(k) exp[-i k_Λ · (L_a - L_b)],    k_Λ = R_Λ^{-1} k,
+
+    so we check that this holds.
+    """
+
+    T = Float64
+
+    # The same invented Z' = 2 cell as the testset above. Two molecules with one image each.
+    lattice, images = two_molecule_cell(T, SVector{3, T}(6, 0, -2), [1, 1, 2, 2])
+
+    # The two different molecules have excitations differing by 20 meV.
+    basis = BH.build_excitation_basis(images, [T[4.10, 4.65], T[4.12, 4.67]])
+    operations = SF.derive_symmetry_operations(images, lattice)
+    n_lambda = length(basis.energies)
+
+    # Invent some reference dipoles, one for each transition of each conformer.
+    reference_dipoles = [
+        SVector{3, T}[SVector{3, T}(0.9, 0.2, -0.3), SVector{3, T}(-0.1, 0.7, 0.5)],
+        SVector{3, T}[SVector{3, T}(0.4, -0.8, 0.1), SVector{3, T}(0.6, 0.3, 0.7)],
+    ]
+    couplings = dipole_couplings(basis, images, lattice, reference_dipoles)
+
+    # Create the eigensystems at k and its symmetry partner, k_Λ.
+    at_k = BH.BlochEigensystem(basis)
+    at_k_lambda = BH.BlochEigensystem(basis)
+
+    # Check the Hamiltonian behaves as intented.
+    # First, that it has off diagonal terms at some reference k.
+    BH.build_bloch_hamiltonian!(at_k, basis, SVector{3, T}(0.13, -0.07, 0.21), couplings)
+    reference = Matrix(Hermitian(copy(at_k.H), :U))
+    @test maximum(abs, reference - Diagonal(diag(reference))) > 1e-6
+    # Now check that it has different values at a different k.
+    BH.build_bloch_hamiltonian!(at_k, basis, SVector{3, T}(-0.31, 0.05, 0.11), couplings)
+    @test maximum(abs, Matrix(Hermitian(copy(at_k.H), :U)) - reference) > 1e-6
+
+    # And now construct it at a few different k.
+    for k in (SVector{3, T}(0.13, -0.07, 0.21), SVector{3, T}(-0.31, 0.05, 0.11),
+              SVector{3, T}(0.02, 0.19, -0.28))
+        BH.build_bloch_hamiltonian!(at_k, basis, k, couplings)
+        H = Matrix(Hermitian(copy(at_k.H), :U))
+
+        # And at each of its symmetry partners.
+        for operation in operations
+            # k_Λ = R_Λ^{-1} k, and time reversal flips the sign on top of that.
+            reversal = operation.conjugate ? -one(T) : one(T)
+            k_lambda = reversal * (transpose(operation.rotation) * k)
+            BH.build_bloch_hamiltonian!(at_k_lambda, basis, k_lambda, couplings)
+            H_lambda = Matrix(Hermitian(copy(at_k_lambda.H), :U))
+
+            for a in 1:n_lambda, b in 1:n_lambda
+                # Find the λ that the operation sends a and b to. λ is a pair (image, transition),
+                # and only the image is permuted. The && chain assigns when both parts match.
+                mapped_a = 0
+                mapped_b = 0
+                for lambda in 1:n_lambda
+                    basis.transition_of[lambda] == basis.transition_of[a] &&
+                        basis.image_of[lambda] == operation.image_of[basis.image_of[a]] &&
+                        (mapped_a = lambda)
+                    basis.transition_of[lambda] == basis.transition_of[b] &&
+                        basis.image_of[lambda] == operation.image_of[basis.image_of[b]] &&
+                        (mapped_b = lambda)
+                end
+
+                # Compute the phase factor from the translation.
+                offset_a = operation.offsets[basis.image_of[a]]
+                offset_b = operation.offsets[basis.image_of[b]]
+                phase = cis(-dot(k_lambda, offset_a - offset_b))
+                # Conjugate the Hamiltonian if the operation is time-reversing, and apply the phase factor.
+                expected = operation.conjugate ? conj(H[a, b]) * phase : H[a, b] * phase
+
+                # Check the symmetry holds.
+                @test H_lambda[mapped_a, mapped_b] ≈ expected atol = 1e-10
+            end
+        end
+    end
+end

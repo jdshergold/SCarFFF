@@ -43,6 +43,10 @@ export SymmetryOperation, StarMember, Stars, derive_symmetry_operations,
 # Max part is used to make sure float32 is not too strict to work.
 match_tolerance(::Type{T}) where {T<:AbstractFloat} = max(T(1.0e-6), 100 * eps(T))
 
+# The largest crystallographic point group, m-3m, has 48 elements. Passing this means the closure is
+# not converging, so it stops rather than getting stuck.
+const MAXIMUM_POINT_GROUP_ORDER = 48
+
 # Decimal places used to recognise two grid directions as the same. Float32 needs some slack.
 direction_digits(::Type{Float32}) = 5
 direction_digits(::Type{T}) where {T<:AbstractFloat} = 8
@@ -195,6 +199,7 @@ function match_operation(
         translation::SVector{3, T},
         operations::Vector{SMatrix{3, 3, T, 9}},
         translations::Vector{SVector{3, T}},
+        conformers::Vector{Int},
         lattice::CrystalLatticeData{T},
     )::Union{Nothing, SymmetryOperation{T}} where {T<:AbstractFloat}
     """
@@ -202,13 +207,17 @@ function match_operation(
 
     Applying (R, τ_Λ) to image i gives a molecule with orientation R M_i sitting at R τ_i + τ_Λ. For
     the operation to be a symmetry of the crystal that has to be one of the images we already have,
-    up to a lattice vector, and both conditions have to hold for the same image. 
+    up to a lattice vector, and both conditions have to hold for the same image.
+
+    It also has to be the same molecule. A cell can hold more than one molecule that is not related
+    to the others by any symmetry.
 
     # Arguments:
     - rotation::SMatrix{3, 3, T, 9}: The candidate Cartesian rotation R.
     - translation::SVector{3, T}: The candidate translation τ_Λ, in Å.
     - operations::Vector{SMatrix{3, 3, T, 9}}: The Cartesian operation of each image.
     - translations::Vector{SVector{3, T}}: The translation of each image, in Å.
+    - conformers::Vector{Int}: Which conformer each image is, so that only like maps onto like.
     - lattice::CrystalLatticeData{T}: The crystal lattice.
 
     # Returns:
@@ -227,6 +236,8 @@ function match_operation(
         position = rotation * translations[i] + translation
 
         for j in 1:n_images
+            # Check that it is the same molecule, not merely one sitting in the same place.
+            conformers[i] == conformers[j] || continue
             # Check if each image points along the same direction as the rotated one.
             maximum(abs, rotated - operations[j]) < match_tolerance(T) || continue
             # Check that the rotated image sits on top of the candidate image, up to a lattice vector.
@@ -268,13 +279,20 @@ function derive_symmetry_operations(
     # As a result, to get from image e.g. 1 to i, we need to map 1 -> reference, then
     # reference -> i. This means we need R_i R_1^{-1} and τ_i - R_i R_1^{-1} τ_1, which is what the following does.
     reference_inverse = inv(operations[1])
-    candidates = Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}[]
+    conformers = [image.conformer_index for image in images]
+    proposed = Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}[]
     for i in 1:n_images
         rotation = operations[i] * reference_inverse
-        push!(candidates, (rotation, translations[i] - rotation * translations[1]))
+        push!(proposed, (rotation, translations[i] - rotation * translations[1]))
     end
 
-    # Close the space group, if it is not already. Usually does nothing.
+    # Only keep the ones that really are symmetries before going any further. That is, operations
+    # which map to like molecules.
+    candidates = filter(
+        candidate -> match_operation(candidate..., operations, translations, conformers, lattice) !== nothing,
+        proposed)
+
+    # Close the space group, if it is not already. Usually does nothing, but good to be safe.
     growing = true
     while growing
         growing = false
@@ -287,17 +305,27 @@ function derive_symmetry_operations(
                 maximum(abs, candidate[1] - composed_rotation) < match_tolerance(T) &&
                     is_lattice_vector(lattice, candidate[2] - composed_translation)
             end
-            if !seen
-                push!(candidates, (composed_rotation, composed_translation))
-                growing = true
-            end
+            seen && continue
+            match_operation(composed_rotation, composed_translation, operations, translations,
+                            conformers, lattice) === nothing && continue
+
+            push!(candidates, (composed_rotation, composed_translation))
+            growing = true
+
+            # No crystallographic point group has more than 48 elements, so passing this means the
+            # closure is running away and would otherwise get stuck until the run is killed.
+            length(candidates) <= MAXIMUM_POINT_GROUP_ORDER || error(
+                "The symmetry closure passed $(MAXIMUM_POINT_GROUP_ORDER) operations, more than any " *
+                "crystallographic point group has. Check the lattice and the molecule " *
+                "translations in the crystal metadata."
+            )
         end
     end
 
     found = SymmetryOperation{T}[]
     # Build the symops: find which image each operation maps each image onto, and the lattice vector left over.
     for (rotation, translation) in candidates
-        operation = match_operation(rotation, translation, operations, translations, lattice)
+        operation = match_operation(rotation, translation, operations, translations, conformers, lattice)
         operation === nothing && continue
         push!(found, operation)
     end
