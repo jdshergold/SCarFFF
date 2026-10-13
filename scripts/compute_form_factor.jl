@@ -1199,7 +1199,7 @@ function main()
                             push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
 
                             # Print a summary of the Ewald parameters.
-                            expected_Q = lattice.volume * ewald_parameters.Q_max^3 / (6 * π^2)
+                            expected_G = lattice.volume * ewald_parameters.G_max^3 / (6 * π^2)
                             supercell = supercell_radius(lattice)
                             widened = ewald_parameters.R_max <= supercell * (1 + 1e-12) ?
                                 " (widened to the 3x3x3 supercell)" : ""
@@ -1207,8 +1207,8 @@ function main()
                                     "η = $(round(ewald_parameters.eta, digits = 4)) Å^-1, " *
                                     "R_max = $(round(ewald_parameters.R_max, digits = 2)) Å$(widened) " *
                                     "($(length(cells.vectors)) cells searched, padded by the cell span), " *
-                                    "Q_max = $(round(ewald_parameters.Q_max, digits = 4)) Å^-1 " *
-                                    "(N_Q ≈ $(round(Int, expected_Q)), $(length(crystal_long_range.G_vectors)) candidates), " *
+                                    "G_max = $(round(ewald_parameters.G_max, digits = 4)) Å^-1 " *
+                                    "(N_G ≈ $(round(Int, expected_G)), $(length(crystal_long_range.G_vectors)) candidates), " *
                                     "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
                             no_dipole_term && println("The Q = 0 term is dropped, so this is the conducting boundary condition.")
 
@@ -1427,7 +1427,7 @@ function main()
                                 write(long_range_group, "eta", crystal_results.ewald_parameters.eta)
                                 write(long_range_group, "epsilon", crystal_results.ewald_parameters.epsilon)
                                 write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max)
-                                write(long_range_group, "Q_max", crystal_results.ewald_parameters.Q_max)
+                                write(long_range_group, "G_max", crystal_results.ewald_parameters.G_max)
                                 write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors))
                                 write(long_range_group, "f_table", long_range.f_table)
                                 write(long_range_group, "q_step", long_range.q_step)

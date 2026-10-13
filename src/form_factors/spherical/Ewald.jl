@@ -29,21 +29,23 @@ struct EwaldParameters{T<:AbstractFloat}
 
     The cutoffs are pinned to a common truncation error ε on both ends, so that neither dominates:
 
-        ε = exp(-η² R_max²) = exp(-Q_max²/4η²).
+        ε = exp(-η² R_max²) = exp(-G_max²/4η²).
 
-    Q_max and R_max are then chosen such that the amount of work done is minimised. To be revisited with
+    G_max and R_max are then chosen such that the amount of work done is minimised. To be revisited with
     cost measuring of both sums, and to make sure a requested ε is what we actually get.
 
     # Fields:
     - eta::T: The splitting parameter η, in Å^{-1}.
     - R_max::T: The real-space cutoff for the short-range sum, in Å. Widened to the 3x3x3 supercell
       radius when ε alone would ask for less, which only improves the truncation.
-    - Q_max::T: The reciprocal-space cutoff for the long-range sum, in Å^{-1}.
+    - G_max::T: The reciprocal-space cutoff for the long-range sum, in Å^{-1}. The sum runs over
+      reciprocal lattice vectors G, but the term dropped at the cutoff is the one at Q = k + G, so
+      this bounds |Q| rather than |G|. See add_long_range!.
     - epsilon::T: The truncation error the cutoffs are pinned to.
     """
     eta::T
     R_max::T
-    Q_max::T
+    G_max::T
     epsilon::T
 end
 
@@ -56,21 +58,21 @@ function choose_ewald_parameters(
     """
     Choose η and the two cutoffs for a requested truncation error, ε.
 
-    The two cutoffs are related by Q_max R_max = -2 ln ε, and the total work
+    The two cutoffs are related by G_max R_max = -2 ln ε, and the total work
 
-        W = c_R N_R + c_Q N_Q,     N_R ≃ 4π R_max³ / 3 V_uc,   N_Q ≃ V_uc Q_max³ / 6π²,
+        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_uc,   N_G ≃ V_uc G_max³ / 6π²,
 
     is minimised at
 
-        R_max ≃ √(-2 ln ε) (V_uc² c_Q / 8π³ c_R)^{1/6},
+        R_max ≃ √(-2 ln ε) (V_uc² c_G / 8π³ c_R)^{1/6},
 
-    and η then satisfies η² = Q_max / 2R_max. We currently assume a cost ratio of 1.
+    and η then satisfies η² = G_max / 2R_max. We currently assume a cost ratio of 1.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice, for the cell volume and reciprocal spacings.
     - epsilon::Real: The requested truncation error, in (0, 1).
     - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
-    - cost_ratio::Real: c_Q / c_R, the cost of one reciprocal lattice vector relative to one real one.
+    - cost_ratio::Real: c_G / c_R, the cost of one reciprocal lattice vector relative to one real one.
 
     # Returns:
     - EwaldParameters{T}: The splitting parameter and both cutoffs.
@@ -94,12 +96,12 @@ function choose_ewald_parameters(
 
     # Get the reciprocal-space cutoff using η.
     R_max = sqrt(log_epsilon) / eta_value
-    Q_max = 2 * eta_value * sqrt(log_epsilon)
+    G_max = 2 * eta_value * sqrt(log_epsilon)
 
     # Now ensure that the real space cutoff includes at least the 3x3x3 supercell.
     R_max = max(R_max, supercell_radius(lattice))
 
-    return EwaldParameters{T}(eta_value, R_max, Q_max, T(epsilon))
+    return EwaldParameters{T}(eta_value, R_max, G_max, T(epsilon))
 end
 
 function supercell_radius(lattice::CrystalLatticeData{T})::T where {T<:AbstractFloat}
@@ -148,7 +150,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     """
     Everything the long-range sum needs that does not depend on k.
 
-    The form factor coefficients are held as a compact sub-table covering only q <= Q_max and
+    The form factor coefficients are held as a compact sub-table covering only q <= G_max and
     ℓ <= l_max_lr, alongside the Hermite tangents used to interpolate them. That table is small
     enough to stay in cache, which matters because it is read at every q point of the outer grid.
 
@@ -164,7 +166,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     - dipole_slopes::Matrix{Complex{T}}: lim_{q→0} f̄_{1m}(q)/q for each λ, columns m = -1, 0, 1, in Å. Used for the boundary term.
     - self_term::Matrix{Complex{T}}: J^LR_{λλ'}(0) for λ, λ' on the same image, in eV.
     - eta::T: The splitting parameter η, in Å^{-1}.
-    - Q_max::T: The reciprocal-space cutoff, in Å^{-1}.
+    - G_max::T: The reciprocal-space cutoff, in Å^{-1}.
     - prefactor::T: 4π α_EM ħc / V_uc, in eV Å^{-2}.
     - include_dipole_term::Bool: Boundary choice: whether the Q = 0 term is the dipole average or zero.
     """
@@ -179,7 +181,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     dipole_slopes::Matrix{Complex{T}}
     self_term::Matrix{Complex{T}}
     eta::T
-    Q_max::T
+    G_max::T
     prefactor::T
     include_dipole_term::Bool
 end
@@ -338,7 +340,7 @@ function build_coefficient_table(
         rotated_R::Array{Complex{T}, 3},
         q_grid_invA::Vector{T},
         l_max::Int,
-        Q_max::T,
+        G_max::T,
     ) where {T<:AbstractFloat}
     """
     Build the compact coefficient and Hermite-tangent tables used by a reciprocal sum.
@@ -347,7 +349,7 @@ function build_coefficient_table(
     - rotated_R::Array{Complex{T},3}: Coefficients for every object on the full q grid.
     - q_grid_invA::Vector{T}: Uniform q grid starting at zero, in inverse Angstroms.
     - l_max::Int: The largest angular mode in rotated_R.
-    - Q_max::T: Reciprocal-space cutoff, in inverse Angstroms.
+    - G_max::T: Reciprocal-space cutoff, in inverse Angstroms.
 
     # Returns:
     - Tuple: Compact coefficients, Hermite tangents, q spacing and retained l ceiling.
@@ -367,12 +369,12 @@ function build_coefficient_table(
     all(abs(q_grid_invA[i + 1] - q_grid_invA[i] - q_step) < uniform_tolerance
         for i in 1:(n_q - 1)) || error("The Ewald q grid must be uniform.")
 
-    # Check that we can actually reach Q_max with the grid and error settings.
-    q_grid_invA[end] >= Q_max || error(
-        "The Ewald cutoff $(Q_max) Å^-1 lies beyond the q grid at $(q_grid_invA[end]) Å^-1.")
+    # Check that we can actually reach G_max with the grid and error settings.
+    q_grid_invA[end] >= G_max || error(
+        "The Ewald cutoff $(G_max) Å^-1 lies beyond the q grid at $(q_grid_invA[end]) Å^-1.")
 
-    # Trim to the q grid needed up to Q_max, ensuring we have the extra points for the interpolation.
-    n_q_lr = min(n_q, Int(ceil(Q_max / q_step)) + 3)
+    # Trim to the q grid needed up to G_max, ensuring we have the extra points for the interpolation.
+    n_q_lr = min(n_q, Int(ceil(G_max / q_step)) + 3)
     # Truncate l_max as well.
     l_max_lr = long_range_l_ceiling(rotated_R, n_q_lr, l_max)
     n_keys_lr = (l_max_lr + 1)^2
@@ -414,7 +416,7 @@ function build_ewald_long_range(
     """
     Assemble everything the long-range sum
 
-        𝒥^LR_{λλ'}(k) = (4π α_EM ħc / V_uc) Σ_{Q ≠ 0}^{Q_max} (1/Q²) exp(-Q²/4η²) u_λ(Q) conj(u_{λ'}(Q)),
+        𝒥^LR_{λλ'}(k) = (4π α_EM ħc / V_uc) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) u_λ(Q) conj(u_{λ'}(Q)),
         
     with
         
@@ -463,14 +465,14 @@ function build_ewald_long_range(
     all(abs(q_grid_invA[i + 1] - q_grid_invA[i] - q_step) < uniform_tolerance for i in 1:(n_q - 1)) ||
         error("The Ewald long-range sum expects a uniform q grid.")
 
-    # Check that we can actually reach Q_max with the grid and error settings.
-    q_grid_invA[end] >= parameters.Q_max || error(
-        "The Ewald reciprocal cutoff Q_max = $(parameters.Q_max) Å^{-1} lies beyond the q grid, " *
+    # Check that we can actually reach G_max with the grid and error settings.
+    q_grid_invA[end] >= parameters.G_max || error(
+        "The Ewald reciprocal cutoff G_max = $(parameters.G_max) Å^{-1} lies beyond the q grid, " *
         "which reaches $(q_grid_invA[end]) Å^{-1}. Raise q_max or allow for a larger truncation error."
     )
 
-    # Trim to the q grid needed up to Q_max, ensuring we have the extra points for the interpolation.
-    n_q_lr = min(n_q, Int(ceil(parameters.Q_max / q_step)) + 3)
+    # Trim to the q grid needed up to G_max, ensuring we have the extra points for the interpolation.
+    n_q_lr = min(n_q, Int(ceil(parameters.G_max / q_step)) + 3)
     # Truncate l_max as well.
     l_max_lr = long_range_l_ceiling(rotated_R, n_q_lr, l_max)
     n_keys_lr = (l_max_lr + 1)^2
@@ -493,8 +495,9 @@ function build_ewald_long_range(
         f_tangent[key, lambda, n_q_lr] = f_table[key, lambda, n_q_lr] - f_table[key, lambda, n_q_lr - 1]
     end
 
-    # Compute the G vectors.
-    G_vectors = enumerate_reciprocal_vectors(lattice, parameters.Q_max + brillouin_zone_radius(lattice))
+    # Compute the G vectors. The cutoff bounds |Q| = |k + G|, so a G as far out as G_max plus the
+    # largest |k| in the zone can still be inside it at some k, and has to be on the list.
+    G_vectors = enumerate_reciprocal_vectors(lattice, parameters.G_max + brillouin_zone_radius(lattice))
 
     # Compute the q -> 0 term, and self-interaction term.
     dipole_slopes = dipole_slope_matrix(rotated_R_bc, q_bc_invA, l_max)
@@ -509,7 +512,7 @@ function build_ewald_long_range(
     return EwaldLongRangeData{T}(
         lattice, G_vectors, f_table, f_tangent, q_step, l_max_lr,
         translations, copy(image_of),
-        dipole_slopes, self_term, parameters.eta, parameters.Q_max, prefactor, include_dipole_term,
+        dipole_slopes, self_term, parameters.eta, parameters.G_max, prefactor, include_dipole_term,
     )
 end
 
@@ -730,9 +733,9 @@ function compute_ewald_diagonal(
 
     # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
     difference_table, difference_tangent, q_step, difference_l_max =
-        build_coefficient_table(rotated_difference, q_grid_invA, l_max, data.Q_max)
+        build_coefficient_table(rotated_difference, q_grid_invA, l_max, data.G_max)
     Xi_table, Xi_tangent, Xi_q_step, Xi_l_max =
-        build_coefficient_table(rotated_Xi, q_grid_invA, l_max, data.Q_max)
+        build_coefficient_table(rotated_Xi, q_grid_invA, l_max, data.G_max)
     abs(q_step - Xi_q_step) <= eps(T) * max(q_step, one(T)) || error(
         "The ΔN and Ξ interpolation grids do not match.")
 
@@ -746,7 +749,7 @@ function compute_ewald_diagonal(
         # Here k = 0, so Q = G. Skip anything beyond the cutoff, and G = 0, which the boundary
         # term below replaces.
         G_norm = norm(G)
-        G_norm <= data.Q_max || continue
+        G_norm <= data.G_max || continue
         G_norm < T(Q_ZERO_TOLERANCE) && continue
 
         # Compute the spherical harmonics for this G.
@@ -886,10 +889,11 @@ end
     k_folded, _ = fold_to_bz(data.lattice, k)
 
     @inbounds for G in data.G_vectors
-        # Find Q = k + G.
+        # Find Q = k + G. The cutoff goes on |Q|, not |G|, because the Gaussian weight that sets
+        # the truncation error is exp(-Q²/4η²).
         Q = k_folded + G
         Q_norm = norm(Q)
-        Q_norm <= data.Q_max || continue
+        Q_norm <= data.G_max || continue
 
         # Use the dipole BC if specified.
         if Q_norm < T(Q_ZERO_TOLERANCE)
