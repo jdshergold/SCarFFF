@@ -483,9 +483,15 @@ function weighted_spherical_bessel_kernel!(weighted_bessel_tensor::CuDeviceArray
 
         # Handle very small x separately to avoid the instability of the Miller recursion.
         if abs(x_f64) <= SMALL_X_THRESHOLD
-            @inbounds j_L_buffer[1] = 1.0 # j_0(0) = 1.
-            for L in 1:L_max
-                @inbounds j_L_buffer[L + 1] = 0.0 # j_L(0) = 0 for L > 0.
+            x_squared = x_f64 * x_f64
+            # The x^L / (2L+1)!! prefactor, stepped up one L at a time.
+            prefactor = 1.0
+            for L in 0:L_max
+                series = 1.0 - x_squared / (2 * (2 * L + 3)) +
+                         x_squared * x_squared / (8 * (2 * L + 3) * (2 * L + 5))
+                @inbounds j_L_buffer[L + 1] = prefactor * series
+                # (2L+3)!! = (2L+1)!! (2L+3), so the next prefactor picks up one x and one (2L+3).
+                prefactor *= x_f64 / (2 * L + 3)
             end
         else
             # Precompute expensive terms that will be reused many times.

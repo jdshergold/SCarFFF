@@ -75,6 +75,12 @@ const PAIR_RESPONSE_BYTES = 64 * 1024 * 1024
     and fill the specified column of j_L_matrix with the results. All calculations
     are performed in Float64 for stability, then cast back to T when stored.
 
+    At small x, we instead use the small x series expansion:
+
+        j_L(x) = x^L / (2L+1)!! [1 - x²/(2(2L+3)) + x⁴/(8(2L+3)(2L+5)) + ...],
+
+    which up to x^4 is good to one part in 10^22 at the threshold. 
+
     # Arguments:
     - j_L_matrix::Array{T, 2}: Preallocated array to store j_L(x) values.
     - j_vals_buffer::Vector{Float64}: Preallocated buffer for storing j_L values. This avoid allocations.
@@ -86,9 +92,16 @@ const PAIR_RESPONSE_BYTES = 64 * 1024 * 1024
 
     # Handle very small x separately to avoid the instability of the Miller recursion.
     if abs(x_f64) <= SMALL_X_THRESHOLD
-        @inbounds j_vals_buffer[1] = 1.0 # j_0(0) = 1.
-        @inbounds for row in 2:(L_max + 1)
-            j_vals_buffer[row] = 0.0 # j_L(0) = 0 for L > 0.
+        x_squared = x_f64 * x_f64
+        # The x^L / (2L+1)!! prefactor, stepped up one L at a time.
+        prefactor = 1.0
+        @inbounds for row in 1:(L_max + 1)
+            L = row - 1
+            series = 1.0 - x_squared / (2 * (2 * L + 3)) +
+                     x_squared * x_squared / (8 * (2 * L + 3) * (2 * L + 5))
+            j_vals_buffer[row] = prefactor * series
+            # (2L+3)!! = (2L+1)!! (2L+3), so the next prefactor picks up one x and one (2L+3).
+            prefactor *= x_f64 / (2 * L + 3)
         end
         @inbounds for row in 1:(L_max + 1)
             j_L_matrix[row, x_column] = T(j_vals_buffer[row])
