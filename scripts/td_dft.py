@@ -64,7 +64,7 @@ ATOMIC_NUMBERS = {
     "Mo": 42,
 }
 
-BOHR_TO_ANGSTROM = 0.52917721092
+BOHR_TO_ANGSTROM = 0.529177210903
 
 def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1", n_top=5, energy_thresh=0.1):
     """Use RDKit to generate quasi-optimal molecular geometry for a given SMILES string.
@@ -734,6 +734,7 @@ def run_td_dft_analysis_from_coordinates(
     orbv = mf.mo_coeff[:, ~occ_mask]
 
     # Prepare data for saving to file.
+    # PySCF holds mol._atom in Bohr, so these coordinates are in Bohr, not Angstroms.
     geometry = [[atom[0], atom[1][0], atom[1][1], atom[1][2]] for atom in mol._atom]
     ao_labels = [str(label) for label in mol.ao_labels()]
     # Truncated to ntrans, to match f_osc and the X and Y amplitudes below. This ensures
@@ -768,12 +769,12 @@ def run_td_dft_analysis_from_coordinates(
         # Save the atom symbols and coordinates.
         dt = h5py.string_dtype(encoding="utf-8")
         f.create_dataset("atom_symbols", data=atom_symbols, dtype=dt)
-        f.create_dataset("atom_coordinates", data=atom_coords)
+        f.create_dataset("atom_coordinates", data=atom_coords)  # Bohr. SCarFFF converts to Angstroms.
 
         # Store the AO labels.
         f.create_dataset("ao_labels", data=ao_labels, dtype=dt)
 
-        # Store the energies and oscillator strengths.
+        # Store the transition energies in eV, and the oscillator strengths.
         f.create_dataset("energies_ev", data=np.array(energies, dtype=float_dtype))
         f.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
 

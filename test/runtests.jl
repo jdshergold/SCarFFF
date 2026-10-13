@@ -136,10 +136,10 @@ end
             @test size(batched) == (length(density_matrices), length(q_grid), (l_max + 1)^2)
 
             # Check a previously known value, in case the single and batched implementations agree, but on the wrong value. 
-            @test sum(abs2, batched) ≈ T(15822.173160627013) rtol = tolerance
-            @test batched[1, 2, 1] ≈ Complex{T}(T(3.2200705644984984), 0) rtol = tolerance atol = tolerance
-            @test batched[2, 3, 5] ≈ Complex{T}(T(-0.11710249835435621), 0) rtol = tolerance atol = tolerance
-            @test batched[3, 2, 9] ≈ Complex{T}(T(-0.007409117682069378), 0) rtol = tolerance atol = tolerance
+            @test sum(abs2, batched) ≈ T(15822.167346872453) rtol = tolerance
+            @test batched[1, 2, 1] ≈ Complex{T}(T(3.220068689449471), 0) rtol = tolerance atol = tolerance
+            @test batched[2, 3, 5] ≈ Complex{T}(T(-0.11710258766693253), 0) rtol = tolerance atol = tolerance
+            @test batched[3, 2, 9] ≈ Complex{T}(T(-0.007409123348153007), 0) rtol = tolerance atol = tolerance
 
             # Check T_{μμ} on a Cartesian diagonal and T_{μν} + T_{νμ} otherwise. If two
             # distinct Cartesian terms belong to the same AO, the second case correctly gives 2T_{μμ}.

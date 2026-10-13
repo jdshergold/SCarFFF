@@ -330,7 +330,7 @@ def build_crystal_metadata(crystal_data):
 
     crystal_metadata = {
         "conformer_labels": list(crystal_data["conformer_labels"]),
-        "lattice": crystal_data["lattice"],
+        "lattice": crystal_data["lattice"],  # Angstroms, rows are a1, a2, a3.
         "dominant_group": crystal_data["dominant_group"],
         "disorder_groups": disorder_groups,
     }

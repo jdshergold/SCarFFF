@@ -120,7 +120,7 @@ const L_MAP = Dict{Char, Int}(
     'I' => 6,
 )
 
-const AU_TO_ANGSTROM = 0.529177 # For converting Bohr radii to Angstroms.
+const AU_TO_ANGSTROM = 0.529177210903 # For converting Bohr radii to Angstroms.
 
 # Element order gives the atomic number.
 const ELEMENT_SYMBOLS = (
@@ -264,6 +264,7 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     nuclear_charges = [get(ATOMIC_NUMBERS, symbol) do
         error("Unknown element symbol '$(symbol)' in the TD-DFT data.")
     end for symbol in atom_symbols]
+    # PySCF writes these in Bohr, and everything downstream of here works in Angstroms.
     atom_coordinates = h5_data["atom_coordinates"] .* T(AU_TO_ANGSTROM)
     molecule_cuboid = Array{T}(undef, 0, 3)
     primitive_to_orbital = Int[]
@@ -438,7 +439,7 @@ function get_molecular_data(
 
         # Read the datasets.
         atom_symbols = read(io, "atom_symbols")
-        atom_coordinates = restore_python_hdf5_order(read(io, "atom_coordinates"))
+        atom_coordinates = restore_python_hdf5_order(read(io, "atom_coordinates")) # Bohr.
         ao_labels = read(io, "ao_labels")
         energies_ev = read(io, "energies_ev")
 

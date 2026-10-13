@@ -956,8 +956,8 @@ function main()
                             if f_s !== nothing
                                 f_s_slice = f_s[batch_idx, :, :, :]
                                 write(io, "f_s", f_s_slice)
-                                write(io, "theta_grid", theta_grid)
-                                write(io, "phi_grid", phi_grid)
+                                write(io, "theta_grid", theta_grid) # Radians.
+                                write(io, "phi_grid", phi_grid) # Radians.
                             end
                             if R_tensor !== nothing
                                 R_slice = R_tensor[batch_idx, :, :]
@@ -967,7 +967,7 @@ function main()
                                 f_lm_slice = f_lm[batch_idx, :, :]
                                 write(io, "f_lm", f_lm_slice)
                             end
-                            write(io, "q_grid", q_grid)
+                            write(io, "q_grid", q_grid) # keV.
                             write(io, "transition_index", transition_idx)
                             write(io, "transition_energy_eV", transition_energy)
                         end
@@ -1017,6 +1017,8 @@ function main()
 
                         rates_h5_path = joinpath(conformer_output_dir, "scattering_rates$(type_suffix).h5")
                         h5open(rates_h5_path, "w") do io
+                            # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e
+                            # and ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
                             write(io, "mchi_MeV", mchi_vals)
                             write(io, "rate_max", rate_max_vals)
                             write(io, "rate_min", rate_min_vals)
@@ -1380,9 +1382,9 @@ function main()
                         # Incoherent: monomer transitions.
                         write(io, "state_f_lm", crystal_results.state_f_lm)
 
-                        # The structure function, summed over states. Units of eV^-1.
+                        # The structure function, summed over states.
                         if crystal_results.structure_factor !== nothing
-                            write(io, "structure_factor_f_lm", crystal_results.structure_factor)
+                            write(io, "structure_factor_f_lm", crystal_results.structure_factor) # Å^-3 eV^-1.
                             write(io, "energy_grid_eV", crystal_results.energy_grid.energies)
                             # The width of the broadening function, used in place of the delta.
                             write(io, "sigma_E_eV", crystal_results.energy_grid.sigma)
@@ -1391,8 +1393,8 @@ function main()
                         # The unsquared form factor on the (q, θ, ϕ) grid, if it was asked for.
                         if crystal_results.f_s !== nothing
                             write(io, "f_s", crystal_results.f_s)
-                            write(io, "theta_grid", theta_grid)
-                            write(io, "phi_grid", phi_grid)
+                            write(io, "theta_grid", theta_grid) # Radians.
+                            write(io, "phi_grid", phi_grid) # Radians.
                         end
                         if crystal_results.band_summary !== nothing
                             write(io, "band_energy_min_eV", crystal_results.band_summary[:, 1])
@@ -1420,7 +1422,7 @@ function main()
                         if crystal_results.couplings !== nothing
                             couplings_group = create_group(io, "couplings")
                             write(couplings_group, "method", coupling_method)
-                            write(couplings_group, "cell_vectors", reduce(hcat, crystal_results.cells.vectors))
+                            write(couplings_group, "cell_vectors", reduce(hcat, crystal_results.cells.vectors)) # Å.
                             # The real-space sum over ΔR. Under "ewald" this is the short-range half
                             # alone, with the long-range self interaction already subtracted at ΔR = 0.
                             # Under "direct" it is the whole coupling, and there is no long_range group.
@@ -1431,15 +1433,15 @@ function main()
                                 # The reciprocal-space half, 𝒥^LR(k). It depends on k, so what is saved
                                 # is the ingredients that rebuild it rather than a table over ΔR.
                                 long_range_group = create_group(couplings_group, "long_range")
-                                write(long_range_group, "eta", crystal_results.ewald_parameters.eta)
+                                write(long_range_group, "eta", crystal_results.ewald_parameters.eta) # Å^-1.
                                 write(long_range_group, "epsilon", crystal_results.ewald_parameters.epsilon)
-                                write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max)
-                                write(long_range_group, "G_max", crystal_results.ewald_parameters.G_max)
-                                write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors))
+                                write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max) # Å.
+                                write(long_range_group, "G_max", crystal_results.ewald_parameters.G_max) # Å^-1.
+                                write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors)) # Å^-1.
                                 write(long_range_group, "f_table", long_range.f_table)
-                                write(long_range_group, "q_step", long_range.q_step)
+                                write(long_range_group, "q_step", long_range.q_step) # Å^-1.
                                 write(long_range_group, "l_max_lr", long_range.l_max_lr)
-                                write(long_range_group, "dipole_slopes", long_range.dipole_slopes)
+                                write(long_range_group, "dipole_slopes", long_range.dipole_slopes) # Å.
                                 write(long_range_group, "include_dipole_term", long_range.include_dipole_term)
                             end
                         end
@@ -1461,7 +1463,7 @@ function main()
                         write(io, "transition_indices", collect(transition_indices))
                         write(io, "disorder_group", crystal_results.dominant_group)
                         write(io, "disorder_group_occupancy", crystal_results.dominant_occupancy)
-                        write(io, "q_grid", q_grid)
+                        write(io, "q_grid", q_grid) # keV.
                     end
 
                     println("$(titlecase(crystal_results.order)) crystal form factor saved to $(coherent_path).")
@@ -1491,6 +1493,8 @@ function main()
 
                     rates_h5_path = joinpath(crystal_output_dir, "scattering_rates$(type_suffix).h5")
                     h5open(rates_h5_path, "w") do io
+                        # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e and
+                        # ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
                         write(io, "mchi_MeV", mchi_vals)
                         write(io, "rate_max", rate_max_vals)
                         write(io, "rate_min", rate_min_vals)
@@ -1567,8 +1571,8 @@ function main()
                         if f_s !== nothing
                             f_s_slice = f_s[batch_idx, :, :, :]
                             write(io, "f_s", f_s_slice)
-                            write(io, "theta_grid", theta_grid)
-                            write(io, "phi_grid", phi_grid)
+                            write(io, "theta_grid", theta_grid) # Radians.
+                            write(io, "phi_grid", phi_grid) # Radians.
                         end
                         if R_tensor !== nothing
                             R_slice = R_tensor[batch_idx, :, :]
@@ -1578,7 +1582,7 @@ function main()
                             f_lm_slice = f_lm[batch_idx, :, :]
                             write(io, "f_lm", f_lm_slice)
                         end
-                        write(io, "q_grid", q_grid)
+                        write(io, "q_grid", q_grid) # keV.
                         write(io, "transition_index", transition_idx)
                         write(io, "transition_energy_eV", transition_energy)
                     end
@@ -1596,6 +1600,8 @@ function main()
 
                     rates_h5_path = joinpath(spherical_output_dir, "scattering_rates$(type_suffix).h5")
                     h5open(rates_h5_path, "w") do io
+                        # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e and
+                        # ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
                         write(io, "mchi_MeV", mchi_vals)
                         write(io, "rate_max", rate_max_vals)
                         write(io, "rate_min", rate_min_vals)
@@ -1652,11 +1658,11 @@ function main()
                 output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
                 h5open(output_path, "w") do io
                     write(io, "form_factor", form_factor)
-                    write(io, "transition_density", transition_density)
-                    write(io, "qx_grid", qx_grid)
-                    write(io, "qy_grid", qy_grid)
-                    write(io, "qz_grid", qz_grid)
-                    write(io, "r_lim", r_lim)
+                    write(io, "transition_density", transition_density) # Å^-3.
+                    write(io, "qx_grid", qx_grid) # keV.
+                    write(io, "qy_grid", qy_grid) # keV.
+                    write(io, "qz_grid", qz_grid) # keV.
+                    write(io, "r_lim", r_lim) # Å.
                     write(io, "transition_index", transition_idx)
                     write(io, "transition_energy_eV", transition_energy_eV)
                 end
@@ -1731,9 +1737,9 @@ function main()
                         write(io, "V_y", V_y)
                         write(io, "V_z", V_z)
                     end
-                    write(io, "qx_grid", qx_grid)
-                    write(io, "qy_grid", qy_grid)
-                    write(io, "qz_grid", qz_grid)
+                    write(io, "qx_grid", qx_grid) # keV.
+                    write(io, "qy_grid", qy_grid) # keV.
+                    write(io, "qz_grid", qz_grid) # keV.
                     write(io, "transition_index", transition_idx)
                     write(io, "transition_energy_eV", transition_energy)
                 end
