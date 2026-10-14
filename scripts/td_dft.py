@@ -613,7 +613,6 @@ def run_td_dft_analysis(
     basis="6-31g*",
     xc="b3lyp",
     nstates=5,
-    ntrans=3,
     output_directory=".",
     ring_flatten=True,
     use_gpu=False,
@@ -627,8 +626,7 @@ def run_td_dft_analysis(
         smiles::str: SMILES string representing the molecule (default: benzene).
         basis::str: Basis set for the calculation (default: '6-31g*').
         xc::str: Exchange-correlation functional to use (default: 'b3lyp').
-        nstates::int: Number of excited states to calculate (default: 5).
-        ntrans::int: Number of transitions to compute transitiom matrices for (default: 3).
+        nstates::int: Number of states for the form factors. TD-DFT computes three extra states to avoid missing degenerate states (default: 5).
         output_directory::str: Directory path to save the results (default: '.').
         ring_flatten::bool: Whether to flatten based on just ring coordinates, or the whole molecule.
         dft_optimisation::bool: Whether to use DFT for geometry optimisation after RDKit (default: False).
@@ -639,6 +637,9 @@ def run_td_dft_analysis(
     Returns:
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
     """
+    if nstates < 1:
+        raise ValueError("nstates must be a positive integer.")
+
     print("Optimising geometry with RDKit.")
     top_conformers, ring_indices = get_rdkit_optimised_geometry(smiles=smiles)
 
@@ -666,7 +667,6 @@ def run_td_dft_analysis(
         basis=basis,
         xc=xc,
         nstates=nstates,
-        ntrans=ntrans,
         output_directory=output_directory,
         use_gpu=use_gpu,
         precision=precision,
@@ -680,7 +680,6 @@ def run_td_dft_analysis_from_coordinates(
     basis="6-31g*",
     xc="b3lyp",
     nstates=5,
-    ntrans=3,
     output_directory=".",
     use_gpu=False,
     precision="float64",
@@ -693,8 +692,7 @@ def run_td_dft_analysis_from_coordinates(
         species::str: Label used to identify the system in the output HDF5 file.
         basis::str: Basis set for the calculation (default: '6-31g*').
         xc::str: Exchange-correlation functional to use (default: 'b3lyp').
-        nstates::int: Number of excited states to calculate (default: 5).
-        ntrans::int: Number of transitions to compute transitiom matrices for (default: 3).
+        nstates::int: Number of states for the form factors. TD-DFT computes three extra states (default: 5).
         output_directory::str: Directory path to save the results (default: '.').
         use_gpu::bool: Whether to run the DFT and TD-DFT calculations on a GPU (default: False).
         precision::str: Floating point precision to use when saving results ('float32' or 'float64').
@@ -704,6 +702,9 @@ def run_td_dft_analysis_from_coordinates(
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
     """
 
+    if nstates < 1:
+        raise ValueError("nstates must be a positive integer.")
+
     print("Creating pySCF molecule with generated geometry.")
     mol = create_pyscf_mol(coordinates, basis=basis)
     print("Molecule created.")
@@ -711,18 +712,25 @@ def run_td_dft_analysis_from_coordinates(
     if plot_molecule_3d:
         plot_molecule_3d_interactive(coordinates, output_directory)
 
-    print("Running TD-DFT calculation for excited states.")
-    mf, td = calculate_excited_states(mol, nstates=nstates, xc=xc, use_gpu=use_gpu)
+    nstates_td_dft = nstates + 3
+    print(f"Running TD-DFT for {nstates_td_dft} states ({nstates} form factors and 3 buffer states).")
+    mf, td = calculate_excited_states(mol, nstates=nstates_td_dft, xc=xc, use_gpu=use_gpu)
     if mf is None:
-        print("Calculation failed. Exiting.")
-        return coordinates, mol, None, None, None
+        raise ValueError("DFT calculation did not converge.")
     else:
+        if len(td.e) < nstates_td_dft or len(td.xy) < nstates_td_dft:
+            raise ValueError(
+                f"TD-DFT returned {min(len(td.e), len(td.xy))} states; "
+                f"{nstates_td_dft} are required for {nstates} form factors and the three-state buffer."
+            )
+        if not np.all(td.converged):
+            raise ValueError("Not all requested TD-DFT states converged, including the three-state buffer.")
         td.analyze()
 
-    print(f"Extracting X and Y for the first N={ntrans} transitions.")
+    print(f"Extracting X and Y for the first N={nstates} transitions.")
 
-    # Extract the X and Y matrices for the first ntrans transitions.
-    mxXY = [get_xy(td, state=i + 1) for i in range(ntrans)]
+    # Save amplitudes only for the states used in the form factors.
+    mxXY = [get_xy(td, state=i + 1) for i in range(nstates)]
 
     # Find which MOs are occupied and which are virtual.
     occupations = mf.mo_occ
@@ -737,13 +745,12 @@ def run_td_dft_analysis_from_coordinates(
     # PySCF holds mol._atom in Bohr, so these coordinates are in Bohr, not Angstroms.
     geometry = [[atom[0], atom[1][0], atom[1][1], atom[1][2]] for atom in mol._atom]
     ao_labels = [str(label) for label in mol.ao_labels()]
-    # Truncated to ntrans, to match f_osc and the X and Y amplitudes below. This ensures
-    # that there are no errors when requesting more states computed than saved.
-    energies = [float(energy * 27.211396) for energy in td.e[:ntrans]]  # Convert Hartree to eV.
+    # Save energies only for the states used in the form factors.
+    energies = [float(energy * 27.211396) for energy in td.e[:nstates]]  # Convert Hartree to eV.
 
     # Extract oscillator strengths.
     oscillator_strengths = np.array(
-        [float(td.oscillator_strength()[i]) for i in range(ntrans)]
+        td.oscillator_strength()[:nstates], dtype=float
     )
 
     # Set the output precision.
@@ -761,6 +768,7 @@ def run_td_dft_analysis_from_coordinates(
         f.attrs["species"] = species
         f.attrs["basis"] = basis
         f.attrs["xc"] = xc
+        f.attrs["nstates_td_dft"] = len(td.e)
 
         # Store the geometry.
         atom_symbols = [atom[0] for atom in geometry]
@@ -790,6 +798,55 @@ def run_td_dft_analysis_from_coordinates(
     print(f"\nResults saved to {output_file}")
 
     return coordinates, mol, mf, td, mxXY
+
+
+def saved_td_dft_states_match(run_directory, nstates, precision):
+    """
+    Check the saved state count and that TD-DFT computed three extra states.
+
+    # Arguments:
+    - run_directory::str: The run directory.
+    - nstates::int: The number of states for the form factors.
+    - precision::str: The saved floating point precision.
+
+    # Returns:
+    - bool: Whether every molecule and conformer has the required saved states.
+    """
+    precision_suffix = "_f32" if precision == "float32" else "_f64"
+    try:
+        with open(os.path.join(run_directory, "metadata.csv"), newline="") as metadata:
+            entries = list(csv.DictReader(metadata))
+        if not entries:
+            return False
+        for entry in entries:
+            molecule_directory = os.path.join(run_directory, entry["folder"])
+            if os.path.isfile(os.path.join(molecule_directory, ".tddft_failed")):
+                return False
+            crystal_metadata = os.path.join(molecule_directory, "crystal_metadata.json")
+            if os.path.isfile(crystal_metadata):
+                with open(crystal_metadata) as crystal_file:
+                    conformer_labels = json.load(crystal_file)["conformer_labels"]
+                if not conformer_labels:
+                    return False
+                state_directories = [os.path.join(molecule_directory, "conformers", label)
+                                     for label in conformer_labels]
+            else:
+                state_directories = [molecule_directory]
+            for state_directory in state_directories:
+                filename = os.path.join(state_directory, f"td_dft_results{precision_suffix}.h5")
+                with h5py.File(filename, "r") as results:
+                    if results["Delta_E_eV"].shape != (nstates,) or results["f_osc"].shape != (nstates,):
+                        return False
+                    if results.attrs.get("nstates_td_dft", 0) < nstates + 3:
+                        return False
+                    for s in range(1, nstates + 1):
+                        if f"X_state_{s}" not in results or f"Y_state_{s}" not in results:
+                            return False
+                    if f"X_state_{nstates + 1}" in results or f"Y_state_{nstates + 1}" in results:
+                        return False
+    except (OSError, KeyError, ValueError):
+        return False
+    return True
 
 
 def parse_cli_arguments():
@@ -833,13 +890,7 @@ def parse_cli_arguments():
         "--nstates",
         type=int,
         default=5,
-        help="Number of excited states to compute.",
-    )
-    parser.add_argument(
-        "--ntrans",
-        type=int,
-        default=3,
-        help="Number of transitions for which to compute NTOs.",
+        help="Number of states for the form factors. TD-DFT computes three additional buffer states.",
     )
     parser.add_argument(
         "--no-ring-flatten",
@@ -878,7 +929,10 @@ def parse_cli_arguments():
         help="Generate interactive 3D molecule plot.",
     )
     parser.set_defaults(ring_flatten=True, use_gpu=False, dft_optimisation=False, plot_molecule_3d=False)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.nstates < 1:
+        parser.error("--nstates must be a positive integer.")
+    return args
 
 
 def main():
@@ -1000,7 +1054,6 @@ def main():
                     basis=args.basis,
                     xc=args.xc,
                     nstates=args.nstates,
-                    ntrans=args.ntrans,
                     output_directory=mol_output_dir,
                     ring_flatten=args.ring_flatten,
                     use_gpu=args.use_gpu,
@@ -1041,7 +1094,6 @@ def main():
                         basis=args.basis,
                         xc=args.xc,
                         nstates=args.nstates,
-                        ntrans=args.ntrans,
                         output_directory=conformer_dir,
                         use_gpu=args.use_gpu,
                         precision=args.precision,
@@ -1058,6 +1110,9 @@ def main():
             print(f"Failure recorded in {failed_file}. Skipping molecule {mol_num} and continuing.\n")
             continue
 
+        failed_file = os.path.join(mol_output_dir, ".tddft_failed")
+        if os.path.isfile(failed_file):
+            os.remove(failed_file)
         print(f"\n{entry['kind'].capitalize()} {mol_num} complete!\n")
 
     # End timing and save to file for bash to read.
