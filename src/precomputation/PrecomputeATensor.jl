@@ -10,7 +10,7 @@ include("../utils/BinEncoding.jl")
 using .FastPowers: fast_neg1_pow
 using .BinEncoding: encode_bins
 using ...SparseTensors
-using ...SparseTensors: SparseATensor, uvw_key, lambda_mu_key
+using ...SparseTensors: SparseATensor, uvw_key, lm_key
 
 export precompute_A_tensor
 
@@ -232,7 +232,7 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
 
         # Preallocate array to store K tensors for all m_i combinations.
         # Indices are (n, λ + 1, mi_idx)
-        K_n_lambda = zeros(Float64, n, n + 1, num_mi_combinations)
+        K_n_lambda_i = zeros(Float64, n, n + 1, num_mi_combinations)
 
         # Preallocate arrays to cache decoded m_i values and their sums.
         m_i_cache = Vector{Tuple}(undef, num_mi_combinations)
@@ -247,7 +247,7 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
             m_i_cache[mi_idx + 1] = m_i
             M_cache[mi_idx + 1] = sum(m_i)
             K_tensor = compute_K_tensor(n, m_i)
-            K_n_lambda[:, :, mi_idx + 1] = K_tensor
+            K_n_lambda_i[:, :, mi_idx + 1] = K_tensor
         end
 
         # Preallocate accumulation array for all (λ, μ) pairs, keyed by λ^2 + (λ + μ) + 1.
@@ -288,14 +288,14 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
                         abs(M) > lambda && continue
 
                         # Look up precomputed K value.
-                        K_lambda_n = K_n_lambda[n, lambda + 1, mi_idx + 1]
+                        K_lambda_n = K_n_lambda_i[n, lambda + 1, mi_idx + 1]
 
                         # Skip if K is zero.
                         K_lambda_n == 0.0 && continue
 
                         # Accumulate the A_{λμ}^{uvw} contribution using lambda-mu key.
                         A_lambda_mu_uvw = norm_factor * S_uvw * K_lambda_n
-                        lambda_mu_bin_idx = lambda_mu_key[lambda + 1, M + lambda + 1]
+                        lambda_mu_bin_idx = lm_key[lambda + 1, M + lambda + 1]
                         lambda_mu_accumulator[lambda_mu_bin_idx] += A_lambda_mu_uvw
                     end
                 end
@@ -303,7 +303,7 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
                 # Store non-zero A tensor values for this (u, v, w) triplet.
                 @inbounds for lambda in n:-2:lambda_min
                     @inbounds for mu in -lambda:lambda
-                        lambda_mu_bin_idx = lambda_mu_key[lambda + 1, mu + lambda + 1]
+                        lambda_mu_bin_idx = lm_key[lambda + 1, mu + lambda + 1]
                         value = lambda_mu_accumulator[lambda_mu_bin_idx]
 
                         # Only store non-zero values.

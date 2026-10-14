@@ -2,43 +2,40 @@
 
 module SparseTensors
 
-export SparseGauntArray, SparseATensor, SparseDTensor, SparseWTensor, lambda_mu_key, uvw_key
+export SparseGauntArray, SparseATensor, SparseDTensor, SparseWTensor, lm_key, uvw_key
 
 # Precompute the (λ, μ) and (u, v, w) keys, and store them as constant arrays for speed.
-# lambda_mu_key goes to λ = 30 (second axis covers μ offset up to 60) so that the f_lm
+# lm_key goes to λ = 30 (second axis covers μ offset up to 60) so that the f_sq_lm
 # Gaunt precomputation, which uses λ up to l_max, works for l_max up to 30.
 # uvw_key goes to λ = 12 (i-orbitals), corresponding to i-orbitals.
 # These are slightly too large for StaticArrays to be useful.
 # Second axis indexes μ via the offset μ + λ, which matches how we look up bins.
-const lambda_mu_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:30, mu_offset in 0:60]
+const lm_key = Int[lambda * lambda + mu_offset + 1 for lambda in 0:30, mu_offset in 0:60]
 const uvw_key = Int[binomial(u + v + w + 2, 3) + (u * (u + v + w + 1) - (u * (u - 1)) ÷ 2 + v) + 1 for u in 0:12, v in 0:12, w in 0:12]
 
 struct SparseGauntArray{T<:AbstractFloat}
     """
-    A structure to store Gaunt coefficients in in sparse COO format.
-    - lambda::Vector{Int}: The lambda quantum numbers for each non-zero Gaunt coefficient.
-    - mu::Vector{Int}: The mu quantum numbers for each non-zero Gaunt coefficient.
-    - L::Vector{Int}: The L quantum numbers for each non-zero Gaunt coefficient.
-    - l::Vector{Int}: The l quantum numbers for each non-zero Gaunt coefficient.
-    - m::Vector{Int}: The m quantum numbers for each non-zero Gaunt coefficient.
-    - coefficients::Vector{T}: The non-zero Gaunt coefficient values.
-    - lambda_mu_bins::Vector{Vector{Int}}: Bins of indices for each (lambda, mu) pair to speed up lookups when contracting.
+    A structure to store Gaunt coefficients in sparse COO format.
+    - l1::Vector{Int}: The first coupled harmonic's angular momentum.
+    - m1::Vector{Int}: The first coupled harmonic's magnetic index.
+    - l2::Vector{Int}: The second coupled harmonic's angular momentum.
+    - l3::Vector{Int}: The output harmonic's angular momentum.
+    - m3::Vector{Int}: The output harmonic's magnetic index.
+    - Gaunt_values::Vector{T}: The non-zero Gaunt coefficient values.
+    - l1_m1_bins::Vector{Vector{Int}}: Bins of indices for each (l1, m1) pair.
 
-    To clarify the bins. When constructing the Gaunt coefficients we store the index of everything
-    entry belonging to a given (λ, μ) in a bin. Then when we want a specific (λ, μ) we can just
-    then find the entries corresponding to that via the bin, which itself can be keyed as
-    e.g. key(λ,μ) = λ^2 + (λ + μ) + 1. This speeds up lookups significantly. Here the λ^2
-    term corresponds to the number of (λ, μ) pairs for all λ' < λ, the (λ + μ) is then the lookup
-    for the "current" lambda. The +1 is for 1-based julia indexing.
+    The coefficients are 𝒢_{ℓ₁m₁,ℓ₂m₂}^{ℓ₃m₃} = ∫dΩ Y_ℓ₁^{m₁} Y_ℓ₂^{m₂} conj(Y_ℓ₃^{m₃}),
+    with m₂ = m₃ - m₁, so m₂ need not be stored. Each (ℓ₁,m₁) bin holds all entries
+    with those first-harmonic indices, using key(ℓ₁,m₁) = ℓ₁² + ℓ₁ + m₁ + 1.
     """
 
-    lambda::Vector{Int}
-    mu::Vector{Int}
-    L::Vector{Int}
-    l::Vector{Int}
-    m::Vector{Int}
-    coefficients::Vector{T}
-    lambda_mu_bins::Vector{Vector{Int}}
+    l1::Vector{Int}
+    m1::Vector{Int}
+    l2::Vector{Int}
+    l3::Vector{Int}
+    m3::Vector{Int}
+    Gaunt_values::Vector{T}
+    l1_m1_bins::Vector{Vector{Int}}
 end
 
 struct SparseATensor{T<:AbstractFloat}

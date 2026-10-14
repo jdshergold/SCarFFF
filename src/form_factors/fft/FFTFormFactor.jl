@@ -31,7 +31,7 @@ function compute_fft_form_factor(
 
     This method computes the form factor by first constructing the transition density:
 
-        ρ(r) = ϕ_f(r) T_{fi} ϕ_i(r),
+        Φ^{g→s}(r) = 2 Σ_{μν} φ_μ(r) T_{μν}^{gs} φ_ν(r),
 
     on a Cartesian grid in real space, followed by a 3D FFT to obtain the form factor in momentum space.
 
@@ -48,7 +48,7 @@ function compute_fft_form_factor(
     - form_factors::Array{Complex{T}, 4}: The form factors in momentum space with shape (n_transitions, n_qx, n_qy, n_qz).
     - transition_densities::Array{T, 4}: The transition densities in real space with shape (n_transitions, n_x, n_y, n_z).
     - r_lim::Vector{T}: The limits of the grid in real space, in Angstroms.
-    - transition_energies_eV::Vector{T}: The transition energies in eV.
+    - Delta_E_eV::Vector{T}: The transition energies in eV.
     """
 
     stage_times = Pair{String, Float64}[]
@@ -59,7 +59,7 @@ function compute_fft_form_factor(
     end
 
     # Get the transition matrices for the specified transitions.
-    transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
+    T_gs = [mol.T_gs[idx] for idx in transition_indices]
 
     # Construct the transition densities on a Cartesian grid.
     N_grid = [length(qx_grid), length(qy_grid), length(qz_grid)]
@@ -68,7 +68,7 @@ function compute_fft_form_factor(
         transition_densities_gpu, r_lim = time_stage!(stage_times, "transition-density grid (GPU)") do
             result = construct_transition_density_gpu(
                 mol,
-                transition_matrices,
+                T_gs,
                 qx_grid,
                 qy_grid,
                 qz_grid
@@ -94,7 +94,7 @@ function compute_fft_form_factor(
         # Check Parseval's theorem if requested.
         if check_parseval
             time_stage!(stage_times, "Parseval check") do
-                for t_idx in 1:length(transition_matrices)
+                for t_idx in 1:length(T_gs)
                     check_parseval_theorem(
                         view(transition_densities, t_idx, :, :, :),
                         view(form_factors, t_idx, :, :, :),
@@ -108,7 +108,7 @@ function compute_fft_form_factor(
         transition_densities, r_lim = time_stage!(stage_times, "transition-density grid") do
             construct_transition_density(
                 mol,
-                transition_matrices,
+                T_gs,
                 qx_grid,
                 qy_grid,
                 qz_grid
@@ -126,7 +126,7 @@ function compute_fft_form_factor(
         # Check Parseval's theorem if requested.
         if check_parseval
             time_stage!(stage_times, "Parseval check") do
-                for t_idx in 1:length(transition_matrices)
+                for t_idx in 1:length(T_gs)
                     check_parseval_theorem(
                         view(transition_densities_copy, t_idx, :, :, :),
                         view(form_factors, t_idx, :, :, :),
@@ -138,11 +138,11 @@ function compute_fft_form_factor(
     end
 
     # Extract the transition energies for the requested transitions.
-    transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
+    Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
     print_stage_timings("FFT form-factor stage timings", stage_times)
 
-    return form_factors, transition_densities, r_lim, transition_energies_eV
+    return form_factors, transition_densities, r_lim, Delta_E_eV
 end
 
 end

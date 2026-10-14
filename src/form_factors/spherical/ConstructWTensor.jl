@@ -9,7 +9,7 @@ include("../../utils/BinEncoding.jl")
 
 using .BinEncoding: decode_bins
 using ...SparseTensors
-using ...SparseTensors: SparseDTensor, SparseWTensor, SparseATensor, lambda_mu_key, uvw_key
+using ...SparseTensors: SparseDTensor, SparseWTensor, SparseATensor, lm_key, uvw_key
 using ...ThreadChunks: chunk_count, chunk_range
 
 @inline function load_sparse_A_tensor(path::String, ::Type{T}) where {T<:AbstractFloat}
@@ -217,7 +217,7 @@ function construct_W_tensor(D_tensor::SparseDTensor{T}, A_tensor_path::String; t
     @inbounds for idx in 1:length(i_indices)
         lambda = lambda_indices[idx]
         mu = mu_indices[idx]
-        bin_key = lambda_mu_key[lambda + 1, mu + lambda + 1]
+        bin_key = lm_key[lambda + 1, mu + lambda + 1]
         push!(lambda_mu_bins[bin_key], idx)
     end
 

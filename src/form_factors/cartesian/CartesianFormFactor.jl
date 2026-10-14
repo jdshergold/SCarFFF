@@ -53,7 +53,7 @@ function compute_cartesian_form_factor(
     # Returns:
     - V_tensors::Union{Nothing, Tuple{Array{Complex{T}, 2}, Array{Complex{T}, 2}, Array{Complex{T}, 2}}}: The V_x, V_y, V_z tensors if need_V is true, otherwise nothing.
     - f_s::Union{Nothing, Array{Complex{T}, 4}}: The form factor on the (q_x, q_y, q_z) grid with shape (n_transitions, n_qx, n_qy, n_qz) if need_grid is true, otherwise nothing.
-    - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
+    - Delta_E_eV::Vector{T}: The transition energies in eV for the requested transitions.
     """
 
     stage_times = Pair{String, Float64}[]
@@ -79,7 +79,7 @@ function compute_cartesian_form_factor(
     end
 
     # Extract the transition matrices for the requested transitions.
-    transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
+    T_gs = [mol.T_gs[idx] for idx in transition_indices]
 
     # Construct the V tensors.
     V_x, V_y, V_z, nonzero_pairs = time_stage!(stage_times, "V tensors") do
@@ -95,13 +95,13 @@ function compute_cartesian_form_factor(
     if need_grid
         if use_gpu
             f_s = time_stage!(stage_times, "Cartesian grid (GPU)") do
-                result = Array(contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold))
+                result = Array(contract_cartesian_grid_gpu(V_x, V_y, V_z, nonzero_pairs, M_ij, T_gs, mol.cartesian_term_to_orbital; threshold = threshold))
                 CUDA.synchronize()
                 result
             end
         else
             f_s = time_stage!(stage_times, "Cartesian grid") do
-                contract_cartesian_grid(V_x, V_y, V_z, nonzero_pairs, M_ij, transition_matrices, mol.cartesian_term_to_orbital; threshold = threshold)
+                contract_cartesian_grid(V_x, V_y, V_z, nonzero_pairs, M_ij, T_gs, mol.cartesian_term_to_orbital; threshold = threshold)
             end
         end
     end
@@ -113,11 +113,11 @@ function compute_cartesian_form_factor(
     end
 
     # Extract the transition energies for the requested transitions.
-    transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
+    Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
     print_stage_timings("Cartesian form-factor stage timings", stage_times)
 
-    return V_tensors, f_s, transition_energies_eV
+    return V_tensors, f_s, Delta_E_eV
 end
 
 end

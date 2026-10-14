@@ -1,16 +1,16 @@
 # This module numerically projects a squared form factor sampled on a (q, θ, ϕ) grid onto real
-# spherical harmonic coefficients, giving an f_lm tensor.
+# spherical harmonic coefficients, giving an f_sq_lm tensor.
 
-module ProjectFLM
+module ProjectFSquared
 
 using Base.Threads
 using SphericalHarmonics
 using LinearAlgebra: mul!
 
-using ..ConstructFLMTensor: U
+using ..ConstructFSquaredTensor: U
 using ...ThreadChunks: chunk_count, chunk_range
 
-export project_f_lm, build_projection_matrices, build_projection_matrix, build_U_blocks,
+export project_f_sq_lm, build_projection_matrices, build_projection_matrix, build_U_blocks,
        project_block!, default_angular_grid
 
 function default_angular_grid(l_max::Int)::Tuple{Int, Int}
@@ -224,7 +224,7 @@ function build_U_blocks(l_max::Int, ::Type{T}) where {T<:AbstractFloat}
 end
 
 function project_block!(
-        f_lm::Array{T, 3},
+        f_sq_lm::Array{T, 3},
         f_sq_block::AbstractArray{T, 4},
         A::Matrix{T},
         U_blocks::Vector{Matrix{Complex{T}}},
@@ -233,7 +233,7 @@ function project_block!(
         occupancy::Union{Nothing, Matrix{Bool}} = nothing,
     ) where {T<:AbstractFloat}
     """
-    Project one block of q points and accumulate the result into the output f_lm tensor.
+    Project one block of q points and accumulate the result into the output f_sq_lm tensor.
 
     Splitting the projection this way streams over q rather than materialising the
     whole squared form factor, which could be very large.
@@ -241,17 +241,17 @@ function project_block!(
     The first axis is either the transition index for the form factor, or the energy value for the structure function.
 
     # Arguments:
-    - f_lm::Array{T, 3}: The output tensor, with dimensions (n_states, n_q, n_keys).
+    - f_sq_lm::Array{T, 3}: The output tensor, with dimensions (n_states, n_q, n_keys).
     - f_sq_block::AbstractArray{T, 4}: The squared form factor for this block, with dimensions (n_states, n_q_block, n_theta, n_phi).
     - A::Matrix{T}: The stacked (real, then imaginary, n_keys apart) μ ≥ 0 projection matrix from build_projection_matrix.
     - U_blocks::Vector{Matrix{Complex{T}}}: The complex-to-real transformation blocks.
-    - q_offset::Int: The index in f_lm of the first q point in this block.
+    - q_offset::Int: The index in f_sq_lm of the first q point in this block.
     - l_max::Int: The maximum angular momentum mode.
     - occupancy::Union{Nothing, Matrix{Bool}}: Which (state, q) of this block hold anything, with
       dimensions (n_states, n_q_block). The rest are skipped, as they are exactly zero.
 
     # Returns:
-    - Nothing. f_lm is modified in place.
+    - Nothing. f_sq_lm is modified in place.
     """
 
     # Get the block sizes.
@@ -321,8 +321,8 @@ function project_block!(
                         for mu in 1:(2 * l + 1)
                             total += coefficients[mu] * U_l[mu, m + l + 1]
                         end
-                        # |f|² is real, so f_lm is real by construction and any imaginary part is noise.
-                        f_lm[state_idx, q_idx, key_base + m] = real(total)
+                        # |f|² is real, so f_sq_lm is real by construction and any imaginary part is noise.
+                        f_sq_lm[state_idx, q_idx, key_base + m] = real(total)
                     end
                 end
             end
@@ -332,7 +332,7 @@ function project_block!(
     return nothing
 end
 
-function project_f_lm(
+function project_f_sq_lm(
         f_sq::Array{T, 4},
         theta_grid::Vector{T},
         phi_grid::Vector{T},
@@ -340,7 +340,7 @@ function project_f_lm(
         q_block::Int = 32,
     )::Array{T, 3} where {T<:AbstractFloat}
     """
-    Project |f(q, θ, ϕ)|² onto real spherical harmonic coefficients, producing an f_lm tensor,
+    Project |f(q, θ, ϕ)|² onto real spherical harmonic coefficients, producing an f_sq_lm tensor,
     keyed by key(ℓ, m) = ℓ² + (ℓ + m) + 1.
 
     We first project onto complex harmonic coefficients by quadrature, then rotate into the real
@@ -360,7 +360,7 @@ function project_f_lm(
     - q_block::Int: How many q points to project at once (default: 32).
 
     # Returns:
-    - Array{T, 3}: The f_lm tensor, with dimensions (n_states, n_q, n_keys).
+    - Array{T, 3}: The f_sq_lm tensor, with dimensions (n_states, n_q, n_keys).
     """
 
     # Get the block sizes and number of keys.
@@ -375,16 +375,16 @@ function project_f_lm(
     A = build_projection_matrix(theta_grid, phi_grid, l_max)
     U_blocks = build_U_blocks(l_max, T)
 
-    f_lm = Array{T, 3}(undef, n_states, n_q, n_keys)
+    f_sq_lm = Array{T, 3}(undef, n_states, n_q, n_keys)
 
     # Project one block of q points at a time.
     for q_start in 1:q_block:n_q
         q_stop = min(q_start + q_block - 1, n_q)
         block = f_sq[:, q_start:q_stop, :, :]
-        project_block!(f_lm, block, A, U_blocks, q_start, l_max)
+        project_block!(f_sq_lm, block, A, U_blocks, q_start, l_max)
     end
 
-    return f_lm
+    return f_sq_lm
 end
 
 end

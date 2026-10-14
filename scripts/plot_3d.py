@@ -10,6 +10,8 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy.interpolate import RegularGridInterpolator
 
+from plot_quantities import crystal_grid_key, crystal_group_grid, crystal_quantity_label
+
 
 def parse_cli_args():
     """
@@ -104,10 +106,11 @@ def parse_cli_args():
         help="Whether to plot the transition density (FFT method only).",
     )
     parser.add_argument(
-        "--coherent",
+        "--crystal",
+        dest="crystal",
         action="store_true",
-        help="Plot the coherent crystal states rather than the per-transition crystal form factors "
-             "(spherical crystal runs only). The data is read from crystal/coherent/, and "
+        help="Plot coherent or incoherent crystal quantities "
+             "(spherical crystal runs only). The data is read from crystal/, and "
              "--transition-indices then selects groups of crystal states, ordered by ascending "
              "energy, rather than monomer transitions.",
     )
@@ -115,7 +118,7 @@ def parse_cli_args():
         "--group-size",
         type=int,
         default=0,
-        help="Crystal states summed per plot in coherent mode, in ascending energy. Defaults to the "
+        help="Crystal states averaged per plot, in ascending energy. Defaults to the "
              "number of molecules in the unit cell, which is how many crystal states each monomer "
              "transition gives rise to. Pass 1 to plot states individually.",
     )
@@ -185,25 +188,31 @@ def parse_cli_args():
 
     # In coherent mode every crystal state lives in one file rather than one directory each, and the
     # indices select groups of states rather than monomer transitions.
-    parsed_args.coherent_path = None
-    if parsed_args.coherent:
+    parsed_args.crystal_path = None
+    if parsed_args.crystal:
         if parsed_args.method != "spherical":
-            print("--coherent only applies to spherical crystal runs.")
+            print("--crystal only applies to spherical crystal runs.")
             sys.exit(1)
-        coherent_root = (runs_dir / "crystal" / "coherent" if parsed_args.results_dir is None
-                         else parsed_args.output_dir / "coherent")
-        for candidate in ["crystal_f_lm_f64.h5", "crystal_f_lm_f32.h5"]:
-            path = coherent_root / candidate
+        crystal_root = runs_dir / "crystal" if parsed_args.results_dir is None else parsed_args.output_dir
+        for candidate in ["crystal_form_factors_f64.h5", "crystal_form_factors_f32.h5"]:
+            path = crystal_root / candidate
             if path.exists():
-                parsed_args.coherent_path = path
+                parsed_args.crystal_path = path
                 break
-        if parsed_args.coherent_path is None:
-            print(f"No coherent form factor file found under {coherent_root}.")
+        if parsed_args.crystal_path is None:
+            print(f"No crystal form factor file found under {crystal_root}.")
             sys.exit(1)
 
-        with h5py.File(parsed_args.coherent_path, "r") as coherent_file:
-            n_states = coherent_file["f_s"].shape[3]
-            n_transitions = coherent_file["transition_indices"].shape[0]
+        with h5py.File(parsed_args.crystal_path, "r") as crystal_file:
+            order = crystal_file["crystal_order"][()]
+            parsed_args.crystal_order = order.decode() if isinstance(order, bytes) else str(order)
+            parsed_args.n_molecules = len(np.unique(crystal_file["image_of"][()]))
+            parsed_args.original_transitions = crystal_file["transition_indices"][()]
+            try:
+                n_states = crystal_file[crystal_grid_key(parsed_args.crystal_order)].shape[3]
+            except KeyError:
+                parser.error("No f_uc or I_uc grid was saved; include form_factor in --compute-mode.")
+            n_transitions = crystal_file["transition_indices"].shape[0]
         parsed_args.effective_group_size = (
             parsed_args.group_size if parsed_args.group_size > 0 else n_states // n_transitions)
         if parsed_args.effective_group_size < 1 or n_states % parsed_args.effective_group_size:
@@ -213,9 +222,9 @@ def parse_cli_args():
         parsed_args.n_groups = n_states // parsed_args.effective_group_size
 
         # Summing |f|^2 over a group discards the phase, so the signed modes have nothing to show.
-        if parsed_args.effective_group_size > 1 and parsed_args.mode != "modsq":
-            print(f"Grouped coherent plots sum |f|^2, so --mode {parsed_args.mode} is not available; "
-                  "use --group-size 1 for the signed modes.")
+        if (parsed_args.effective_group_size > 1 or parsed_args.crystal_order == "incoherent") and parsed_args.mode != "modsq":
+            print(f"Crystal intensity plots average |f|^2, so --mode {parsed_args.mode} is not available; "
+                  "signed modes need a single coherent band (--group-size 1).")
             sys.exit(1)
 
     # The transition density is only available for the FFT method.
@@ -440,15 +449,17 @@ def extract_domain_data(data, mode, is_transition_density, already_squared=False
     - colorscale::str: The colourmap to use.
     - symmetric::bool: Whether to use symmetric colourbar limits.
     """
+    if already_squared and mode != "modsq":
+        raise ValueError("An intensity has no Re or Im amplitude; select modsq.")
     if is_transition_density:
         plot_data = data
-        label = "ρ(r) [Å<sup>-3</sup>]"
+        label = "Φ<sup>g→s</sup>(r) [Å<sup>-3</sup>]"
         colorscale = "RdBu_r"
         symmetric = True
     else:
         if mode == "modsq":
             plot_data = data if already_squared else np.abs(data) ** 2
-            label = "Σ_Ψ |f_s(q)|^2" if already_squared else "|f_s(q)|^2"
+            label = "Mean intensity" if already_squared else "|f_s(q)|^2"
             colorscale = "Viridis"
             symmetric = False
         elif mode == "Im":
@@ -633,7 +644,7 @@ def main():
         # Returns:
         - ::tuple: Loaded data, containing e.g. form factor, transition density, and grid data.
         """
-        if args.coherent:
+        if args.crystal:
             # One group of crystal states, summed. Everything else below is shared with the
             # per-transition path, since after the sum it is just another scalar field on the grid.
             group_size = args.effective_group_size
@@ -643,27 +654,21 @@ def main():
                 return None
             first = (group - 1) * group_size
 
-            with h5py.File(args.coherent_path, "r") as ff_file:
+            with h5py.File(args.crystal_path, "r") as ff_file:
                 theta_grid = ff_file["theta_grid"][()]
                 phi_grid = ff_file["phi_grid"][()]
                 q_grid = ff_file["q_grid"][()]
-                band_mean = ff_file["band_energy_mean_eV"][()]
-
-                # Julia writes (n_states, n_q, n_theta, n_phi), which h5py presents reversed, so the
-                # state is the last index here. A single state keeps its phase, so the signed modes
-                # still work; a group has to be squared before summing and loses it.
-                if group_size == 1:
-                    field = ff_file["f_s"][:, :, :, first]
-                else:
-                    field = None
-                    for state in range(first, first + group_size):
-                        contribution = np.abs(ff_file["f_s"][:, :, :, state]) ** 2
-                        field = contribution if field is None else field + contribution
+                energy_key = ("Delta_E_band_mean_eV"
+                              if args.crystal_order == "coherent" else
+                              "Delta_E_monomer_eV")
+                band_mean = ff_file[energy_key][()]
+                field = crystal_group_grid(ff_file, args.crystal_order, first,
+                                           first + group_size, args.n_molecules)
 
             # Julia's (n_q, n_theta, n_phi) arrives as (n_phi, n_theta, n_q), so match the layout
             # the per-transition path produces.
             field = np.transpose(field, (1, 0, 2))
-            output_dir = args.coherent_path.parent / (
+            output_dir = args.crystal_path.parent / (
                 f"group_{group}" if group_size > 1 else f"state_{group}")
             output_dir.mkdir(parents=True, exist_ok=True)
             mean_energy = band_mean[first:first + group_size].mean()
@@ -721,7 +726,7 @@ def main():
                 qz_grid = ff_file["qz_grid"][()]
 
                 # Compute q_lim from the grid.
-                q_lim = np.array([qx_grid.max(), qy_grid.max(), qz_grid.max()])
+                q_lim = (qx_grid, qy_grid, qz_grid)
 
                 # Julia writes with shape (nx, ny, nz), but HDF5 reverses to (nz, ny, nx).
                 # Transpose to get (nx, ny, nz).
@@ -745,7 +750,7 @@ def main():
                 qz_grid = ff_file["qz_grid"][()]
 
                 # Compute q_lim from the grid.
-                q_lim = np.array([qx_grid.max(), qy_grid.max(), qz_grid.max()])
+                q_lim = (qx_grid, qy_grid, qz_grid)
 
                 # Julia writes with shape (nx, ny, nz), but HDF5 reverses to (nz, ny, nx).
                 # Transpose to get (nx, ny, nz).
@@ -785,8 +790,14 @@ def main():
                     f_s, theta_grid, phi_grid, q_grid, output_dir = data
                     plot_data, label, colorscale, symmetric = extract_domain_data(
                         f_s, mode, False,
-                        already_squared=args.coherent and args.effective_group_size > 1
+                        already_squared=args.crystal and (args.effective_group_size > 1 or args.crystal_order == "incoherent")
                     )
+
+                    if args.crystal:
+                        first = (int(tidx) - 1) * args.effective_group_size
+                        label = crystal_quantity_label(args.crystal_order, first,
+                            first + args.effective_group_size, args.n_molecules,
+                            args.original_transitions, mode=mode, html=True)
 
                     # Determine q_lim from args if specified.
                     q_lim_override = None
@@ -812,15 +823,15 @@ def main():
                     )
 
                     # Create the coordinate arrays.
-                    nx, ny, nz = form_factor.shape
-                    qx_coords = np.linspace(-q_lim[0], q_lim[0], nx)
-                    qy_coords = np.linspace(-q_lim[1], q_lim[1], ny)
-                    qz_coords = np.linspace(-q_lim[2], q_lim[2], nz)
+                    qx_coords, qy_coords, qz_coords = q_lim
 
                     # Downsample to target grid size.
                     coord1, coord2, coord3, plot_data = downsample_fft_grid(
                         qx_coords, qy_coords, qz_coords, plot_data, args.grid_size
                     )
+
+                if args.crystal:
+                    title = label + f" for {args.run_name} molecule {args.molecule_number}."
 
                 coord_type = "q"
                 axis_labels = ("q<sub>x</sub> [keV]", "q<sub>y</sub> [keV]", "q<sub>z</sub> [keV]")
@@ -833,6 +844,8 @@ def main():
                 elif mode == "Re":
                     title = f"Re[f<sub>S</sub>(q)] for {args.run_name} molecule {args.molecule_number}."
 
+                if args.crystal:
+                    title = label + f" for {args.run_name} molecule {args.molecule_number}."
                 output_path = output_dir / f"form_factor_3d_{mode}.html"
 
             else:
@@ -844,9 +857,9 @@ def main():
 
                 # Create the coordinate arrays.
                 nx, ny, nz = transition_density.shape
-                x_coords = np.linspace(-r_lim[0], r_lim[0], nx)
-                y_coords = np.linspace(-r_lim[1], r_lim[1], ny)
-                z_coords = np.linspace(-r_lim[2], r_lim[2], nz)
+                x_coords = np.linspace(-r_lim[0], r_lim[0], nx, endpoint=False)
+                y_coords = np.linspace(-r_lim[1], r_lim[1], ny, endpoint=False)
+                z_coords = np.linspace(-r_lim[2], r_lim[2], nz, endpoint=False)
 
                 # Downsample to target grid size.
                 coord1, coord2, coord3, plot_data = downsample_fft_grid(
@@ -855,7 +868,7 @@ def main():
 
                 coord_type = "r"
                 axis_labels = ("x [Å]", "y [Å]", "z [Å]")
-                title = f"Transition density ρ(r) for {args.run_name} molecule {args.molecule_number}."
+                title = f"Transition density Φ<sup>g→s</sup>(r) for {args.run_name} molecule {args.molecule_number}."
                 output_path = output_dir / "transition_density_3d.html"
 
             # Apply range limits.

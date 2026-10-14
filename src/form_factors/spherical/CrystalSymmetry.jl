@@ -1,31 +1,5 @@
 # This module finds the symmetry operations that let one Bloch diagonalisation cover the whole
 # star of k points.
-#
-# Two relations are used, both derived in crystal_upgrade.tex §"Some symmetries" and both verified
-# against the assembled H(k) to round off:
-#
-#   Time reversal.  J is real, since it is a Coulomb integral over real transition densities and a
-#   real separation, so H(k) = conj(H(-k)). This holds for any crystal and needs no crystallography.
-#
-#   The star of k.  For a space group element Λ with rotation R_Λ, carrying molecule A_i onto
-#   molecule Λ(A_i) up to a lattice vector L_{Λ,A_i}, the eigenvectors at k_Λ = R_Λ^{-1} k follow
-#   from those at k by a permutation and a phase,
-#
-#       E_Ψ(k_Λ) = E_Ψ(k),    C_{Λ(A_i),s}(k_Λ) = C_{A_i,s}(k) exp(-i k_Λ · L_{Λ,A_i}).
-#
-# Composing the two gives what the reconstruction applies, for a member whose own wavevector is k_m.
-# Without time reversal,
-#
-#       C_{Λ(A_i),s}(k_m) =      C_{A_i,s}(k)  exp(-i k_m · L_{Λ,A_i}),
-#
-# and with it, the same thing on the conjugated coefficients,
-#
-#       C_{Λ(A_i),s}(k_m) = conj(C_{A_i,s}(k)) exp(-i k_m · L_{Λ,A_i}).
-#
-# Writing k_m rather than k_Λ is what lets the two share a phase factor: the two differ by a
-# reciprocal lattice vector at most, and G · L is a multiple of 2π, so the phase cannot tell them
-# apart. The operations come from the images already recorded in the crystal metadata, so no space
-# group library and no metadata change is needed.
 
 module CrystalSymmetry
 
@@ -56,15 +30,15 @@ struct SymmetryOperation{T<:AbstractFloat}
     One operation of the star.
 
     # Fields:
-    - rotation::SMatrix{3, 3, T, 9}: The Cartesian rotation R_Λ, including the improper sign.
+    - R_Lambda::SMatrix{3, 3, T, 9}: The Cartesian rotation R_Λ, including the improper sign.
     - image_of::Vector{Int}: Λ(A_i), the image each image is carried onto.
-    - offsets::Vector{SVector{3, T}}: The lattice vector L_{Λ,A_i} left over for each image, in Å.
+    - L_offsets::Vector{SVector{3, T}}: The lattice vector L_{Λ,A_i} left over for each image, in Å.
     - conjugate::Bool: Whether this operation is composed with time reversal, which sends k to -k
       and conjugates the coefficients.
     """
-    rotation::SMatrix{3, 3, T, 9}
+    R_Lambda::SMatrix{3, 3, T, 9}
     image_of::Vector{Int}
-    offsets::Vector{SVector{3, T}}
+    L_offsets::Vector{SVector{3, T}}
     conjugate::Bool
 end
 
@@ -74,7 +48,7 @@ struct StarMember{T<:AbstractFloat}
 
     # Fields:
     - operation::Int: Index of an operation that maps k onto k_Λ.
-    - direction::SVector{3, T}: The direction of the member. This is k_Λ.
+    - direction::SVector{3, T}: The momentum transfer direction q̂ of the member.
     - grid_indices::Vector{Tuple{Int, Int}}: Every (θ, ϕ) index that points in this direction. The poles and
       the repeated ϕ endpoint mean one direction can sit at several indices, and each still needs
       its own entry in the output grid.
@@ -173,7 +147,7 @@ function cartesian_operation(image::CrystalImage{T})::SMatrix{3, 3, T, 9} where 
     - SMatrix{3, 3, T, 9}: The operation R_i, with det(R_i) = det_rotation.
     """
 
-    return SMatrix{3, 3, T, 9}(image.det_rotation .* Quaternionic.to_rotation_matrix(image.rotation))
+    return SMatrix{3, 3, T, 9}(image.det_rotation .* Quaternionic.to_rotation_matrix(image.R_tilde))
 end
 
 function is_lattice_vector(lattice::CrystalLatticeData{T}, vector::SVector{3, T})::Bool where {T<:AbstractFloat}
@@ -273,7 +247,7 @@ function derive_symmetry_operations(
     # Setup the lists of rotations and translations.
     n_images = length(images)
     operations = [cartesian_operation(image) for image in images]
-    translations = [image.translation for image in images]
+    translations = [image.tau for image in images]
 
     # The recorded pairs orient and place each image relative to the reference conformer.
     # As a result, to get from image e.g. 1 to i, we need to map 1 -> reference, then
@@ -332,7 +306,7 @@ function derive_symmetry_operations(
 
     # Put the idenity operation first in the list.
     identity_position = findfirst(
-        operation -> maximum(abs, operation.rotation - one(SMatrix{3, 3, T, 9})) < match_tolerance(T), found)
+        operation -> maximum(abs, operation.R_Lambda - one(SMatrix{3, 3, T, 9})) < match_tolerance(T), found)
     identity_position === nothing && error(
         "The identity is not among the matched symmetry operations, which should be impossible. " *
         "Check the translations and rotations in the crystal metadata."
@@ -342,7 +316,7 @@ function derive_symmetry_operations(
     end
 
     # Add in the time reversed operations, k -> -k and conjugation.
-    time_reversed = [SymmetryOperation{T}(operation.rotation, operation.image_of, operation.offsets, true)
+    time_reversed = [SymmetryOperation{T}(operation.R_Lambda, operation.image_of, operation.L_offsets, true)
                      for operation in found]
 
     return vcat(found, time_reversed)
@@ -428,7 +402,7 @@ function build_stars(
         closed = true
         for index in 1:n_directions
             # Find the image of the direction: sign * R * direction, matching k_i = R_i k.
-            target = nearest_direction(sign .* (operation.rotation * direction_vectors[index]))
+            target = nearest_direction(sign .* (operation.R_Lambda * direction_vectors[index]))
             if target == 0
                 closed = false
                 break

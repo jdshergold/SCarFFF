@@ -17,13 +17,13 @@ function contract_spherical_grid_gpu(
     """
     Contract the radial and angular parts of the form factor to obtain f_s(q, θ, ϕ) on a spherical grid, defined by:
 
-        f_s(q, θ, ϕ) = ∑_{ℓ=0}^{l_max} ∑_{m=-ℓ}^{ℓ} R_{ℓm}(q) Y_{ℓm}(θ, ϕ),
+        f_s(q, θ, ϕ) = ∑_{ℓ=0}^{l_max} ∑_{m=-ℓ}^{ℓ} R_{ℓm}(q) Y_ℓ^m(θ, ϕ),
 
     where R is the R tensor that depends only on the modulus of the momentum transfer, q,
-    and Y_{ℓm} are the spherical harmonics.
+    and Y_ℓ^m are the spherical harmonics.
 
-    This GPU implementation computes Y_{ℓm}(θ, ϕ) for m ≥ 0 only, then performs two dense matrix
-    multiplications (GEMMs) to exploit the symmetry Y_{ℓ,-m}(θ, ϕ) = (-1)^m conj(Y_{ℓm}(θ, ϕ)).
+    This GPU implementation computes Y_ℓ^m(θ, ϕ) for m ≥ 0 only, then performs two dense matrix
+    multiplications (GEMMs) to exploit the symmetry Y_{ℓ,-m}(θ, ϕ) = (-1)^m conj(Y_ℓ^m(θ, ϕ)).
 
     # Arguments:
     - R_pos::CuArray{Complex{T}}: The R tensor for m ≥ 0 with dimensions (n_transitions, n_q, n_keys_pos).

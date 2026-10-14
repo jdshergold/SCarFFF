@@ -775,12 +775,12 @@ def run_td_dft_analysis_from_coordinates(
         f.create_dataset("ao_labels", data=ao_labels, dtype=dt)
 
         # Store the transition energies in eV, and the oscillator strengths.
-        f.create_dataset("energies_ev", data=np.array(energies, dtype=float_dtype))
+        f.create_dataset("Delta_E_eV", data=np.array(energies, dtype=float_dtype))
         f.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
 
         # Store the occupied and virtual MO coefficients, shared across all transitions.
-        f.create_dataset("mo_coeff_occ", data=np.asarray(orbo, dtype=complex_dtype))
-        f.create_dataset("mo_coeff_vir", data=np.asarray(orbv, dtype=complex_dtype))
+        f.create_dataset("C_o", data=np.asarray(orbo, dtype=complex_dtype))
+        f.create_dataset("C_v", data=np.asarray(orbv, dtype=complex_dtype))
 
         # Store the per-transition X and Y amplitudes.
         for i, (X, Y) in enumerate(mxXY):

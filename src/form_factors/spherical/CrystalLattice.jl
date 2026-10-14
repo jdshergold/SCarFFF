@@ -22,7 +22,7 @@ const BOHR_ANGSTROM = 0.529177210903
 struct CrystalLatticeData{T<:AbstractFloat}
     direct::SMatrix{3, 3, T, 9}      # Rows are the direct lattice vectors a_1, a_2, a_3, in Å.
     reciprocal::SMatrix{3, 3, T, 9}  # Rows are the reciprocal lattice vectors b_1, b_2, b_3, in Å^{-1}.
-    volume::T                        # The unit cell volume, in Å^3.
+    V_cell::T                        # The unit cell volume, in Å^3.
 end
 
 function build_crystal_lattice(direct_lattice::AbstractMatrix, ::Type{T}) where {T<:AbstractFloat}
@@ -46,15 +46,15 @@ function build_crystal_lattice(direct_lattice::AbstractMatrix, ::Type{T}) where 
     size(direct_lattice) == (3, 3) || error("The direct lattice must be a 3x3 matrix, got $(size(direct_lattice)).")
 
     A = SMatrix{3, 3, T, 9}(T.(direct_lattice))
-    volume = abs(det(A))
+    V_cell = abs(det(A))
 
     # A degenerate cell would make the reciprocal lattice meaningless, so catch it here rather than
     # letting it surface as a silently wrong inverse.
-    volume > eps(T) || error("The direct lattice is singular (volume $(volume) Å^3), so the reciprocal lattice is undefined.")
+    V_cell > eps(T) || error("The direct lattice is singular (V_cell $(V_cell) Å^3), so the reciprocal lattice is undefined.")
 
     B = T(2π) * transpose(inv(A))
 
-    return CrystalLatticeData{T}(A, B, volume)
+    return CrystalLatticeData{T}(A, B, V_cell)
 end
 
 @inline function fold_to_bz(lattice::CrystalLatticeData{T}, q::SVector{3, T})::Tuple{SVector{3, T}, SVector{3, T}} where {T<:AbstractFloat}

@@ -14,12 +14,12 @@ include("DensityFormFactors.jl")
 include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
-include("ConstructFLMTensor.jl")
+include("ConstructFSquaredTensor.jl")
 include("ConstructCrystalTensor.jl")
 include("CrystalLattice.jl")
 include("Ewald.jl")
 include("BlochHamiltonian.jl")
-include("ProjectFLM.jl")
+include("ProjectFSquared.jl")
 include("WignerRotations.jl")
 include("CouplingJ.jl")
 include("CrystalSymmetry.jl")
@@ -28,7 +28,7 @@ include("CoherentCrystalFormFactor.jl")
 include("ComputeRates.jl")
 
 using CUDA
-using .ReadBasisSet: get_molecular_data, MoleculeData, build_Delta_matrices,
+using .ReadBasisSet: get_molecular_data, MoleculeData, build_Delta_T_matrices,
                      TransitionPairs, build_transition_pairs
 using .ConstructPairCoefficients: construct_pair_coefficients
 using .ConstructbCoefficients: construct_b_coefficients
@@ -39,38 +39,38 @@ using .ConstructWTensor: construct_W_tensor
 using .ConstructRTensor: construct_R_tensor
 using .DensityFormFactors: split_density_R_tensors
 using .ContractSphericalGrid: contract_spherical_grid
-using .ConstructCrystalTensor: construct_crystal_f_lm_tensors
+using .ConstructCrystalTensor: construct_unit_cell_f_sq_lm_tensors
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
 using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
               compute_ewald_D, supercell_radius,
               check_dipole_against_oscillator_strength
 using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis,
                          set_D_couplings!
-using .ProjectFLM: project_f_lm, default_angular_grid
+using .ProjectFSquared: project_f_sq_lm, default_angular_grid
 using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings,
                   compute_crystal_corrections, subtract_self_term!,
                   image_translation_span
 using .CrystalSymmetry: SymmetryOperation, Stars, derive_symmetry_operations,
                         build_stars, star_reduction_factor, choose_compatible_phi_count
 using .StructureFactor: EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
-                        incoherent_structure_factor, integrate_energy, trim_energy_axis,
+                        incoherent_intensity_lm_E, integrate_energy, trim_energy_axis,
                         describe_energy_grid, kernel_shape, apply_structure_function_prefactor!
 using .CoherentCrystalFormFactor: rotate_R_tensors, rotate_crystal_R_tensors,
-                                  compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
-                                  compute_incoherent_crystal_f_lm
+                                  compute_coherent_unit_cell_form_factor, compute_coherent_unit_cell_f_sq_lm,
+                                  compute_incoherent_unit_cell_f_sq_lm
 
 using .ComputeRates: compute_rates, compute_rates_by_orientation, combine_crystal_rate_grids
 using ..StageTimings: print_stage_timings, time_stage!
 
 export compute_spherical_form_factor, compute_spherical_form_factor_with_densities,
-       compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids,
+       compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids,
        build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis,
        set_D_couplings!, compute_crystal_corrections,
        rotate_R_tensors, rotate_crystal_R_tensors,
-       compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
-       compute_incoherent_crystal_f_lm, project_f_lm,
+       compute_coherent_unit_cell_form_factor, compute_coherent_unit_cell_f_sq_lm,
+       compute_incoherent_unit_cell_f_sq_lm, project_f_sq_lm,
        EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
-       incoherent_structure_factor, integrate_energy, trim_energy_axis, describe_energy_grid,
+       incoherent_intensity_lm_E, integrate_energy, trim_energy_axis, describe_energy_grid,
        kernel_shape, apply_structure_function_prefactor!,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        compute_ewald_D, subtract_self_term!,
@@ -138,7 +138,7 @@ function _compute_spherical_form_factor(
         use_gpu::Bool = false,
         need_grid::Bool = true,
         need_R::Bool = true,
-        need_flm::Bool = true,
+        need_f_sq_lm::Bool = true,
         need_Delta_and_Xi::Bool = false,
     ) where {T<:AbstractFloat}
     """
@@ -156,14 +156,14 @@ function _compute_spherical_form_factor(
     - use_gpu::Bool: Whether to use the GPU for steps beyond the W tensor (default: false).
     - need_grid::Bool: Whether to contract the R tensor to compute the form factor on the grid (default: true).
     - need_R::Bool: Whether to save the R tensor (default: true).
-    - need_flm::Bool: Whether to compute the f_lm tensor (default: false).
+    - need_f_sq_lm::Bool: Whether to compute the f_sq_lm tensor (default: true).
     - need_Delta_and_Xi::Bool: Whether to also construct Δ and Ξ for the crystal correction.
 
     # Returns:
     - R_tensor::Union{Array{Complex{T}, 3}, Nothing}: The prefactored R tensor keyed by ℓ^2 + (ℓ + m) + 1, or nothing if not requested for saving.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The form factor on the (q, θ, ϕ) grid with shape (n_transitions, n_q, n_θ, n_ϕ), or nothing if not requested.
-    - f_lm::Union{Array{Complex{T}, 3}, Nothing}: The f_lm tensor, the ``squared'' verision of the R tensor, with shape (n_transitions, n_q, n_flm_keys), or nothing if not requested.
-    - transition_energies_eV::Vector{T}: The transition energies in eV for the requested transitions.
+    - f_sq_lm::Union{Array{T, 3}, Nothing}: The real harmonic coefficients of |f_s|², with shape (n_transitions, n_q, n_keys), or nothing if not requested.
+    - Delta_E_eV::Vector{T}: The transition energies in eV for the requested transitions.
     - Delta_and_Xi: The Δ and neutral ground-charge R tensors, or nothing.
     """
 
@@ -181,24 +181,24 @@ function _compute_spherical_form_factor(
     # Use @__DIR__ to make paths relative to this source file, not the working directory.
     type_suffix = T == Float32 ? "_f32" : "_f64"
     data_dir = joinpath(@__DIR__, "../../data")
-    gaunt_path = joinpath(data_dir, "gaunt_coefficients", "gaunt_coefficients_lambda$(lambda_max)_L$(l_max + lambda_max)_l$(l_max)$(type_suffix).h5")
+    gaunt_path = joinpath(data_dir, "gaunt_coefficients", "Gaunt_l1$(lambda_max)_l2$(l_max + lambda_max)_l3$(l_max)$(type_suffix).h5")
     A_tensor_path = joinpath(data_dir, "A_tensors", "A_tensor_n$(lambda_max)$(type_suffix).h5")
 
     # Precompute angular tensors if they do not already exist.
     need_gaunt = force_recomputation || !isfile(gaunt_path)
     need_A = force_recomputation || !isfile(A_tensor_path)
-    gaunt_flm_path = ""
-    need_gaunt_flm = false
-    if need_flm
-        gaunt_flm_path = joinpath(data_dir, "gaunt_coefficients", "gaunt_coefficients_flm_lmax$(l_max)$(type_suffix).h5")
-        need_gaunt_flm = force_recomputation || !isfile(gaunt_flm_path)
+    gaunt_f_sq_lm_path = ""
+    need_gaunt_f_sq_lm = false
+    if need_f_sq_lm
+        gaunt_f_sq_lm_path = joinpath(data_dir, "gaunt_coefficients", "Gaunt_l1$(l_max)_l2$(l_max)_l3$(l_max)$(type_suffix).h5")
+        need_gaunt_f_sq_lm = force_recomputation || !isfile(gaunt_f_sq_lm_path)
     end
-    if need_gaunt || need_A || need_gaunt_flm
+    if need_gaunt || need_A || need_gaunt_f_sq_lm
         time_stage!(stage_times, "precompute angular tensors") do
             need_gaunt && precompute_gaunt_coefficients(lambda_max, l_max + lambda_max, l_max, gaunt_path, T)
             need_A && precompute_A_tensor(lambda_max, A_tensor_path, T)
-            if need_gaunt_flm
-                precompute_gaunt_coefficients(l_max, l_max, l_max, gaunt_flm_path, T)
+            if need_gaunt_f_sq_lm
+                precompute_gaunt_coefficients(l_max, l_max, l_max, gaunt_f_sq_lm_path, T)
             end
         end
     end
@@ -225,17 +225,17 @@ function _compute_spherical_form_factor(
     end
 
     # Extract the transition matrices for the requested transitions.
-    transition_matrices = [mol.transition_matrices[idx] for idx in transition_indices]
-    density_matrices = copy(transition_matrices)
+    T_gs = [mol.T_gs[idx] for idx in transition_indices]
+    density_matrices = copy(T_gs)
     if need_Delta_and_Xi
-        push!(density_matrices, mol.ground_state_matrix)
-        append!(density_matrices, build_Delta_matrices(mol, transition_indices))
+        push!(density_matrices, mol.T_gg)
+        append!(density_matrices, build_Delta_T_matrices(mol, transition_indices))
     end
-    n_transitions = length(transition_matrices)
+    n_transitions = length(T_gs)
 
     R_lm = nothing
     f_s = nothing
-    f_lm = nothing
+    f_sq_lm = nothing
     Delta_and_Xi = nothing
 
     if use_gpu
@@ -280,7 +280,7 @@ function _compute_spherical_form_factor(
             need_Delta_and_Xi && CUDA.unsafe_free!(transition_neg)
         end
 
-        if need_R || need_flm || need_Delta_and_Xi
+        if need_R || need_f_sq_lm || need_Delta_and_Xi
             all_R = time_stage!(stage_times, "copy and combine R tensor") do
                 combine_gpu_R_tensor(R_lm_pos, R_lm_neg, l_max)
             end
@@ -294,14 +294,14 @@ function _compute_spherical_form_factor(
             end
         end
 
-        if need_flm
-            # Construct the f_lm tensor on the CPU from the combined R tensor.
-            f_lm = time_stage!(stage_times, "f_lm tensor") do
-                ConstructFLMTensor.construct_f_lm_tensor(R_lm, gaunt_flm_path)
+        if need_f_sq_lm
+            # Construct the f_sq_lm tensor on the CPU from the combined R tensor.
+            f_sq_lm = time_stage!(stage_times, "f_sq_lm tensor") do
+                ConstructFSquaredTensor.construct_f_sq_lm_tensor(R_lm, gaunt_f_sq_lm_path)
             end
         end
 
-        # Unset R_lm if we only needed it as an intermediate for f_lm.
+        # Unset R_lm if we only needed it as an intermediate for f_sq_lm.
         if !need_R
             R_lm = nothing
         end
@@ -341,10 +341,10 @@ function _compute_spherical_form_factor(
             end
         end
 
-        if need_flm
-            # Construct the f_lm tensor.
-            f_lm = time_stage!(stage_times, "f_lm tensor") do
-                ConstructFLMTensor.construct_f_lm_tensor(R_lm, gaunt_flm_path)
+        if need_f_sq_lm
+            # Construct the f_sq_lm tensor.
+            f_sq_lm = time_stage!(stage_times, "f_sq_lm tensor") do
+                ConstructFSquaredTensor.construct_f_sq_lm_tensor(R_lm, gaunt_f_sq_lm_path)
             end
         end
 
@@ -356,11 +356,11 @@ function _compute_spherical_form_factor(
     end
 
     # Extract the transition energies for the requested transitions.
-    transition_energies_eV = [T(mol.transition_energies_eV[idx]) for idx in transition_indices]
+    Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
     print_stage_timings("Spherical form-factor stage timings", stage_times)
 
-    return R_lm, f_s, f_lm, transition_energies_eV, Delta_and_Xi
+    return R_lm, f_s, f_sq_lm, Delta_E_eV, Delta_and_Xi
 end
 
 function compute_spherical_form_factor(args...; kwargs...)
@@ -372,11 +372,11 @@ function compute_spherical_form_factor(args...; kwargs...)
     - kwargs: Molecular form-factor keyword arguments.
 
     # Returns:
-    - Tuple: R, the angular-grid form factor, f_lm and transition energies.
+    - Tuple: R, the angular-grid form factor, f_sq_lm and transition energies.
     """
-    R_lm, f_s, f_lm, energies, _ = _compute_spherical_form_factor(
+    R_lm, f_s, f_sq_lm, energies, _ = _compute_spherical_form_factor(
         args...; kwargs..., need_Delta_and_Xi = false)
-    return R_lm, f_s, f_lm, energies
+    return R_lm, f_s, f_sq_lm, energies
 end
 
 function compute_spherical_form_factor_with_densities(args...; kwargs...)

@@ -15,7 +15,7 @@ export construct_nuclear_R, split_density_R_tensors, Delta_row
     """
     The row of the rotated Δ tensor that holds pair (s, t) of a given image.
 
-    Δ is laid out image-major with the pair running fastest, the same way λ runs over transitions
+    Δ is laid out image-major with the pair running fastest, the same way λ_i runs over transitions
     fastest and then over images.
 
     # Arguments:
@@ -119,7 +119,7 @@ function split_density_R_tensors(
     ) where {T<:AbstractFloat}
     """
     Split the density batch, [R_s1, R_s2, ..., R_sn, R_g, Δ_1,..., Δ_p], where R_sn is
-    the nth transition R tensor (f_lm), R_g is the ground state R tensor, for the charge density,
+    the nth transition R tensor (f_sq_lm), R_g is the ground state R tensor, for the charge density,
     denoted N_g in the notes, and Δ_p is the R tensor of the pth (s, t) pair. Then build
 
         Ξ_lm(q) = N_lm^(g)(q) - Z_lm(q).

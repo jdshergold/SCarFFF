@@ -4,6 +4,7 @@ using LinearAlgebra
 using Quaternionic
 using SphericalHarmonics
 using StaticArrays
+using HDF5
 
 const SF = SCarFFF.SphericalFormFactor
 const RT = SF.ConstructRTensor
@@ -197,7 +198,7 @@ function build_small_R_case(::Type{T}, tmp_dir::String) where {T<:AbstractFloat}
 
     # The asymmetric matrix and its transpose expose any accidental assumption that T_ij = T_ji.
     asymmetric = T[1 2; 3 4]
-    density_matrices = Matrix{T}[mol.transition_matrices[1], asymmetric, Matrix(transpose(asymmetric))]
+    density_matrices = Matrix{T}[mol.T_gs[1], asymmetric, Matrix(transpose(asymmetric))]
     q_grid = T[0, 0.25, 1]
     inputs = (W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, 2, gaunt_path,
               density_matrices, mol.cartesian_term_to_orbital)
@@ -305,8 +306,8 @@ end
     C_v = Complex{T}[0.1; -0.3; 0.9;;]
     X = Complex{T}[0.4; -0.2;;]
     Y = Complex{T}[0.05; 0.12;;]
-    ground = DM.build_ground_state_matrix(C_o)
-    difference = DM.build_pair_difference_matrix(X, Y, X, Y, C_o, C_v)
+    ground = DM.build_T_gg(C_o)
+    difference = DM.build_Delta_T(X, Y, X, Y, C_o, C_v)
     A = conj(X) * transpose(X) + Y * adjoint(Y)
     B = transpose(X) * conj(X) + adjoint(Y) * Y
     @test ground ≈ C_o * adjoint(C_o)
@@ -319,8 +320,8 @@ end
     # unrelated to the first state's.
     X_t = Complex{T}[0.15 + 0.3im; 0.45;;]
     Y_t = Complex{T}[-0.08; 0.02 - 0.11im;;]
-    Delta_st = DM.build_pair_difference_matrix(X, Y, X_t, Y_t, C_o, C_v)
-    Delta_ts = DM.build_pair_difference_matrix(X_t, Y_t, X, Y, C_o, C_v)
+    Delta_st = DM.build_Delta_T(X, Y, X_t, Y_t, C_o, C_v)
+    Delta_ts = DM.build_Delta_T(X_t, Y_t, X, Y, C_o, C_v)
     # A^(ts) and B^(ts), written out here independently of the function being tested.
     A_ts = conj(X) * transpose(X_t) + Y_t * adjoint(Y)
     B_ts = transpose(X_t) * conj(X) + adjoint(Y) * Y_t
@@ -336,8 +337,8 @@ end
     Y_real = T[-0.06; 0.09;;]
     C_o_real = real(C_o)
     C_v_real = real(C_v)
-    real_st = DM.build_pair_difference_matrix(real(X), real(Y), X_real, Y_real, C_o_real, C_v_real)
-    real_ts = DM.build_pair_difference_matrix(X_real, Y_real, real(X), real(Y), C_o_real, C_v_real)
+    real_st = DM.build_Delta_T(real(X), real(Y), X_real, Y_real, C_o_real, C_v_real)
+    real_ts = DM.build_Delta_T(X_real, Y_real, real(X), real(Y), C_o_real, C_v_real)
     @test real_st ≈ transpose(real_ts)
     # Neither matrix is symmetric by itself, so the test below is not comparing a density to itself.
     @test !isapprox(real_st, real_ts)
@@ -384,8 +385,8 @@ end
 
         # Batch order is transitions, ground, then one Δ density per (s, t) pair.
         # As in, all_R = [transition_R_1, transition_R_2, ..., ground_R, Delta_R_1, Delta_R_2, ...].
-        densities = Matrix{T}[mol.transition_matrices[1], mol.ground_state_matrix]
-        append!(densities, RB.build_Delta_matrices(mol, [1]))
+        densities = Matrix{T}[mol.T_gs[1], mol.T_gg]
+        append!(densities, RB.build_Delta_T_matrices(mol, [1]))
         all_R = RT.construct_R_tensor(
             W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path,
             densities, term_to_orbital)
@@ -401,16 +402,16 @@ end
         # Two transitions give three pairs, so the batch is 2 + 1 + 3 and Δ starts after the ground state.
         # This molecule only has one state, so invent a second one by scaling its amplitudes. Any Δ
         # built from X and Y is neutral at q = 0, so the split's neutrality check still applies.
-        X_1 = mol.X_matrices[1]
-        Y_1 = mol.Y_matrices[1]
+        X_1 = mol.X_states[1]
+        Y_1 = mol.Y_states[1]
         X_2 = T(0.7) .* X_1
         Y_2 = T(-0.4) .* Y_1
         Delta_pair_matrices = Matrix{T}[
-            DM.build_pair_difference_matrix(X_1, Y_1, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir),
-            DM.build_pair_difference_matrix(X_1, Y_1, X_2, Y_2, mol.mo_coeff_occ, mol.mo_coeff_vir),
-            DM.build_pair_difference_matrix(X_2, Y_2, X_2, Y_2, mol.mo_coeff_occ, mol.mo_coeff_vir)]
-        two_state_densities = Matrix{T}[mol.transition_matrices[1], mol.transition_matrices[1],
-                                        mol.ground_state_matrix]
+            DM.build_Delta_T(X_1, Y_1, X_1, Y_1, mol.C_o, mol.C_v),
+            DM.build_Delta_T(X_1, Y_1, X_2, Y_2, mol.C_o, mol.C_v),
+            DM.build_Delta_T(X_2, Y_2, X_2, Y_2, mol.C_o, mol.C_v)]
+        two_state_densities = Matrix{T}[mol.T_gs[1], mol.T_gs[1],
+                                        mol.T_gg]
         append!(two_state_densities, Delta_pair_matrices)
         two_state_R = RT.construct_R_tensor(
             W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path,
@@ -430,15 +431,15 @@ end
         selected_mol = deepcopy(mol)
         X_3 = T(-0.3) .* X_1
         Y_3 = T(0.8) .* Y_1
-        append!(selected_mol.X_matrices, [X_2, X_3])
-        append!(selected_mol.Y_matrices, [Y_2, Y_3])
-        selected_Delta = RB.build_Delta_matrices(selected_mol, [3, 1])
-        @test selected_Delta[1] ≈ real(DM.build_pair_difference_matrix(
-            X_3, Y_3, X_3, Y_3, mol.mo_coeff_occ, mol.mo_coeff_vir))
-        @test selected_Delta[2] ≈ real(DM.build_pair_difference_matrix(
-            X_3, Y_3, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir))
-        @test selected_Delta[3] ≈ real(DM.build_pair_difference_matrix(
-            X_1, Y_1, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir))
+        append!(selected_mol.X_states, [X_2, X_3])
+        append!(selected_mol.Y_states, [Y_2, Y_3])
+        selected_Delta = RB.build_Delta_T_matrices(selected_mol, [3, 1])
+        @test selected_Delta[1] ≈ real(DM.build_Delta_T(
+            X_3, Y_3, X_3, Y_3, mol.C_o, mol.C_v))
+        @test selected_Delta[2] ≈ real(DM.build_Delta_T(
+            X_3, Y_3, X_1, Y_1, mol.C_o, mol.C_v))
+        @test selected_Delta[3] ≈ real(DM.build_Delta_T(
+            X_1, Y_1, X_1, Y_1, mol.C_o, mol.C_v))
 
         # Expanding Z_lm against the harmonics must reproduce the point-charge sum it came from,
         # Σ_I Z_I exp(i q · R_I), which checks the i^l, Bessel and conj(Y) factors together.
@@ -484,7 +485,7 @@ end
     for (image_idx, image) in enumerate(images)
         for (conformers, rotated, n_densities) in
                 ((conformer_R, rotated_R, 2), (conformer_Delta, rotated_Delta, 3), (conformer_Xi, rotated_Xi, 1))
-            expected = rotate_test_R(conformers[image.conformer_index], image.rotation, l_max)
+            expected = rotate_test_R(conformers[image.conformer_index], image.R_tilde, l_max)
             for l in 0:l_max
                 keys = (l * l + 1):((l + 1)^2)
                 expected[:, :, keys] .*= image.det_rotation^l
@@ -513,7 +514,7 @@ end
     BH.set_D_couplings!(basis, zeros(T, 1, 2, 2))
     BH.build_bloch_hamiltonian!(eigensystem, basis, SVector{3, T}(0.2, -0.1, 0.3))
     # Check that no diagonal correction was applied.
-    @test eigensystem.H ≈ Diagonal(Complex{T}.(basis.energies))
+    @test eigensystem.H ≈ Diagonal(Complex{T}.(basis.Delta_E_monomer))
     # Check that passing a block for one transition, when there are two, throws an error.
     @test_throws ErrorException BH.set_D_couplings!(basis, ones(T, 1, 1, 1))
 
@@ -532,7 +533,7 @@ end
         # Each molecule has its own block. The zeros between them enforce δ_{A_i B_j}.
         expected_D = T[-0.12 0.18 0 0; 0.18 0.07 0 0;
                        0 0 0.03 -0.09; 0 0 -0.09 -0.04]
-        expected_H = Diagonal(basis.energies) + expected_D
+        expected_H = Diagonal(basis.Delta_E_monomer) + expected_D
         @test basis.D_couplings == expected_D
         eigensystem = BH.BlochEigensystem(basis)
         tolerance = T == Float32 ? 2e-6 : 2e-13
@@ -541,9 +542,9 @@ end
         for k in (SVector{3, T}(0, 0, 0), SVector{3, T}(0.2, -0.1, 0.3))
             BH.solve_bloch_hamiltonian!(eigensystem, basis, k)
             @test eigensystem.H ≈ expected_H atol = tolerance
-            @test eigensystem.energies ≈ eigvals(Symmetric(expected_H)) atol = tolerance
-            @test expected_H * eigensystem.coefficients ≈
-                  eigensystem.coefficients * Diagonal(eigensystem.energies) atol = tolerance
+            @test eigensystem.Delta_E ≈ eigvals(Symmetric(expected_H)) atol = tolerance
+            @test expected_H * eigensystem.C ≈
+                  eigensystem.C * Diagonal(eigensystem.Delta_E) atol = tolerance
         end
 
         # Invalid blocks must be rejected before replacing the previous D.
@@ -561,7 +562,7 @@ end
         # Replacing D with zero must clear the off-diagonal entries as well as the shifts.
         BH.set_D_couplings!(basis, zero(D_blocks))
         BH.build_bloch_hamiltonian!(eigensystem, basis, SVector{3, T}(0, 0, 0))
-        @test eigensystem.H == Diagonal(Complex{T}.(basis.energies))
+        @test eigensystem.H == Diagonal(Complex{T}.(basis.Delta_E_monomer))
     end
 end
 
@@ -601,14 +602,14 @@ end
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "coupling_gaunt.h5")
         SF.PrecomputeGaunt.precompute_gaunt_coefficients(
-            l_max, l_max, 2 * l_max, gaunt_path, T)
+            l_max, 2 * l_max, l_max, gaunt_path, T)
 
         # Folding D into the same pass must leave J exactly as the J-only route computed it.
         old_J = CJ.compute_couplings(
             transition_R, basis, cells, q_grid, l_max, gaunt_path)
         new_J, D_blocks = CJ.compute_crystal_corrections(
             transition_R, Delta_R, Xi_R, basis, cells, q_grid, l_max, gaunt_path)
-        @test new_J.values ≈ old_J.values atol = 1e-13
+        @test new_J.J_deltaR ≈ old_J.J_deltaR atol = 1e-13
         @test all(isfinite, D_blocks)
 
         # With no change in the excited-state density, every directed D interaction vanishes.
@@ -624,7 +625,7 @@ end
         rotation_matrix = SMatrix{3, 3, T, 9}(
             Quaternionic.to_rotation_matrix(common_rotation))
         rotated_images = [BH.CrystalImage{T}(
-            1, identity_rotation, one(T), rotation_matrix * image.translation) for image in images]
+            1, identity_rotation, one(T), rotation_matrix * image.tau) for image in images]
         rotated_basis = BH.build_excitation_basis(rotated_images, [T[2.0]])
         rotated_transition = rotate_test_R(transition_R, common_rotation, l_max)
         rotated_Delta = rotate_test_R(Delta_R, common_rotation, l_max)
@@ -632,7 +633,7 @@ end
         rotated_J, rotated_D = CJ.compute_crystal_corrections(
             rotated_transition, rotated_Delta, rotated_Xi, rotated_basis, cells,
             q_grid, l_max, gaunt_path)
-        @test rotated_J.values ≈ new_J.values rtol = 2e-12 atol = 2e-12
+        @test rotated_J.J_deltaR ≈ new_J.J_deltaR rtol = 2e-12 atol = 2e-12
         @test rotated_D ≈ D_blocks rtol = 2e-12 atol = 2e-12
 
         # A molecule must feel neighbours on both sides, so one molecule repeated periodically
@@ -690,7 +691,7 @@ end
 
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "off_diagonal_D_gaunt.h5")
-        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, gaunt_path, T)
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, 2 * l_max, l_max, gaunt_path, T)
 
         # Compare both kernels against a direct angular integral. This checks the rotation of the
         # potential back to Δ, including complex Wigner matrices and the reversed separation.
@@ -700,7 +701,7 @@ end
                 parameters = split)
             J_only = CJ.compute_couplings(
                 transition_R, basis, cells, q_grid, l_max, gaunt_path; parameters = split)
-            @test couplings.values == J_only.values
+            @test couplings.J_deltaR == J_only.J_deltaR
             @test size(D_blocks) == (2, 2, 2)
             @test all(abs.(D_blocks[:, 1, 2]) .> 1e-5)
             @test D_blocks[:, 1, 2] == D_blocks[:, 2, 1]
@@ -712,7 +713,7 @@ end
             for image in 1:2
                 neighbour = 3 - image
                 rows = ((image - 1) * 3 + 1):(image * 3)
-                separation = images[image].translation - images[neighbour].translation
+                separation = images[image].tau - images[neighbour].tau
                 reference = angular_D_reference(
                     Delta_R[rows, :, :], Xi_R[neighbour, :, :], separation, q_grid, radial_weights)
                 @test maximum(abs, imag(reference)) < 1e-12
@@ -727,7 +728,7 @@ end
             rotation = Quaternionic.rotor(T[cos(angle / 2), (sin(angle / 2) .* axis)...])
             rotation_matrix = SMatrix{3, 3, T, 9}(Quaternionic.to_rotation_matrix(rotation))
             rotated_images = [BH.CrystalImage{T}(
-                image.conformer_index, identity_rotation, one(T), rotation_matrix * image.translation)
+                image.conformer_index, identity_rotation, one(T), rotation_matrix * image.tau)
                 for image in images]
             rotated_basis = BH.build_excitation_basis(rotated_images, [T[2.1, 2.8], T[2.2, 3.0]])
             _, rotated_D = CJ.compute_crystal_corrections(
@@ -777,7 +778,7 @@ end
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "ewald_gaunt.h5")
         SF.PrecomputeGaunt.precompute_gaunt_coefficients(
-            l_max, l_max, 2 * l_max, gaunt_path, T)
+            l_max, 2 * l_max, l_max, gaunt_path, T)
 
         # A large spherical direct sum provides the reference boundary condition.
         direct_cells = CJ.enumerate_neighbour_cells(lattice, T(12))
@@ -795,7 +796,7 @@ end
                 lattice, T(1e-8); eta = eta)
             short_cells = CJ.enumerate_neighbour_cells(lattice, parameters.R_max)
             long_range = SF.Ewald.build_ewald_long_range(
-                transition_R, transition_R_bc, [image.translation, image.translation], basis.image_of, lattice,
+                transition_R, transition_R_bc, [image.tau, image.tau], basis.image_of, lattice,
                 q_grid, q_bc, l_max, parameters)
             _, short_D = CJ.compute_crystal_corrections(
                 transition_R, Delta_R, Xi_R, basis, short_cells,
@@ -831,19 +832,19 @@ end
     Xi_bc = neutral_test_R(2, T[q_bc], l_max)
     transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
     transition_bc = vcat(Delta_bc[1:2, :, :], Delta_bc[4:5, :, :])
-    tau_of_lambda = [images[image].translation for image in basis.image_of]
+    tau_of_lambda_i = [images[image].tau for image in basis.image_of]
     lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
     parameters = SF.choose_ewald_parameters(lattice, T(1e-8); eta = T(0.4))
     pairs = DM.build_transition_pairs(2)
 
     vacuum = SF.build_ewald_long_range(
-        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        transition_R, transition_bc, tau_of_lambda_i, basis.image_of, lattice,
         q_grid, q_bc, l_max, parameters; epsilon_b = one(T))
     conductor = SF.build_ewald_long_range(
-        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        transition_R, transition_bc, tau_of_lambda_i, basis.image_of, lattice,
         q_grid, q_bc, l_max, parameters; epsilon_b = T(Inf))
     dielectric = SF.build_ewald_long_range(
-        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        transition_R, transition_bc, tau_of_lambda_i, basis.image_of, lattice,
         q_grid, q_bc, l_max, parameters; epsilon_b = T(4))
     D_vacuum = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
         q_grid, q_bc, basis.n_transitions, l_max, vacuum)
@@ -874,12 +875,12 @@ end
         harmonics = harmonic_values(G / G_norm, l_max)
         Delta_at_G = neutral_test_R(6, T[G_norm], l_max)
         Xi_at_G = neutral_test_R(2, T[G_norm], l_max)
-        total_Xi = sum(cis(dot(G, images[image].translation)) *
+        total_Xi = sum(cis(dot(G, images[image].tau)) *
                        sum(Xi_at_G[image, 1, :] .* harmonics) for image in 1:2)
         weight = vacuum.prefactor * exp(-(G_norm / (2 * parameters.eta))^2) / G_norm^2
         for image in 1:2, (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
             row = (image - 1) * 3 + pair
-            value = weight * cis(dot(G, images[image].translation)) *
+            value = weight * cis(dot(G, images[image].tau)) *
                     sum(Delta_at_G[row, 1, :] .* harmonics) * conj(total_Xi)
             reciprocal[image, s, t] += value
             s == t && continue
@@ -924,20 +925,20 @@ end
     # Check that the grid spans from 5 eV to 8 eV, with a σ_E = 3 dE buffer on either end.
     grid = SF.build_energy_grid(5.0, 8.0, 0.01)
 
-    @test grid.step ≈ 0.01
-    @test grid.sigma ≈ 3 * grid.step
+    @test grid.energy_step ≈ 0.01
+    @test grid.sigma ≈ 3 * grid.energy_step
     @test grid.half_window == 3
 
     # Check that there are either 5 or 6 points (for σ_E = 3 ΔE)
-    for offset in range(0, grid.step, length = 9)[1:8]
-        buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
-        occupancy = zeros(Bool, length(grid.energies), 1)
+    for offset in range(0, grid.energy_step, length = 9)[1:8]
+        buffer = zeros(Float64, length(grid.E), 1, 1, 1)
+        occupancy = zeros(Bool, length(grid.E), 1)
         SF.accumulate_delta!(buffer, occupancy, grid, 6.5 + offset, 1.0, 1, 1, 1)
         @test count(!iszero, buffer) in (5, 6)
     end
-    @test first(grid.energies) ≈ 5.0 - grid.sigma
-    @test last(grid.energies) >= 8.0 + grid.sigma
-    @test all(diff(grid.energies) .≈ 0.01)
+    @test first(grid.E) ≈ 5.0 - grid.sigma
+    @test last(grid.E) >= 8.0 + grid.sigma
+    @test all(diff(grid.E) .≈ 0.01)
 
     # σ_E is where the mollifier reaches zero, with nothing at all beyond it. Check this.
     @test SF.kernel_shape(grid, grid.sigma) == 0.0
@@ -948,70 +949,77 @@ end
     finer = SF.build_energy_grid(5.0, 8.0, 0.005)
 
     @test finer.sigma ≈ grid.sigma / 2
-    @test length(finer.energies) > length(grid.energies)
+    @test length(finer.E) > length(grid.E)
 
-    # Reject ΔE that are too small, as we would need too many grid points.
+    # Reject dE that are too small, as we would need too many grid points.
     @test_throws ErrorException SF.build_energy_grid(5.0, 8.0, 1e-7)
     @test_throws ErrorException SF.build_energy_grid(5.0, 8.0, -0.01)
 
     # Check that the delta approximation preserves the normalisation.
-    for energy in (5.0, 6.5, 8.0, first(grid.energies), last(grid.energies))
-        buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
-        occupancy = zeros(Bool, length(grid.energies), 1)
+    for energy in (5.0, 6.5, 8.0, first(grid.E), last(grid.E))
+        buffer = zeros(Float64, length(grid.E), 1, 1, 1)
+        occupancy = zeros(Bool, length(grid.E), 1)
         SF.accumulate_delta!(buffer, occupancy, grid, energy, 3.25, 1, 1, 1)
-        @test sum(buffer) * grid.step ≈ 3.25
+        @test sum(buffer) * grid.energy_step ≈ 3.25
     end
 
     # Check everything in the structure factor is zero away from where the bands are.
-    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
-    occupancy = zeros(Bool, length(grid.energies), 1)
+    buffer = zeros(Float64, length(grid.E), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.E), 1)
     SF.accumulate_delta!(buffer, occupancy, grid, 6.5, 1.0, 1, 1, 1)
-    outside = abs.(grid.energies .- 6.5) .> grid.sigma
+    outside = abs.(grid.E .- 6.5) .> grid.sigma
 
     @test all(buffer[outside, 1, 1, 1] .== 0.0)
 
     # Also check that it nonzero where it should be.
-    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
-    occupancy = zeros(Bool, length(grid.energies), 1)
+    buffer = zeros(Float64, length(grid.E), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.E), 1)
     SF.accumulate_delta!(buffer, occupancy, grid, 6.5, 1.0, 1, 1, 1)
     weights = buffer[:, 1, 1, 1]
-    mean_energy = sum(weights .* grid.energies) / sum(weights)
+    mean_energy = sum(weights .* grid.E) / sum(weights)
 
     @test mean_energy ≈ 6.5 atol = 1e-6
-    @test grid.energies[argmax(weights)] ≈ 6.5 atol = grid.step
+    @test grid.E[argmax(weights)] ≈ 6.5 atol = grid.energy_step
 
     # Check that the variance is what we expect.
-    variance = sum(weights .* (grid.energies .- mean_energy).^2) / sum(weights)
+    variance = sum(weights .* (grid.E .- mean_energy).^2) / sum(weights)
     @test sqrt(variance) ≈ 0.3976350541 * grid.sigma rtol = 5e-2
 
     # Check that multiple states are actually accumulated, and don't overwrite one another.
-    buffer = zeros(Float64, length(grid.energies), 1, 1, 1)
-    occupancy = zeros(Bool, length(grid.energies), 1)
+    buffer = zeros(Float64, length(grid.E), 1, 1, 1)
+    occupancy = zeros(Bool, length(grid.E), 1)
     for (energy, magnitude) in ((5.5, 1.0), (6.0, 2.0), (7.25, 0.5))
         SF.accumulate_delta!(buffer, occupancy, grid, energy, magnitude, 1, 1, 1)
     end
-    @test sum(buffer) * grid.step ≈ 3.5
+    @test sum(buffer) * grid.energy_step ≈ 3.5
 
     # Make sure that all of the bins with stuff in are marked as occupied.
     @test all(buffer[.!occupancy[:, 1], 1, 1, 1] .== 0.0)
-    @test count(occupancy) < length(grid.energies)
+    @test count(occupancy) < length(grid.E)
 
     # The incoherent route spreads fixed transition energies, and integrating E must give back the
     # coefficients it started from.
-    f_lm = reshape(collect(1.0:12.0), 2, 2, 3)
+    f_sq_lm = reshape(collect(1.0:12.0), 2, 2, 3)
     energies = [5.5, 7.0]
-    structure_factor = SF.incoherent_structure_factor(f_lm, energies, grid)
+    structure_factor = SF.incoherent_intensity_lm_E(f_sq_lm, energies, grid)
     integral = SF.integrate_energy(structure_factor, grid)
 
-    @test size(structure_factor) == (length(grid.energies), 2, 3)
-    @test integral ≈ dropdims(sum(f_lm, dims = 1), dims = 1)
+    @test size(structure_factor) == (length(grid.E), 2, 3)
+    @test integral ≈ dropdims(sum(f_sq_lm, dims = 1), dims = 1)
+
+    # The saved structure function includes 2π/V_cell, with no state or molecule average.
+    V_cell = 125.0
+    SF.apply_structure_function_prefactor!(structure_factor, V_cell)
+    @test SF.integrate_energy(structure_factor, grid) ≈
+          (2π / V_cell) .* dropdims(sum(f_sq_lm, dims = 1), dims = 1)
+    @test_throws ErrorException SF.apply_structure_function_prefactor!(copy(structure_factor), 0.0)
 end
 
 @testset "Energy axis trimming" begin
     # The axis is built wider than the bands need, so the empty ends come off before anything is
     # saved to disk.
     grid = SF.build_energy_grid(5.0, 8.0, 0.01)
-    n_energy = length(grid.energies)
+    n_energy = length(grid.E)
     structure_factor = zeros(Float64, n_energy, 2, 3)
 
     # Put some nonzero physics in two bins.
@@ -1024,13 +1032,13 @@ end
 
     # Check the trimmed size is correct.
     @test size(trimmed) == (high_bin - low_bin + 1, 2, 3)
-    @test length(trimmed_grid.energies) == high_bin - low_bin + 1
-    @test trimmed_grid.energies[1] ≈ grid.energies[low_bin]
-    @test trimmed_grid.energies[end] ≈ grid.energies[high_bin]
+    @test length(trimmed_grid.E) == high_bin - low_bin + 1
+    @test trimmed_grid.E[1] ≈ grid.E[low_bin]
+    @test trimmed_grid.E[end] ≈ grid.E[high_bin]
 
     # Check that the trimming didn't drop anything nonzero.
     @test trimmed_grid.sigma == grid.sigma
-    @test trimmed_grid.step == grid.step
+    @test trimmed_grid.energy_step == grid.energy_step
     @test sum(trimmed) == sum(structure_factor)
 
     # Check that there are the right number of gaps in the middle.
@@ -1048,7 +1056,7 @@ end
     unchanged, unchanged_grid = SF.trim_energy_axis(empty_factor, grid)
 
     @test unchanged === empty_factor
-    @test length(unchanged_grid.energies) == n_energy
+    @test length(unchanged_grid.E) == n_energy
 end
 
 function two_molecule_cell(::Type{T}, offset::SVector{3, T},
@@ -1141,9 +1149,9 @@ function dipole_couplings(basis, images, lattice, reference_dipoles::Vector{Vect
                                           n3 * lattice.direct[3, :]))
     end
 
-    n_lambda = length(basis.energies)
-    dipoles = Vector{SVector{3, T}}(undef, n_lambda)
-    for lambda in 1:n_lambda
+    n_lambda_i = length(basis.Delta_E_monomer)
+    dipoles = Vector{SVector{3, T}}(undef, n_lambda_i)
+    for lambda in 1:n_lambda_i
         image = images[basis.image_of[lambda]]
         operation = SF.CrystalSymmetry.cartesian_operation(image)
         # Compute the dipoles for each image, by rotating hte reference dipoles.
@@ -1151,20 +1159,20 @@ function dipole_couplings(basis, images, lattice, reference_dipoles::Vector{Vect
             reference_dipoles[image.conformer_index][basis.transition_of[lambda]]
     end
 
-    values = zeros(Complex{T}, length(cell_vectors), n_lambda, n_lambda)
+    values = zeros(Complex{T}, length(cell_vectors), n_lambda_i, n_lambda_i)
     for (cell_idx, cell) in enumerate(cell_vectors),
-        lambda_prime in 1:n_lambda, lambda in 1:n_lambda
+        lambda_j in 1:n_lambda_i, lambda in 1:n_lambda_i
 
-        separation = images[basis.image_of[lambda]].translation -
-                     images[basis.image_of[lambda_prime]].translation - cell
+        separation = images[basis.image_of[lambda]].tau -
+                     images[basis.image_of[lambda_j]].tau - cell
         distance = norm(separation)
         # A molecule does not couple to itself in its own cell, and nothing couples past the cutoff.
         (distance < 1e-8 || distance > cutoff) && continue
         direction = separation / distance
         first_dipole = dipoles[lambda]
-        second_dipole = dipoles[lambda_prime]
+        second_dipole = dipoles[lambda_j]
         # Set J_{λλ'}(ΔR) = (d_λ · d_λ') / |distance|^3.
-        values[cell_idx, lambda, lambda_prime] = Complex{T}(
+        values[cell_idx, lambda, lambda_j] = Complex{T}(
             (dot(first_dipole, second_dipole) -
              3 * dot(first_dipole, direction) * dot(second_dipole, direction)) / distance^3)
     end
@@ -1189,7 +1197,7 @@ end
     # The two different molecules have excitations differing by 20 meV.
     basis = BH.build_excitation_basis(images, [T[4.10, 4.65], T[4.12, 4.67]])
     operations = SF.derive_symmetry_operations(images, lattice)
-    n_lambda = length(basis.energies)
+    n_lambda_i = length(basis.Delta_E_monomer)
 
     # The environment mixes transitions differently for the two conformers, but symmetry-related
     # images of the same conformer must carry the same D block.
@@ -1230,16 +1238,16 @@ end
         for operation in operations
             # k_Λ = R_Λ k, and time reversal flips the sign on top of that.
             reversal = operation.conjugate ? -one(T) : one(T)
-            k_lambda = reversal * (operation.rotation * k)
+            k_lambda = reversal * (operation.R_Lambda * k)
             BH.build_bloch_hamiltonian!(at_k_lambda, basis, k_lambda, couplings)
             H_lambda = Matrix(Hermitian(copy(at_k_lambda.H), :U))
 
-            for a in 1:n_lambda, b in 1:n_lambda
+            for a in 1:n_lambda_i, b in 1:n_lambda_i
                 # Find the λ that the operation sends a and b to. λ is a pair (image, transition),
                 # and only the image is permuted. The && chain assigns when both parts match.
                 mapped_a = 0
                 mapped_b = 0
-                for lambda in 1:n_lambda
+                for lambda in 1:n_lambda_i
                     basis.transition_of[lambda] == basis.transition_of[a] &&
                         basis.image_of[lambda] == operation.image_of[basis.image_of[a]] &&
                         (mapped_a = lambda)
@@ -1249,8 +1257,8 @@ end
                 end
 
                 # Compute the phase factor from the translation.
-                offset_a = operation.offsets[basis.image_of[a]]
-                offset_b = operation.offsets[basis.image_of[b]]
+                offset_a = operation.L_offsets[basis.image_of[a]]
+                offset_b = operation.L_offsets[basis.image_of[b]]
                 phase = cis(-dot(k_lambda, offset_a - offset_b))
                 # Conjugate the Hamiltonian if the operation is time-reversing, and apply the phase factor.
                 expected = operation.conjugate ? conj(H[a, b]) * phase : H[a, b] * phase
@@ -1283,11 +1291,11 @@ end
     operations = SF.derive_symmetry_operations(images, lattice)
 
     # The cell has to actually supply an operation that is not its own inverse.
-    @test any(maximum(abs, operation.rotation * operation.rotation - I) > 1e-10
+    @test any(maximum(abs, operation.R_Lambda * operation.R_Lambda - I) > 1e-10
               for operation in operations)
 
     basis = BH.build_excitation_basis(images, [T[4.10, 4.65]])
-    n_lambda = length(basis.energies)
+    n_lambda_i = length(basis.Delta_E_monomer)
 
     # Build D from rotated densities, so the symmetry check includes its pair contractions as
     # well as its placement in H. Only molecules in this cell contribute to this finite reference.
@@ -1299,7 +1307,7 @@ end
     cells = CJ.NeighbourCells{T}([SVector{3, T}(0, 0, 0)], [(0, 0, 0)], [1])
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "fourfold_D_gaunt.h5")
-        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, gaunt_path, T)
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, 2 * l_max, l_max, gaunt_path, T)
         _, D_blocks = CJ.compute_crystal_corrections(
             rotated_R, rotated_Delta, rotated_Xi, basis, cells, q_grid, l_max, gaunt_path)
         @test abs(D_blocks[1, 1, 2]) > 1e-6
@@ -1321,14 +1329,14 @@ end
 
         for operation in operations
             reversal = operation.conjugate ? -one(T) : one(T)
-            k_lambda = reversal * (operation.rotation * k)
+            k_lambda = reversal * (operation.R_Lambda * k)
             BH.build_bloch_hamiltonian!(at_k_lambda, basis, k_lambda, couplings)
             H_lambda = Matrix(Hermitian(copy(at_k_lambda.H), :U))
 
-            for a in 1:n_lambda, b in 1:n_lambda
+            for a in 1:n_lambda_i, b in 1:n_lambda_i
                 mapped_a = 0
                 mapped_b = 0
-                for lambda in 1:n_lambda
+                for lambda in 1:n_lambda_i
                     basis.transition_of[lambda] == basis.transition_of[a] &&
                         basis.image_of[lambda] == operation.image_of[basis.image_of[a]] &&
                         (mapped_a = lambda)
@@ -1337,12 +1345,68 @@ end
                         (mapped_b = lambda)
                 end
 
-                phase = cis(-dot(k_lambda, operation.offsets[basis.image_of[a]] -
-                                           operation.offsets[basis.image_of[b]]))
+                phase = cis(-dot(k_lambda, operation.L_offsets[basis.image_of[a]] -
+                                           operation.L_offsets[basis.image_of[b]]))
                 expected = operation.conjugate ? conj(H[a, b]) * phase : H[a, b] * phase
 
                 @test H_lambda[mapped_a, mapped_b] ≈ expected atol = 1e-10
             end
         end
     end
+end
+
+
+@testset "Gaunt convention" begin
+    mktempdir() do directory
+        path = joinpath(directory, "Gaunt.h5")
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(1, 2, 1, path, Float64)
+        for contraction in (SF.ConstructRTensor, SF.ConstructRTensorGPU, SF.ConstructFSquaredTensor)
+            gaunt = contraction.load_gaunt_array(path, Float64)
+            for m in -1:1
+                # Y_0^0 = 1/√(4π), so coupling it to Y_1^m returns the same Y_1^m.
+                index = findfirst(i -> gaunt.l1[i] == 1 && gaunt.l2[i] == 0 &&
+                    gaunt.l3[i] == 1 && gaunt.m1[i] == m && gaunt.m3[i] == m,
+                    eachindex(gaunt.Gaunt_values))
+                @test index !== nothing
+                @test gaunt.Gaunt_values[index] ≈ 1 / sqrt(4π)
+
+                # ∫dΩ |Y_1^m|² Y_2^0 gives the Gaunt coefficient with plane-wave M = 0.
+                index = findfirst(i -> gaunt.l1[i] == 1 && gaunt.l2[i] == 2 &&
+                    gaunt.l3[i] == 1 && gaunt.m1[i] == m && gaunt.m3[i] == m,
+                    eachindex(gaunt.Gaunt_values))
+                @test index !== nothing
+                expected = (m == 0 ? 2.0 : -1.0) * sqrt(5 / (4π)) / 5
+                @test gaunt.Gaunt_values[index] ≈ expected
+            end
+        end
+
+        # P̄ uses the Gaunt directly, with only i^L and the polar harmonic left to multiply.
+        P_pair = CJ.build_pair_frame_P(path, Float64)
+        for mu in -1:1
+            triple = findfirst(==((1, 1, mu)), P_pair.triples)
+            members = P_pair.offsets[triple]:(P_pair.offsets[triple + 1] - 1)
+            for member in members
+                L = P_pair.member_L[member]
+                if L == 0
+                    @test P_pair.member_weight[member] ≈ 1 / (4π)
+                elseif L == 2
+                    expected = -(mu == 0 ? 2.0 : -1.0) / (4π)
+                    @test P_pair.member_weight[member] ≈ expected
+                else
+                    @test false
+                end
+            end
+        end
+    end
+end
+
+@testset "Intensity rate projection" begin
+    # Constant radial intensity must retain its two state values in every tophat bin.
+    f_sq_lm = zeros(Float64, 2, 3, 1)
+    f_sq_lm[1, :, 1] .= 2.0
+    f_sq_lm[2, :, 1] .= 5.0
+    projected = SF.ComputeRates.to_tophat(f_sq_lm)
+    @test size(projected) == (2, 2, 1)
+    @test sum(abs2, projected[1, :, 1]) ≈ 4.0 / 3
+    @test sum(abs2, projected[2, :, 1]) ≈ 25.0 / 3
 end

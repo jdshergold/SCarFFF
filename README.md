@@ -97,7 +97,7 @@ SCarFFF/
 │   │   │   ├── ConstructWTensor.jl          # W tensor construction.
 │   │   │   ├── ConstructRTensor.jl          # R tensor construction (CPU).
 │   │   │   ├── ConstructRTensorGPU.jl       # R tensor construction (GPU).
-│   │   │   ├── ConstructFLMTensor.jl        # fsq tensor construction (CPU).
+│   │   │   ├── ConstructFSquaredTensor.jl        # fsq tensor construction (CPU).
 │   │   │   ├── ContractSphericalGrid.jl     # Final contraction to spherical grid (CPU).
 │   │   │   └── ContractSphericalGridGPU.jl  # Final contraction to spherical grid (GPU).
 │   │   │
@@ -129,7 +129,7 @@ SCarFFF/
             ├── spherical/     # Spherical method results.
             │   └── transition_[n]/
             │       ├── fs_grid_f32.h5 # Form factor results (HDF5). Contains whichever of
-            │       │                  # f_s (grid), R_tensor, and f_lm were requested via
+            │       │                  # f_s (grid), R_tensor, and f_sq_lm were requested via
             │       │                  # COMPUTE_MODES in run_computation.sh.
             │       ├── fs_3d.html     # Interactive 3D form factor visualisation.
             │       └── *.png          # 2D slice plots.

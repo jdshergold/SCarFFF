@@ -60,13 +60,13 @@ end
 
 function construct_transition_density(
         mol::MoleculeData{T},
-        transition_matrices::Vector{Matrix{T}},
+        T_gs::Vector{Matrix{T}},
         qx_grid::Vector{T},
         qy_grid::Vector{T},
         qz_grid::Vector{T}
     )::Tuple{Array{T, 4}, Vector{T}} where {T<:AbstractFloat}
     """
-    Construct the transition density ϕ_f(r)T_{fi}ϕ_i(r) for one or more transitions.
+    Construct the transition density Φ^{g→s}(r) = 2 Σ_{μν} φ_μ(r) T_{μν}^{gs} φ_ν(r) for one or more transitions.
 
     Here ϕ_{i}(r - r_i) is the i-th atomic orbital at position r_i, given by:
 
@@ -76,7 +76,7 @@ function construct_transition_density(
 
     # Arguments:
     - mol::MoleculeData{T}: The molecular data structure containing basis set and coordinates.
-    - transition_matrices::Vector{Matrix{T}}: Vector of transition matrices T_{fi}.
+    - T_gs::Vector{Matrix{T}}: Per-spin AO transition matrices T^(gs).
     - qx_grid::Vector{T}: The qx grid in momentum space, in keV.
     - qy_grid::Vector{T}: The qy grid in momentum space, in keV.
     - qz_grid::Vector{T}: The qz grid in momentum space, in keV.
@@ -92,7 +92,7 @@ function construct_transition_density(
     # Compute the transition density on the spatial grid.
     n_primitives = mol.n_primitives
     n_orbitals = mol.n_orbitals
-    n_transitions = length(transition_matrices)
+    n_transitions = length(T_gs)
     primitive_to_atom = mol.primitive_to_atom
     primitive_to_orbital = mol.primitive_to_orbital
 
@@ -186,7 +186,7 @@ function construct_transition_density(
                         # Compute the transition density at the current grid point for ALL transitions.
                         # This reuses the expensive orbital evaluation across all transitions.
                         for t in 1:n_transitions
-                            mul!(view(temp_local, :, t), transition_matrices[t], orbital_local)  # temp[:, t] = T_fi * ϕ_i.
+                            mul!(view(temp_local, :, t), T_gs[t], orbital_local)  # temp[:, t] = T_fi * ϕ_i.
                             transition_densities[t, ii, jj, kk] = T(dot(orbital_local, view(temp_local, :, t)))
                         end
                     end

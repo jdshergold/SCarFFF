@@ -13,10 +13,10 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
     """
     Contract the radial and angular parts of the form factor to obtain f_s(q, θ, ϕ) on a spherical grid, defined by:
 
-        f_s(q, θ, ϕ) = ∑_{ℓ=0}^{l_max} ∑_{m=-ℓ}^{ℓ} R_{ℓm}(q) Y_{ℓm}(θ, ϕ),
+        f_s(q, θ, ϕ) = ∑_{ℓ=0}^{l_max} ∑_{m=-ℓ}^{ℓ} R_{ℓm}(q) Y_ℓ^m(θ, ϕ),
 
     where R is the R tensor that depends only on the modulus of the momentum transfer, q,
-    and Y_{ℓm} are the spherical harmonics.
+    and Y_ℓ^m are the spherical harmonics.
 
     Spherical harmonics are computed once per (θ, ϕ) point and reused for all transitions.
 

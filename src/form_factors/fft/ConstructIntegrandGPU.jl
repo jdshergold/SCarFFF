@@ -167,20 +167,20 @@ end
 
 function construct_transition_density_gpu(
         mol::MoleculeData{T},
-        transition_matrices::Vector{Matrix{T}},
+        T_gs::Vector{Matrix{T}},
         qx_grid::Vector{T},
         qy_grid::Vector{T},
         qz_grid::Vector{T}
     )::Tuple{CuArray{T, 4}, Vector{T}} where {T<:AbstractFloat}
     """
-    Construct the transition density ϕ_f(r)T_{fi}ϕ_i(r) for one or more transitions using the GPU.
+    Construct the transition density Φ^{g→s}(r) = 2 Σ_{μν} φ_μ(r) T_{μν}^{gs} φ_ν(r) for one or more transitions using the GPU.
 
             This implementation processes the grid in memory-safe z-chunks.
             Each slice launches a single kernel to compute orbital values, then uses GPU matrix operations for transitions.
 
     # Arguments:
     - mol::MoleculeData{T}: The molecular data structure containing basis set and coordinates.
-    - transition_matrices::Vector{Matrix{T}}: Vector of transition matrices T_{fi}.
+    - T_gs::Vector{Matrix{T}}: Per-spin AO transition matrices T^(gs).
     - qx_grid::Vector{T}: The qx grid in momentum space, in keV.
     - qy_grid::Vector{T}: The qy grid in momentum space, in keV.
     - qz_grid::Vector{T}: The qz grid in momentum space, in keV.
@@ -194,7 +194,7 @@ function construct_transition_density_gpu(
 
     n_primitives = mol.n_primitives
     n_orbitals = mol.n_orbitals
-    n_transitions = length(transition_matrices)
+    n_transitions = length(T_gs)
 
     # Determine optimal z_chunk_size based on available GPU memory.
     # We need to fit orbital_chunk_gpu and temp_chunk_gpu in memory.
@@ -254,7 +254,7 @@ function construct_transition_density_gpu(
     primitive_to_orbital_gpu = CuArray(primitive_to_orbital)
 
     # Transfer transition matrices to GPU.
-    transition_matrices_gpu = [CuArray(tm) for tm in transition_matrices]
+    T_gs_gpu = [CuArray(tm) for tm in T_gs]
 
     # Allocate output for transition densities on GPU.
     transition_densities_gpu = CUDA.zeros(T, n_transitions, N_grid[1], N_grid[2], N_grid[3])
@@ -312,7 +312,7 @@ function construct_transition_density_gpu(
             # Compute T * ϕ for this chunk.
             chunk_view = view(orbital_chunk_gpu, :, 1:chunk_points)
             temp_view = view(temp_chunk_gpu, :, 1:chunk_points)
-            mul!(temp_view, transition_matrices_gpu[t_idx], chunk_view)
+            mul!(temp_view, T_gs_gpu[t_idx], chunk_view)
             CUDA.synchronize()
 
             # Compute transition density: ρ = ∑_i (T*ϕ)_i * ϕ_i.

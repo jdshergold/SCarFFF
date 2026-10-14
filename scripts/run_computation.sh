@@ -8,32 +8,35 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="salicylic_acid_test_norm_coherent"     # Name for this run.
+RUN_NAME="benzene_same_mol_mix"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
 CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
 SMILES=""        # Single molecule mode. SMILES string for the molecule.
-CIF_FILE="examples/our_favourite_molecules/ACSALA07.cif"                 # Single crystal mode. Path to a CIF file.
-CIF_DIR=""                  # Batch crystal mode. Path to a directory of CIF files.
+CIF_FILE="examples/benzene_1423904.cif" #"examples/our_favourite_molecules/ZZZMTW02.cif"                 # Single crystal mode. Path to a CIF file.
+CIF_DIR="" #"examples/our_favourite_molecules"                  # Batch crystal mode. Path to a directory of CIF files.
 
 # ==== Crystal parameters (crystal mode only). ====
 CRYSTAL_ORDER="coherent"    # How to combine the monomer form factors. "coherent" solves the Frenkel
                             # exciton Bloch problem and mixes amplitudes before squaring; "incoherent"
                             # just adds |f|^2 over the images. Both produce the same outputs, except
                             # that only the coherent one has bands.
-BAND_MAP_PLANE="all"        # Cartesian plane(s) to sample the band energies E(k) over, matching the
+BAND_MAP_PLANE="all"        # Cartesian plane(s) to sample the band energies Delta_E_n(k) over, matching the
                             # form factor slices: "all", or one of xy (k_z=0), xz (k_y=0), yz (k_x=0),
                             # or "none" to skip.
-DELTA_E=0.01                # Bin width in eV of the energy axis of the structure function
-                            # f^2_lm(q, E). This determines the width of the mollifier too, sigma_E = 3 * DELTA_E.
+ENERGY_STEP=0.01            # Bin width in eV of the energy axis of the structure function
+                            # S_lm(q, E). This determines the width of the mollifier too, sigma_E = 3 * ENERGY_STEP.
 BAND_RANGE_STAR_STRIDE=8    # Stride over stars to use to estimate the band energy range. If any warnings are raised and points are lost, reduce this. ~8 is fine usually.
 BAND_RANGE_Q_STRIDE=4       # Stride over |q| to use to estimate the band energy range. If any warnings are raised and points are lost, reduce this. ~4 is fine usually.
+EPSILON_B=Inf               # Permittivity of the medium around the sample, which scales the Q = 0
+                            # Ewald boundary term by 1/(2 eps_b + 1). 1.0 is a spherical sample in
+                            # vacuum; Inf is the conducting ("tin foil") boundary condition.
 
 
 # ==== TD-DFT parameters. ====
-BASIS="6-31g*"             # Basis set to use. See README for supported basis sets and aliases.
-XC_FUNCTIONAL="b3lyp"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
+BASIS="def2-SVP"             # Basis set to use. See README for supported basis sets and aliases.
+XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
 NSTATES=12                  # Number of excited states to compute.
 NTRANS=12                   # Number of transitions to analyse.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
@@ -46,7 +49,7 @@ METHOD="spherical"         # Method for form factor computation. Options: "spher
 # ==== Spherical method parameters. ====
 # Momentum transfer grid parameters.
 Q_MAX=20.0                 # Maximum momentum transfer in keV.
-N_Q=101                    # Number of |q| grid points.
+N_Q=251                    # Number of |q| grid points.
 # Angular grid. Leave these at 0 to size them from L_MAX, which is what the projection onto
 # spherical harmonics actually needs: |f|^2 is quadratic in the form factor so it carries content up
 # to 2*L_MAX, giving 4*L_MAX+1 points. Setting them larger costs time and buys nothing.
@@ -55,7 +58,7 @@ N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 t
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODES=("form_factor" "f_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_lm_tensor.
+COMPUTE_MODES=("form_factor" "f_sq_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_sq_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
 COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor. Not supported for coherent crystals.
@@ -97,7 +100,7 @@ PLOT_TRANSITION_DENSITY=true  # Set to true to plot the transition density (FFT 
 # 2D plotting parameters.
 PLOT_PLANES=("xy" "xz" "yz")  # Planes to plot. Options: xy (qz=0), xz (qy=0), yz (qx=0). Each option will be plotted as a column, in the same order as provided.
 PLOT_MODES=("modsq" "Re" "Im")  # What to plot. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each option will be plotted as row, in the same order as provided.
-PLOT_FLM_MODES=true           # Set to true to plot dominant f^2_{lm}(q) modes (spherical method only, requires f_lm_tensor in COMPUTE_MODES).
+PLOT_F_SQ_LM_MODES=true           # Set to true to plot dominant f^2_{lm}(q) modes (spherical method only, requires f_sq_lm_tensor in COMPUTE_MODES).
 
 # 3D plotting parameters.
 PLOT_3D_MODES=("modsq" "Re" "Im")  # Modes for 3D plots. Options: modsq (|f_s|^2), Re (real part), Im (imaginary part). Each mode will generate a separate 3D plot.
@@ -118,8 +121,8 @@ PLOT_RANGE_Z=()           # z range in Angstroms (e.g., ("-10" "10")).
 # CONFIG ENDS HERE
 # ========================================
 
-FLM_MODES_ARG=""
-if [ "$PLOT_FLM_MODES" = true ]; then FLM_MODES_ARG="--plot-flm-modes"; fi
+F_SQ_LM_MODES_ARG=""
+if [ "$PLOT_F_SQ_LM_MODES" = true ]; then F_SQ_LM_MODES_ARG="--plot-f-sq-lm-modes"; fi
 
 # Get the directory where this script is located.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -332,9 +335,10 @@ else
         JULIA_CMD="$JULIA_CMD --l-max $L_MAX"
         if [ "$CRYSTAL_MODE" = true ] && [ "$CRYSTAL_ORDER" = "coherent" ]; then
             JULIA_CMD="$JULIA_CMD --band-map-plane $BAND_MAP_PLANE"
+            JULIA_CMD="$JULIA_CMD --epsilon-b $EPSILON_B"
         fi
         if [ "$CRYSTAL_MODE" = true ]; then
-            JULIA_CMD="$JULIA_CMD --dE $DELTA_E"
+            JULIA_CMD="$JULIA_CMD --dE $ENERGY_STEP"
             JULIA_CMD="$JULIA_CMD --band-range-star-stride $BAND_RANGE_STAR_STRIDE"
             JULIA_CMD="$JULIA_CMD --band-range-q-stride $BAND_RANGE_Q_STRIDE"
         fi
@@ -413,8 +417,8 @@ echo "Step 3: Plot generation..."
 if [ "$SKIP_2D_PLOTS" = true ] && [ "$SKIP_3D_PLOTS" = true ]; then
     echo "  Skipping all plot generation."
     echo ""
-elif [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; then
-    echo "  Skipping plot generation (no form factor or f_lm tensor computed)."
+elif [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_sq_lm_tensor" && [ "$PLOT_F_SQ_LM_MODES" = true ]; }; then
+    echo "  Skipping plot generation (no form factor or f_sq_lm tensor computed)."
     echo ""
 elif [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; then
     echo "  Skipping plot generation (only V tensors were computed, no form factor grid available)."
@@ -446,8 +450,8 @@ else
             plot_cmd="$plot_cmd --plot-transition-density"
         fi
 
-        if [ "$PLOT_FLM_MODES" = true ]; then
-            plot_cmd="$plot_cmd --plot-flm-modes"
+        if [ "$PLOT_F_SQ_LM_MODES" = true ]; then
+            plot_cmd="$plot_cmd --plot-f-sq-lm-modes"
         fi
 
         if [ "$include_rates" = true ] && [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
@@ -581,7 +585,7 @@ else
                 # which order it holds from the file, so there is a single call either way.
                 $PYTHON_BIN plot_slices.py --run-name "$RUN_NAME" --molecule-number "$MOL_NUM" \
                     --method spherical --results-dir crystal --group-states \
-                    $FLM_MODES_ARG || echo "  Crystal plotting failed."
+                    $F_SQ_LM_MODES_ARG || echo "  Crystal plotting failed."
                 for conformer_dir in "$MOL_DIR"/conformers/*; do
                     [ -d "$conformer_dir" ] || continue
                     conformer_label=$(basename "$conformer_dir")
@@ -720,21 +724,21 @@ if [ $FORM_FACTOR_TIME -gt 0 ]; then
     fi
 fi
 
-if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_lm_tensor" && [ "$PLOT_FLM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
+if [ "$SKIP_2D_PLOTS" != true ] && ! { [ "$METHOD" = "spherical" ] && ! printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor" && ! { printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "f_sq_lm_tensor" && [ "$PLOT_F_SQ_LM_MODES" = true ]; }; } && ! { [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ]; }; then
     if [ "$CRYSTAL_MODE" = true ]; then
         echo "    │   │       └── 1/"
         if printf '%s\n' "${COMPUTE_MODES[@]}" | grep -qi "form_factor"; then
             echo "    │   │           └── form_factor_*.png"
         fi
-        if [ "$PLOT_FLM_MODES" = true ]; then
-            echo "    │   │           └── flm_modes.png"
+        if [ "$PLOT_F_SQ_LM_MODES" = true ]; then
+            echo "    │   │           └── f_sq_lm_modes.png"
         fi
         if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
             echo "    │   │       └── scattering_rates.png"
         fi
-        if [ "$PLOT_FLM_MODES" = true ]; then
+        if [ "$PLOT_F_SQ_LM_MODES" = true ]; then
             echo "    │       └── 1/"
-            echo "    │           └── flm_modes.png"
+            echo "    │           └── f_sq_lm_modes.png"
         fi
         if [ "$METHOD" = "spherical" ] && [ "$COMPUTE_RATES" = true ]; then
             echo "    │       └── scattering_rates.png"

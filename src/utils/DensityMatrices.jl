@@ -5,19 +5,19 @@ module DensityMatrices
 
 using LinearAlgebra
 
-export build_transition_matrix, build_ground_state_matrix, build_pair_difference_matrix,
+export build_T_gs, build_T_gg, build_Delta_T,
        to_real_density, TransitionPairs, build_transition_pairs
 
-function build_transition_matrix(
+function build_T_gs(
         X::AbstractMatrix,
         Y::AbstractMatrix,
-        mo_coeff_occ::AbstractMatrix,
-        mo_coeff_vir::AbstractMatrix,
+        C_o::AbstractMatrix,
+        C_v::AbstractMatrix,
     )
     """
-    Build the AO basis transition density matrix for one excited state,
+    Build the per-spin AO basis transition density matrix for one excited state,
 
-        T^(s) = C_o X* C_v† + C_v Y† C_o†.
+        T^(gs) = C_o X* C_v† + C_v Y† C_o†.
 
     Written in the general form, with the conjugates and adjoints kept in place. For real MO
     coefficients and real X and Y it reduces to the familiar C_o (X + Y) C_v^T, because the second
@@ -27,48 +27,48 @@ function build_transition_matrix(
     # Arguments:
     - X::AbstractMatrix: The excitation amplitudes, with shape (n_occupied, n_virtual).
     - Y::AbstractMatrix: The de-excitation amplitudes, with the same shape.
-    - mo_coeff_occ::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
-    - mo_coeff_vir::AbstractMatrix: The virtual MO coefficients C_v, with shape (n_ao, n_virtual).
+    - C_o::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
+    - C_v::AbstractMatrix: The virtual MO coefficients C_v, with shape (n_ao, n_virtual).
 
     # Returns:
     - The AO basis transition density matrix, with shape (n_ao, n_ao).
     """
-    return mo_coeff_occ * conj(X) * adjoint(mo_coeff_vir) + mo_coeff_vir * adjoint(Y) * adjoint(mo_coeff_occ)
+    return C_o * conj(X) * adjoint(C_v) + C_v * adjoint(Y) * adjoint(C_o)
 end
 
-function build_ground_state_matrix(mo_coeff_occ::AbstractMatrix)
+function build_T_gg(C_o::AbstractMatrix)
     """
-    Build the AO basis ground state density matrix,
+    Build the per-spin AO basis ground state density matrix,
 
-        T^(g) = C_o C_o†,
+        T^(gg) = C_o C_o†,
 
     which reduces to C_o C_o^T for real coefficients.
 
     # Arguments:
-    - mo_coeff_occ::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
+    - C_o::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
 
     # Returns:
     - The AO basis ground state density matrix, with shape (n_ao, n_ao).
     """
-    return mo_coeff_occ * adjoint(mo_coeff_occ)
+    return C_o * adjoint(C_o)
 end
 
-function build_pair_difference_matrix(
+function build_Delta_T(
         X_s::AbstractMatrix,
         Y_s::AbstractMatrix,
         X_t::AbstractMatrix,
         Y_t::AbstractMatrix,
-        mo_coeff_occ::AbstractMatrix,
-        mo_coeff_vir::AbstractMatrix,
+        C_o::AbstractMatrix,
+        C_v::AbstractMatrix,
     )
     """
-    Build the AO basis difference density matrix, Δ_{st}, that contributes to the D term of the Hamiltonian,
+    Build the per-spin AO basis difference density matrix, ΔT^(ts), that contributes to the D term of the Hamiltonian,
 
-        Δ_{st} ↔ C_v B^(ts) C_v† − C_o A^(ts) C_o†,
+        ΔT^(ts) = C_v B^(ts) C_v† − C_o A^(ts) C_o†,
         A^(ts) = X^(s)* X^(t)ᵀ + Y^(t) Y^(s)†,
         B^(ts) = X^(t)ᵀ X^(s)* + Y^(s)† Y^(t).
 
-    This is T^(ts), the transition density matrix from excited state t to excited state s, with
+    This is ΔT^(ts) = T^(ts) − δ_{st} T^(gg), formed from T^(ts), the transition density matrix from excited state t to excited state s, with
     δ_{st} times the ground state density subtracted.
 
     # Arguments:
@@ -76,16 +76,16 @@ function build_pair_difference_matrix(
     - Y_s::AbstractMatrix: The de-excitation amplitudes of the row state, with the same shape.
     - X_t::AbstractMatrix: The excitation amplitudes of the column state.
     - Y_t::AbstractMatrix: The de-excitation amplitudes of the column state.
-    - mo_coeff_occ::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
-    - mo_coeff_vir::AbstractMatrix: The virtual MO coefficients C_v, with shape (n_ao, n_virtual).
+    - C_o::AbstractMatrix: The occupied MO coefficients C_o, with shape (n_ao, n_occupied).
+    - C_v::AbstractMatrix: The virtual MO coefficients C_v, with shape (n_ao, n_virtual).
 
     # Returns:
-    - The AO basis density matrix of Δ_{st}, with shape (n_ao, n_ao).
+    - The per-spin AO basis matrix ΔT^(ts), with shape (n_ao, n_ao).
     """
-    virtual_block = transpose(X_t) * conj(X_s) + adjoint(Y_s) * Y_t
-    occupied_block = conj(X_s) * transpose(X_t) + Y_t * adjoint(Y_s)
+    B_ts = transpose(X_t) * conj(X_s) + adjoint(Y_s) * Y_t
+    A_ts = conj(X_s) * transpose(X_t) + Y_t * adjoint(Y_s)
 
-    return mo_coeff_vir * virtual_block * adjoint(mo_coeff_vir) - mo_coeff_occ * occupied_block * adjoint(mo_coeff_occ)
+    return C_v * B_ts * adjoint(C_v) - C_o * A_ts * adjoint(C_o)
 end
 
 struct TransitionPairs

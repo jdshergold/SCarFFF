@@ -19,12 +19,12 @@ include("form_factors/fft/FFTFormFactor.jl")
 include("form_factors/cartesian/CartesianFormFactor.jl")
 
 # Import the functions to compute the form factors from each module.
-using .SphericalFormFactor: compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
+using .SphericalFormFactor: compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids
 using .FFTFormFactor: compute_fft_form_factor
 using .CartesianFormFactor: compute_cartesian_form_factor
 
 # And export them for other modules to use.
-export compute_spherical_form_factor, compute_fft_form_factor, compute_cartesian_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
+export compute_spherical_form_factor, compute_fft_form_factor, compute_cartesian_form_factor, compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids
 
 function write_mock_molecular_data_file(file_path::String, ::Type{T}) where {T<:AbstractFloat}
     """
@@ -51,9 +51,9 @@ function write_mock_molecular_data_file(file_path::String, ::Type{T}) where {T<:
         # Write the transition data. Just a single transition at 1.0 eV, with one occupied and one
         # virtual orbital, whose amplitudes and coefficients give an identity transition matrix.
         # We have to transpose again here because of python-Julia weirdness.
-        io["energies_ev"] = T[1.0]
-        io["mo_coeff_occ"] = permutedims(Complex{T}[1.0; 0.0;;], (2, 1))
-        io["mo_coeff_vir"] = permutedims(Complex{T}[0.0; 1.0;;], (2, 1))
+        io["Delta_E_eV"] = T[1.0]
+        io["C_o"] = permutedims(Complex{T}[1.0; 0.0;;], (2, 1))
+        io["C_v"] = permutedims(Complex{T}[0.0; 1.0;;], (2, 1))
         io["X_state_1"] = permutedims(Complex{T}[1.0;;], (2, 1))
         io["Y_state_1"] = permutedims(Complex{T}[0.0;;], (2, 1))
     end
@@ -104,7 +104,7 @@ end
             q_grid = T[0.0, 0.1]
             theta_grid = T[0.0]
             phi_grid = T[0.0]
-            transition_matrices = [mol.transition_matrices[1]]
+            T_gs = [mol.T_gs[1]]
 
             # Construct the R tensor.
             R_tensor = SphericalFormFactor.ConstructRTensor.construct_R_tensor(
@@ -115,7 +115,7 @@ end
                 q_grid,
                 l_max,
                 gaunt_path,
-                transition_matrices,
+                T_gs,
                 mol.cartesian_term_to_orbital,
             )
 
@@ -175,7 +175,7 @@ end
                     # Define a minimal grid for precompilation.
                     q_grid = T[0.0, 0.1]
                     l_max = 6
-                    transition_matrices = [mol.transition_matrices[1]]
+                    T_gs = [mol.T_gs[1]]
 
                     # Construct the R tensor components on the GPU.
                     lambda_max = maximum(W_ij.lambda)
@@ -190,7 +190,7 @@ end
                         lambda_max,
                         n_max,
                         gaunt_path,
-                        transition_matrices,
+                        T_gs,
                         mol.cartesian_term_to_orbital;
                         threshold = T(0),
                     )
@@ -243,14 +243,14 @@ end
             )
 
             # Contract the V tensors to get the form factor on the Cartesian grid.
-            transition_matrices = [mol.transition_matrices[1]]
+            T_gs = [mol.T_gs[1]]
             _ = CartesianFormFactor.ContractCartesianGrid.contract_cartesian_grid(
                 V_x,
                 V_y,
                 V_z,
                 nonzero_pairs,
                 M_ij,
-                transition_matrices,
+                T_gs,
                 mol.cartesian_term_to_orbital;
                 threshold = T(0)
             )
@@ -296,14 +296,14 @@ end
                     )
 
                     # Contract the V tensors to get the form factor on the Cartesian grid using GPU.
-                    transition_matrices = [mol.transition_matrices[1]]
+                    T_gs = [mol.T_gs[1]]
                     _ = CartesianFormFactor.ContractCartesianGridGPU.contract_cartesian_grid_gpu(
                         V_x,
                         V_y,
                         V_z,
                         nonzero_pairs,
                         M_ij,
-                        transition_matrices,
+                        T_gs,
                         mol.cartesian_term_to_orbital;
                         threshold = T(0)
                     )
@@ -332,10 +332,10 @@ end
             q_vals = T[0.0, 0.1]
 
             # Construct the transition density in real space (CPU).
-            transition_matrices = [mol.transition_matrices[1]]
+            T_gs = [mol.T_gs[1]]
             transition_density, r_lim = FFTFormFactor.ConstructTransitionDensity.construct_transition_density(
                 mol,
-                transition_matrices,
+                T_gs,
                 q_vals,
                 q_vals,
                 q_vals
@@ -350,7 +350,7 @@ end
                 try
                     transition_density_gpu, r_lim_gpu = FFTFormFactor.ConstructTransitionDensityGPU.construct_transition_density_gpu(
                         mol,
-                        transition_matrices,
+                        T_gs,
                         q_vals,
                         q_vals,
                         q_vals

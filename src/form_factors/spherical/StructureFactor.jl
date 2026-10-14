@@ -13,17 +13,17 @@ using ..BlochHamiltonian: CrystalExcitationBasis, BlochEigensystem, CrystalCoupl
 using ..CrystalSymmetry: Stars
 using ...ThreadChunks: chunk_count, chunk_range
 
-export EnergyGrid, build_energy_grid, accumulate_delta!, incoherent_structure_factor,
+export EnergyGrid, build_energy_grid, accumulate_delta!, incoherent_intensity_lm_E,
        integrate_energy, trim_energy_axis, describe_energy_grid, kernel_shape,
        apply_structure_function_prefactor!
 
-# We use a mollifier in place of the delta function, with width either side of the band σ_E = 3 ΔE.
+# We use a mollifier in place of the delta function, with width either side of the band σ_E = 3 dE.
 const MOLLIFIER_SUPPORT_BINS = 3
 
 struct EnergyGrid{T<:AbstractFloat}
-    energies::Vector{T}   # The E axis, in eV.
+    E::Vector{T}   # The E axis, in eV.
     sigma::T              # σ_E, where the kernel reaches zero. Nothing lies beyond it.
-    step::T               # ΔE between neighbouring bins.
+    energy_step::T        # dE between neighbouring bins.
     half_window::Int      # Bins either side of a band energy that the kernel reaches.
 end
 
@@ -36,7 +36,7 @@ end
 
     # Arguments:
     - grid::EnergyGrid{T}: The energy axis, carrying σ_E.
-    - offset::T: E_bin - E_Ψ, in eV.
+    - offset::T: E_bin - ΔE_n, in eV.
 
     # Returns:
     - T: The unnormalised weight.
@@ -60,7 +60,7 @@ function band_energy_range(
         q_stride::Int = 4,
     ) where {T<:AbstractFloat}
     """
-    Find the range of E_Ψ(k) over the wavevectors the form factor will visit.
+    Find the range of ΔE_n(k) over the wavevectors the form factor will visit.
 
     This samples the k of the coherent loop, k = fold(q n̂) per star representative, but only every
     star_stride-th star and q_stride-th q.
@@ -75,7 +75,7 @@ function band_energy_range(
     - lattice::CrystalLatticeData{T}: The crystal lattice.
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
     - stars::Stars{T}: The direction stars.
-    - couplings::Union{Nothing, CrystalCouplings{T}}: The J_{λλ'}(ΔR), or nothing.
+    - couplings::Union{Nothing, CrystalCouplings{T}}: The J_{λ_iλ_j′}(ΔR), or nothing.
     - long_range::Union{Nothing, EwaldLongRangeData{T}}: The Ewald long-range data, or nothing.
     - star_stride::Int: Sample every this many star representatives (default: 8).
     - q_stride::Int: Sample every this many q points (default: 4).
@@ -87,8 +87,8 @@ function band_energy_range(
 
     # Get the dimensions.
     n_stars = length(stars.irreducible_directions)
-    n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
-    n_lambda = length(basis.energies)
+    n_neighbour_cells = couplings === nothing ? 0 : length(couplings.Delta_R)
+    n_lambda_i = length(basis.Delta_E_monomer)
 
     # Sample the wavevectors and q.
     sampled_stars = 1:star_stride:n_stars
@@ -104,8 +104,8 @@ function band_energy_range(
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
             # Build the eigensystem for this star.
-            eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells, vecs = false)
-            previous = Vector{T}(undef, n_lambda)
+            eigensystem = BlochEigensystem(basis, long_range; n_neighbour_cells = n_neighbour_cells, vecs = false)
+            previous = Vector{T}(undef, n_lambda_i)
             # Keep track of the bounds for this chunk.
             low = T(Inf)
             high = T(-Inf)
@@ -120,17 +120,17 @@ function band_energy_range(
                     solve_bloch_energies!(eigensystem, basis, k_vector, couplings, long_range)
 
                     # Update the bounds.
-                    low = min(low, eigensystem.energies[1])
-                    high = max(high, eigensystem.energies[end])
+                    low = min(low, eigensystem.Delta_E[1])
+                    high = max(high, eigensystem.Delta_E[end])
 
                     # How far any band moved over one sampling step, which sets the margin.
                     if position > 1
-                        for state in 1:n_lambda
+                        for state in 1:n_lambda_i
                             largest_step = max(largest_step,
-                                               abs(eigensystem.energies[state] - previous[state]))
+                                               abs(eigensystem.Delta_E[state] - previous[state]))
                         end
                     end
-                    copyto!(previous, eigensystem.energies)
+                    copyto!(previous, eigensystem.Delta_E)
                 end
             end
 
@@ -159,7 +159,7 @@ function build_energy_grid(
     # Arguments:
     - energy_low::T: The smallest band energy, in eV.
     - energy_high::T: The largest band energy, in eV.
-    - step::T: ΔE, the bin width, in eV.
+    - step::T: dE, the bin width, in eV.
     - maximum_points::Int: Refuse to build an axis longer than this, since the cost of everything
       downstream is linear in it (default: 200000).
 
@@ -168,7 +168,7 @@ function build_energy_grid(
     """
 
     # Check the grid is sensible.
-    step > 0 || error("ΔE must be positive, got $(step) eV.")
+    step > 0 || error("dE must be positive, got $(step) eV.")
     span = energy_high - energy_low
     span > 0 || error("The band range is empty: E_min = $(energy_low), E_max = $(energy_high).")
 
@@ -178,13 +178,13 @@ function build_energy_grid(
     n_energy = ceil(Int, (span + 2 * sigma) / step) + 1
 
     n_energy <= maximum_points ||
-        error("ΔE = $(step) eV needs $(n_energy) energy points to cover a band range of " *
-              "$(round(span, digits = 4)) eV, over the limit of $(maximum_points). Use a larger ΔE.")
+        error("dE = $(step) eV needs $(n_energy) energy points to cover a band range of " *
+              "$(round(span, digits = 4)) eV, over the limit of $(maximum_points). Use a larger dE.")
 
     # Build the energy grid.
-    energies = collect(range(energy_low - sigma; step = step, length = n_energy))
+    E = collect(range(energy_low - sigma; step = step, length = n_energy))
 
-    return EnergyGrid{T}(energies, sigma, step, MOLLIFIER_SUPPORT_BINS)
+    return EnergyGrid{T}(E, sigma, step, MOLLIFIER_SUPPORT_BINS)
 end
 
 
@@ -200,9 +200,9 @@ function describe_energy_grid(grid::EnergyGrid{T}) where {T<:AbstractFloat}
     """
 
     return string(
-        "Structure function energy grid: ", length(grid.energies), " points over [",
-        round(first(grid.energies), digits = 4), ", ", round(last(grid.energies), digits = 4),
-        "] eV, ΔE = ", round(1000 * grid.step, digits = 3), " meV.\n",
+        "Structure function energy grid: ", length(grid.E), " points over [",
+        round(first(grid.E), digits = 4), ", ", round(last(grid.E), digits = 4),
+        "] eV, dE = ", round(1000 * grid.energy_step, digits = 3), " meV.\n",
         "  Mollifier delta, σ_E = ±", round(1000 * grid.sigma, digits = 3),
         " meV over ±", grid.half_window, " bins, and exactly zero outside.",
     )
@@ -223,7 +223,7 @@ end
     Spread the form factor over the energy axis to get the structure function, using the mollifier.
     This is approximately:
         
-            f_Ψ(q, E) ≃ f_Ψ(q) * δ(E - E_Ψ(q)),
+            I_n(q, E) ≃ |f_{n,uc}(q)|² * δ(E - ΔE_n(q)),
 
     with the mollifier in place of the delta function.
 
@@ -232,8 +232,8 @@ end
     - occupancy::Matrix{Bool}: Which (bin, q) ever receive anything, dimensions (n_energy,
       n_q_block), marked here so the projection can skip the rest. One array per task, merged later.
     - grid::EnergyGrid{T}: The energy axis and its kernel.
-    - energy::T: E_Ψ(k) for this state, in eV.
-    - magnitude::T: |f_Ψ(q)|².
+    - energy::T: ΔE_n(k) for this state, in eV.
+    - magnitude::T: |f_{n,uc}(q)|².
     - q_local::Int: The q index within the block.
     - theta_idx::Int: The θ index.
     - phi_idx::Int: The ϕ index.
@@ -244,10 +244,10 @@ end
       silent: the weight is still deposited, at the nearest edge, but at the wrong energy.
     """
 
-    n_energy = length(grid.energies)
+    n_energy = length(grid.E)
 
     # The grid is uniform, so the nearest bin is arithmetic rather than a search.
-    raw_centre = round(Int, (energy - grid.energies[1]) / grid.step) + 1
+    raw_centre = round(Int, (energy - grid.E[1]) / grid.energy_step) + 1
     centre = clamp(raw_centre, 1, n_energy)
     outside = raw_centre != centre
     # Find the range of bins we need to look at.
@@ -257,98 +257,98 @@ end
     total = zero(T)
     # Add the mollifier at each energy.
     @inbounds for bin in first_bin:last_bin
-        total += kernel_shape(grid, grid.energies[bin] - energy)
+        total += kernel_shape(grid, grid.E[bin] - energy)
     end
 
     # Handle the cases when our energy grid is too small, which should never happen.
     if total <= 0
-        buffer[centre, q_local, theta_idx, phi_idx] += magnitude / grid.step
+        buffer[centre, q_local, theta_idx, phi_idx] += magnitude / grid.energy_step
         occupancy[centre, q_local] = true
         return outside
     end
 
     # Now include the |f|^2 part, and the normalisation factor that ensures the sum rule holds.
-    weight = magnitude / (total * grid.step)
+    weight = magnitude / (total * grid.energy_step)
     @inbounds for bin in first_bin:last_bin
         occupancy[bin, q_local] = true
         buffer[bin, q_local, theta_idx, phi_idx] +=
-            weight * kernel_shape(grid, grid.energies[bin] - energy)
+            weight * kernel_shape(grid, grid.E[bin] - energy)
     end
 
     return outside
 end
 
 
-function incoherent_structure_factor(
-        f_lm::Array{T, 3},
-        energies::Vector{T},
+function incoherent_intensity_lm_E(
+        f_sq_lm::Array{T, 3},
+        Delta_E::Vector{T},
         grid::EnergyGrid{T},
     ) where {T<:AbstractFloat}
     """
-    Spread the incoherent f²_{ℓm}(q) onto the energy axis.
+    Spread the incoherent intensity coefficients onto the energy axis before 2π/V_cell.
 
     Without the Bloch problem each transition keeps one energy for every q, so there is no angular
     integral left to do and the structure function is just the existing coefficients times one fixed
     kernel per transition.
 
     # Arguments:
-    - f_lm::Array{T, 3}: The coefficients, dimensions (n_transitions, n_q, n_keys).
-    - energies::Vector{T}: The transition energies in eV, one per transition.
+    - f_sq_lm::Array{T, 3}: The coefficients, dimensions (n_transitions, n_q, n_keys).
+    - Delta_E::Vector{T}: The transition energies in eV, one per transition.
     - grid::EnergyGrid{T}: The energy axis and its kernel.
 
     # Returns:
-    - Array{T, 3}: f²_{ℓm}(q, E), dimensions (n_energy, n_q, n_keys).
+    - Array{T, 3}: The bare summed intensity in eV^-1, with dimensions (n_energy, n_q, n_keys).
     """
 
     # Get the dimensions.
-    n_transitions, n_q, n_keys = size(f_lm)
-    n_energy = length(grid.energies)
-    length(energies) == n_transitions ||
-        error("Got $(length(energies)) energies for $(n_transitions) transitions.")
+    n_transitions, n_q, n_keys = size(f_sq_lm)
+    n_energy = length(grid.E)
+    length(Delta_E) == n_transitions ||
+        error("Got $(length(Delta_E)) energies for $(n_transitions) transitions.")
 
-    structure_factor = zeros(T, n_energy, n_q, n_keys)
+    intensity_lm_E = zeros(T, n_energy, n_q, n_keys)
     kernel = Vector{T}(undef, n_energy)
 
     for transition in 1:n_transitions
         # One kernel per transition, since its energy does not move with q.
         total = zero(T)
         @inbounds for bin in 1:n_energy
-            offset = grid.energies[bin] - energies[transition]
-            kernel[bin] = abs(offset) <= grid.half_window * grid.step ?
+            offset = grid.E[bin] - Delta_E[transition]
+            kernel[bin] = abs(offset) <= grid.half_window * grid.energy_step ?
                           kernel_shape(grid, offset) : zero(T)
             total += kernel[bin]
         end
         total > 0 || continue
         # Normalise the kernel.
-        kernel ./= total * grid.step
+        kernel ./= total * grid.energy_step
 
-        # Spread the energies.
+        # Spread the intensity at each excitation energy.
         @inbounds for key in 1:n_keys, q_idx in 1:n_q
-            value = f_lm[transition, q_idx, key]
+            value = f_sq_lm[transition, q_idx, key]
             value == 0 && continue
             for bin in 1:n_energy
-                structure_factor[bin, q_idx, key] += value * kernel[bin]
+                intensity_lm_E[bin, q_idx, key] += value * kernel[bin]
             end
         end
     end
 
-    return structure_factor
+    return intensity_lm_E
 end
 
 
 function apply_structure_function_prefactor!(
-        structure_factor::Array{T, 3},
+        intensity_lm_E::Array{T, 3},
         V_cell::T,
     )::Array{T, 3} where {T<:AbstractFloat}
     """
-    Scale the summed f²_{ℓm}(q, E) up to the dynamic structure function,
+    Scale the bare summed intensity coefficients up to the dynamic structure function,
 
-        S(q, E) = (2π/V_cell) Σ_Ψ |f_Ψ(q)|² δ(E - E_Ψ(q)),
+        S(q, E) = (2π/V_cell) Σ_n |f_{n,uc}(q)|² δ(E - ΔE_n(q)),
 
     so what comes out is S_{ℓm} rather than the bare sum over states.
 
     # Arguments:
-    - structure_factor::Array{T, 3}: Σ_Ψ f²_{ℓm}(q) δ(E - E_Ψ), dimensions (n_energy, n_q, n_keys).
+    - intensity_lm_E::Array{T, 3}: Σ_n f²_{n,uc;ℓm}(q) δ(E - ΔE_n), in eV^-1, dimensions (n_energy, n_q, n_keys).
     - V_cell::T: The unit cell volume, in Å³.
 
     # Returns:
@@ -356,13 +356,13 @@ function apply_structure_function_prefactor!(
     """
 
     V_cell > 0 || error("The unit cell volume must be positive, got $(V_cell).")
-    structure_factor .*= T(2 * π) / V_cell
+    intensity_lm_E .*= T(2 * π) / V_cell
 
-    return structure_factor
+    return intensity_lm_E
 end
 
 function trim_energy_axis(
-        structure_factor::Array{T, 3},
+        S_lm::Array{T, 3},
         grid::EnergyGrid{T},
     ) where {T<:AbstractFloat}
     """
@@ -370,7 +370,7 @@ function trim_energy_axis(
     This removes the extra padding we put in before, to save disk space later.
 
     # Arguments:
-    - structure_factor::Array{T, 3}: f²_{ℓm}(q, E), dimensions (n_energy, n_q, n_keys).
+    - S_lm::Array{T, 3}: S_{ℓm}(q, E), dimensions (n_energy, n_q, n_keys).
     - grid::EnergyGrid{T}: The axis it sits on.
 
     # Returns:
@@ -379,56 +379,56 @@ function trim_energy_axis(
     """
 
     # Get the dimensions.
-    n_energy, n_q, n_keys = size(structure_factor)
+    n_energy, n_q, n_keys = size(S_lm)
 
     occupied = falses(n_energy)
     # Check which bins are occupied.
     @inbounds for key in 1:n_keys, q_idx in 1:n_q, bin in 1:n_energy
-        structure_factor[bin, q_idx, key] == 0 || (occupied[bin] = true)
+        S_lm[bin, q_idx, key] == 0 || (occupied[bin] = true)
     end
 
     # Find the first and last occupied bin indices, and trim.
     first_bin = findfirst(occupied)
-    first_bin === nothing && return structure_factor, grid
+    first_bin === nothing && return S_lm, grid
     last_bin = findlast(occupied)
-    (first_bin == 1 && last_bin == n_energy) && return structure_factor, grid
+    (first_bin == 1 && last_bin == n_energy) && return S_lm, grid
 
     kept = first_bin:last_bin
 
-    return structure_factor[kept, :, :],
-           EnergyGrid{T}(grid.energies[kept], grid.sigma, grid.step, grid.half_window)
+    return S_lm[kept, :, :],
+           EnergyGrid{T}(grid.E[kept], grid.sigma, grid.energy_step, grid.half_window)
 end
 
 
 function integrate_energy(
-        structure_factor::Array{T, 3},
+        S_lm::Array{T, 3},
         grid::EnergyGrid{T},
     ) where {T<:AbstractFloat}
     """
-    Integrate the structure function over E, which must give back f²_{ℓm}(q).
+    Integrate the structure function over E, giving (2π/V_cell) Σ_n f²_{n,uc;ℓm}(q).
 
     The kernel is normalised, so this is the sum rule that says every state deposited its magnitude
     once and only once.
 
     # Arguments:
-    - structure_factor::Array{T, 3}: f²_{ℓm}(q, E), dimensions (n_energy, n_q, n_keys).
+    - S_lm::Array{T, 3}: S_{ℓm}(q, E), dimensions (n_energy, n_q, n_keys).
     - grid::EnergyGrid{T}: The energy axis.
 
     # Returns:
-    - Matrix{T}: ∫dE f²_{ℓm}(q, E), dimensions (n_q, n_keys).
+    - Matrix{T}: ∫dE S_{ℓm}(q, E), dimensions (n_q, n_keys).
     """
 
     # Get the dimensions.
-    n_energy, n_q, n_keys = size(structure_factor)
+    n_energy, n_q, n_keys = size(S_lm)
     integral = zeros(T, n_q, n_keys)
 
     # The thing saved is in units of inverse dE, so multiply by dE to get the integral.
     @inbounds for key in 1:n_keys, q_idx in 1:n_q
         total = zero(T)
         for bin in 1:n_energy
-            total += structure_factor[bin, q_idx, key]
+            total += S_lm[bin, q_idx, key]
         end
-        integral[q_idx, key] = total * grid.step
+        integral[q_idx, key] = total * grid.energy_step
     end
 
     return integral

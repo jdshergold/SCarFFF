@@ -12,7 +12,7 @@ include("../../utils/BinEncoding.jl")
 using .BinEncoding: decode_bins
 using ...SparseTensors
 using ...FastPowers: fast_i_pow, fast_neg1_pow
-using ...SparseTensors: SparseWTensor, SparseGauntArray, lambda_mu_key
+using ...SparseTensors: SparseWTensor, SparseGauntArray, lm_key
 using ...ThreadChunks: chunk_count, chunk_range
 
 export construct_R_tensor
@@ -34,16 +34,14 @@ export construct_R_tensor
     """
     h5open(path, "r") do io
         # Read in the indices and coefficients.
-        lambda = Vector{Int}(read(io, "lambda"))
-        mu = Vector{Int}(read(io, "mu"))
-        L = Vector{Int}(read(io, "L"))
-        l = Vector{Int}(read(io, "l"))
-        m = Vector{Int}(read(io, "m"))
-        coeffs = Vector{T}(read(io, "coefficients"))
-        
-        # Reconstruct the lambda_mu_bins.
-        lambda_mu_bins = decode_bins(Vector{Int}(read(io, "lambda_mu_bins/data")), Vector{Int}(read(io, "lambda_mu_bins/offsets")))
-        return SparseGauntArray(lambda, mu, L, l, m, coeffs, lambda_mu_bins)
+        l1 = Vector{Int}(read(io, "l1"))
+        m1 = Vector{Int}(read(io, "m1"))
+        l2 = Vector{Int}(read(io, "l2"))
+        l3 = Vector{Int}(read(io, "l3"))
+        m3 = Vector{Int}(read(io, "m3"))
+        Gaunt_values = Vector{T}(read(io, "Gaunt_values"))
+        l1_m1_bins = decode_bins(Vector{Int}(read(io, "l1_m1_bins/data")), Vector{Int}(read(io, "l1_m1_bins/offsets")))
+        return SparseGauntArray(l1, m1, l2, l3, m3, Gaunt_values, l1_m1_bins)
     end
 end
 
@@ -211,11 +209,11 @@ function build_pair_density_weights(
     ) where {T<:AbstractFloat}
     """
     Convert the requested AO density-like matrices into weights for the non-empty Cartesian-term
-    pairs stored in the W tensor. The density matrix weights, built from T_ij, appearing in:
+    pairs stored in the W tensor. The density matrix weights, built from the per-spin AO matrix T, appearing in:
 
-        R_{lm}^{(a)}(q) = 2 ∑_{i,j} T_ij^(a) S_{ℓm,ij}(q) = 2 [∑_i T_ii^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_ij^(a) + T_ji^(a)) S_{ℓm,ij}(q)].
+        R_{lm}^{(a)}(q) = 2 ∑_{i,j} T_{μ(i)ν(j)}^(a) S_{ℓm,ij}(q) = 2 [∑_i T_{μ(i)μ(i)}^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_{μ(i)ν(j)}^(a) + T_{ν(j)μ(i)}^(a)) S_{ℓm,ij}(q)].
 
-    is then returned, as appropriate. This is either T_ii or T_ij + T_ji. The factor of 2 for the
+    is then returned, as appropriate. This is either T_{μμ} or T_{μν} + T_{νμ}. The factor of 2 for the
     two spin channels is applied later, when the R tensor is assembled.
 
     # Arguments:
@@ -284,15 +282,15 @@ function construct_R_tensor(
     """
     Construct the R_{ℓm}(q) tensors for all of the requested density-like matrices:
 
-        R_{ℓm}^{(a)}(q) = 2 [∑_i T_ii^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_ij^(a) + T_ji^(a)) S_{ℓm,ij}(q)].
+        R_{ℓm}^{(a)}(q) = 2 [∑_i T_{μ(i)μ(i)}^(a) S_{ℓm,ii}(q) + ∑_{j>i} (T_{μ(i)ν(j)}^(a) + T_{ν(j)μ(i)}^(a)) S_{ℓm,ij}(q)].
 
-    Here, the factor of 2 accounts for the two spin channels, and the Cartesian-term overlap
+    Here, μ(i), ν(j) map Cartesian terms to AO indices, and the factor of 2 accounts for the two spin channels, and the Cartesian-term overlap
     coefficient is
 
         S_{ℓm,ij}(q) = 2 (2π)^(5/2) exp(-σ_{ij}²q²/2) ∑_{L,n,λ,μ} i^L j_L(qR_{ij}) q^n
-                         W_{ij,λμ}^n G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
+                         W_{ij,λμ}^n 𝒢_{λμ,LM}^{ℓm} conj(Y_L^{m-μ}(Rhat_{ij})),
 
-    where W_{ij,λμ}^n is the W tensor, G_{λLℓ}^{μm} are Gaunt coefficients, j_L are spherical Bessel
+    where W_{ij,λμ}^n is the W tensor, 𝒢_{λμ,LM}^{ℓm} are Gaunt coefficients, j_L are spherical Bessel
     functions, and Y_L^M are spherical harmonics evaluated at Rhat_{ij}. Each S_{ℓm,ij}(q) is calculated
     once, in blocks, before being combined with every density matrix. Only m ≥ 0 is calculated
     directly, since
@@ -300,6 +298,9 @@ function construct_R_tensor(
         R_{ℓ,-m}^{(a)}(q) = (-1)^(m-ℓ) R_{ℓm}^{(a)*}(q),
 
     lets us skip half the work.
+
+    The shared Gaunt indices (l1,m1,l2,m2,l3,m3) are (λ,μ,L,M,ℓ,m) here,
+    with M = m - μ.
 
     # Arguments:
     - W_tensor::SparseWTensor{T}: The sparse W tensor, already filtered by the requested W threshold.
@@ -320,7 +321,7 @@ function construct_R_tensor(
 
     # Load the Gaunt coefficients.
     gaunt_array = load_gaunt_array(gaunt_array_path, T)
-    gaunt_coeffs = gaunt_array.coefficients
+    gaunt_coeffs = gaunt_array.Gaunt_values
 
     # Get the relevant angular and output dimensions. Only the triangular m ≥ 0 range is computed
     # explicitly, which halves both the S coefficient work and its temporary storage.
@@ -349,7 +350,7 @@ function construct_R_tensor(
     # Precompute the powers of i.
     fill_i_powers!(i_powers, L_max)
 
-    # List the non-empty W bins and prepare the density weight (T_ij factors) for each Cartesian pair before the
+    # List the non-empty W bins and prepare the density weight (AO density entries) for each Cartesian pair before the
     # expensive S calculation.
     full_bins, pair_i, pair_j, pair_density_weights = build_pair_density_weights(
         W_tensor, density_matrices, cartesian_term_to_orbital)
@@ -431,16 +432,16 @@ function construct_R_tensor(
                         mu = W_tensor.mu[W_idx]
                         n_idx = W_tensor.n[W_idx] + 1
                         W_val = W_tensor.W_values[W_idx]
-                        bin_key = lambda_mu_key[lambda + 1, mu + lambda + 1]
+                        bin_key = lm_key[lambda + 1, mu + lambda + 1]
 
                         # Loop over the matching Gaunt coefficients. The m < 0 coefficients follow
                         # from conjugation symmetry and are restored after combining with T.
-                        for gaunt_idx in gaunt_array.lambda_mu_bins[bin_key]
-                            m = gaunt_array.m[gaunt_idx]
+                        for gaunt_idx in gaunt_array.l1_m1_bins[bin_key]
+                            m = gaunt_array.m3[gaunt_idx]
                             m < 0 && continue
 
-                            L = gaunt_array.L[gaunt_idx]
-                            l = gaunt_array.l[gaunt_idx]
+                            L = gaunt_array.l2[gaunt_idx]
+                            l = gaunt_array.l3[gaunt_idx]
 
                             # Compute the corresponding spherical-harmonic index M = m - μ and the
                             # q-independent angular part of this contribution.
@@ -468,7 +469,7 @@ function construct_R_tensor(
             end
         end
 
-        # Pick the right part of density weights (T_ij combinations) to fill R.
+        # Pick the right part of density weights (AO density combinations) to fill R.
         density_block = @view pair_density_weights[:, pair_start:pair_stop]
 
         # Combine every density-like matrix with the completed block of S coefficients.

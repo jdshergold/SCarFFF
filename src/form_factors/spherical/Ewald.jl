@@ -13,7 +13,7 @@ using ..ReadBasisSet: build_transition_pairs
 
 export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
-       compute_ewald_D, self_term_matrix, check_dipole_against_oscillator_strength
+       compute_ewald_D, J_self_matrix, check_dipole_against_oscillator_strength
 
 # Coefficients below this fraction of the largest one over the long-range q range are treated as
 # absent, which sets the max ℓ in the long-range sum. With this set to 1e-4, the error is around
@@ -29,9 +29,9 @@ struct EwaldParameters{T<:AbstractFloat}
     """
     The Ewald splitting parameter and the two cutoffs it implies.
 
-    The cutoffs are pinned to a common truncation error ε on both ends, so that neither dominates:
+    The cutoffs are pinned to a common estimated error ε_tot/√2 on both ends, so that neither dominates:
 
-        ε = exp(-η² R_max²) = exp(-G_max²/4η²).
+        ε_R = ε_G = ε_tot/√2 ≃ exp(-η² R_max²) ≃ exp(-G_max²/4η²).
 
     G_max and R_max are then chosen such that the amount of work done is minimised. To be revisited with
     cost measuring of both sums, and to make sure a requested ε is what we actually get.
@@ -43,36 +43,36 @@ struct EwaldParameters{T<:AbstractFloat}
     - G_max::T: The reciprocal-space cutoff for the long-range sum, in Å^{-1}. The sum runs over
       reciprocal lattice vectors G, but the term dropped at the cutoff is the one at Q = k + G, so
       this bounds |Q| rather than |G|. See add_long_range!.
-    - epsilon::T: The truncation error the cutoffs are pinned to.
+    - epsilon_tot::T: The truncation error the cutoffs are pinned to.
     """
     eta::T
     R_max::T
     G_max::T
-    epsilon::T
+    epsilon_tot::T
 end
 
 function choose_ewald_parameters(
         lattice::CrystalLatticeData{T},
-        epsilon::Real;
+        epsilon_tot::Real;
         eta::Real = 0,
         cost_ratio::Real = 1,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
-    Choose η and the two cutoffs for a requested truncation error, ε.
+    Choose η and the two cutoffs for a requested total error, ε_tot.
 
-    The two cutoffs are related by G_max R_max = -2 ln ε, and the total work
+    The two cutoffs are related by G_max R_max = -2 ln(ε_tot/√2), and the total work
 
         W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π²,
 
     is minimised at
 
-        R_max ≃ √(-2 ln ε) (V_cell² c_G / 8π³ c_R)^{1/6},
+        R_max ≃ √(-2 ln(ε_tot/√2)) (V_cell² c_G / 8π³ c_R)^{1/6},
 
     and η then satisfies η² = G_max / 2R_max. We currently assume a cost ratio of 1.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice, for the cell volume and reciprocal spacings.
-    - epsilon::Real: The requested truncation error, in (0, 1).
+    - epsilon_tot::Real: The requested truncation error, in (0, 1).
     - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
     - cost_ratio::Real: c_G / c_R, the cost of one reciprocal lattice vector relative to one real one.
 
@@ -81,18 +81,18 @@ function choose_ewald_parameters(
     """
 
     # Check that both an error ∈ [0,1] and a cost ratio > 0 are given.
-    zero(epsilon) < epsilon < one(epsilon) ||
-        error("The Ewald truncation error must lie in (0, 1), got $(epsilon).")
+    zero(epsilon_tot) < epsilon_tot < one(epsilon_tot) ||
+        error("The Ewald truncation error must lie in (0, 1), got $(epsilon_tot).")
     cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(cost_ratio).")
 
     # Extra factor of √2 since total error is √(ε_Q^2 + ε_R^2) = √2 ε.
-    log_epsilon = -log(T(epsilon) / sqrt(T(2)))
+    log_epsilon = -log(T(epsilon_tot) / sqrt(T(2)))
 
     if eta > 0
         eta_value = T(eta)
     else
         # The work-minimising real-space cutoff.
-        optimal_R = sqrt(2 * log_epsilon) * (lattice.volume^2 * T(cost_ratio) / (8 * T(π)^3))^(one(T) / 6)
+        optimal_R = sqrt(2 * log_epsilon) * (lattice.V_cell^2 * T(cost_ratio) / (8 * T(π)^3))^(one(T) / 6)
         eta_value = sqrt(log_epsilon) / optimal_R
     end
 
@@ -103,7 +103,7 @@ function choose_ewald_parameters(
     # Now ensure that the real space cutoff includes at least the 3x3x3 supercell.
     R_max = max(R_max, supercell_radius(lattice))
 
-    return EwaldParameters{T}(eta_value, R_max, G_max, T(epsilon))
+    return EwaldParameters{T}(eta_value, R_max, G_max, T(epsilon_tot))
 end
 
 function supercell_radius(lattice::CrystalLatticeData{T})::T where {T<:AbstractFloat}
@@ -159,19 +159,19 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     # Fields:
     - lattice::CrystalLatticeData{T}: The crystal lattice, used to fold k before summing.
     - G_vectors::Vector{SVector{3, T}}: Candidate reciprocal lattice vectors, in Å^{-1}.
-    - f_table::Array{Complex{T}, 3}: The coefficients f̄, with dimensions (n_lambda, n_q_lr, n_keys_lr).
-    - f_tangent::Array{Complex{T}, 3}: The Hermite tangents Δq df̄/dq, with the same dimensions.
+    - f_table::Array{Complex{T}, 3}: The image coefficients f, with dimensions (n_keys_lr, n_lambda_i, n_q_lr).
+    - f_tangent::Array{Complex{T}, 3}: The Hermite tangents Δq df/dq, with the same dimensions.
     - q_step::T: The spacing of the (uniform) q grid, in Å^{-1}.
     - l_max_lr::Int: The ℓ ceiling of the sub-table.
-    - translations::Vector{SVector{3, T}}: The distinct τ_{A,i}, one per molecule in the cell.
-    - image_of::Vector{Int}: Which of those translations each λ carries, so its length is n_lambda.
-    - dipole_slopes::Matrix{Complex{T}}: lim_{q→0} f̄_{1m}(q)/q for each λ, columns m = -1, 0, 1, in Å. Used for the boundary term.
-    - self_term::Matrix{Complex{T}}: J^LR_{λλ'}(0) for λ, λ' on the same image, in eV.
+    - tau::Vector{SVector{3, T}}: The distinct τ_{A,i}, one per molecule in the cell.
+    - image_of::Vector{Int}: Which of those tau each λ_i carries, so its length is n_lambda_i.
+    - dipole_slopes::Matrix{Complex{T}}: lim_{q→0} f_{1m}(q)/q for each λ_i, columns m = -1, 0, 1, in Å. Used for the boundary term.
+    - J_self::Matrix{Complex{T}}: J^self_{λ_iλ_j′} for λ_i, λ_j′ on the same image, in eV.
     - eta::T: The splitting parameter η, in Å^{-1}.
     - G_max::T: The reciprocal-space cutoff, in Å^{-1}.
     - prefactor::T: 4π α_EM ħc / V_cell, in eV Å^{-2}.
     - epsilon_b::T: The permittivity of the medium around the sample. Not to be confused with the Ewald truncation
-      error, which EwaldParameters calls epsilon.
+      error, which EwaldParameters calls epsilon_tot.
     """
     lattice::CrystalLatticeData{T}
     G_vectors::Vector{SVector{3, T}}
@@ -179,10 +179,10 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     f_tangent::Array{Complex{T}, 3}
     q_step::T
     l_max_lr::Int
-    translations::Vector{SVector{3, T}}
+    tau::Vector{SVector{3, T}}
     image_of::Vector{Int}
     dipole_slopes::Matrix{Complex{T}}
-    self_term::Matrix{Complex{T}}
+    J_self::Matrix{Complex{T}}
     eta::T
     G_max::T
     prefactor::T
@@ -195,12 +195,12 @@ struct EwaldLongRangeBuffers{T<:AbstractFloat, C}
     is allocated once per thread rather than once per q point.
 
     # Fields:
-    - u::Vector{Complex{T}}: The phase-shifted molecular amplitudes u_λ(Q).
+    - f_image::Vector{Complex{T}}: The phase-shifted molecular amplitudes f_{λ_i}(Q).
     - harmonics::Vector{Complex{T}}: Y_ℓ^μ(Q̂) flattened onto the table's key ordering.
     - image_phases::Vector{Complex{T}}: exp(i Q . τ) for each molecule in the cell.
     - Ylm_cache::C: The spherical harmonic cache, sized to the ℓ ceiling of the sub-table.
     """
-    u::Vector{Complex{T}}
+    f_image::Vector{Complex{T}}
     harmonics::Vector{Complex{T}}
     image_phases::Vector{Complex{T}}
     Ylm_cache::C
@@ -211,7 +211,7 @@ function EwaldLongRangeBuffers(data::EwaldLongRangeData{T}) where {T<:AbstractFl
     return EwaldLongRangeBuffers{T, typeof(cache)}(
         Vector{Complex{T}}(undef, length(data.image_of)),
         Vector{Complex{T}}(undef, (data.l_max_lr + 1)^2),
-        Vector{Complex{T}}(undef, length(data.translations)),
+        Vector{Complex{T}}(undef, length(data.tau)),
         cache,
     )
 end
@@ -314,7 +314,7 @@ function long_range_l_ceiling(
     Find the largest ℓ whose coefficients are non-negligible for the long-range q grid.
 
     # Arguments:
-    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f̄, with dimensions (n_lambda, n_q, n_keys).
+    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f, with dimensions (n_lambda_i, n_q, n_keys).
     - n_q_lr::Int: How many q points the long-range sum reaches.
     - l_max::Int: The maximum angular momentum mode of the form factor.
 
@@ -322,12 +322,12 @@ function long_range_l_ceiling(
     - Int: The ℓ ceiling.
     """
 
-    n_lambda = size(rotated_R, 1)
+    n_lambda_i = size(rotated_R, 1)
 
     # Find the largest coefficient in each l block over the long-range q range.
     block_magnitude = zeros(T, l_max + 1)
-    @inbounds for l in 0:l_max, key in (l * l + 1):((l + 1)^2), q_idx in 1:n_q_lr, lambda in 1:n_lambda
-        block_magnitude[l + 1] = max(block_magnitude[l + 1], abs(rotated_R[lambda, q_idx, key]))
+    @inbounds for l in 0:l_max, key in (l * l + 1):((l + 1)^2), q_idx in 1:n_q_lr, lambda_i in 1:n_lambda_i
+        block_magnitude[l + 1] = max(block_magnitude[l + 1], abs(rotated_R[lambda_i, q_idx, key]))
     end
 
     cutoff = T(COEFFICIENT_THRESHOLD) * maximum(block_magnitude)
@@ -407,7 +407,7 @@ end
 function build_ewald_long_range(
         rotated_R::Array{Complex{T}, 3},
         rotated_R_bc::Array{Complex{T}, 3},
-        tau_of_lambda::Vector{SVector{3, T}},
+        tau_of_lambda_i::Vector{SVector{3, T}},
         image_of::Vector{Int},
         lattice::CrystalLatticeData{T},
         q_grid_invA::Vector{T},
@@ -419,24 +419,24 @@ function build_ewald_long_range(
     """
     Assemble everything the long-range sum
 
-        𝒥^LR_{λλ'}(k) = (4π α_EM ħc / V_cell) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) u_λ(Q) conj(u_{λ'}(Q)),
+        J_bar^LR_{λ_iλ_j′}(k) = (4π α_EM ħc / V_cell) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) f_{λ_i}(Q) conj(f_{λ_j′}(Q)),
         
     with
         
-        u_λ(Q) = exp(i Q . τ_{A,i}) Σ_{ℓμ} f̄^λ_{ℓμ}(Q) Y_ℓ^μ(Q̂),
+        f_{λ_i}(Q) = exp(i Q . τ_{A,i}) Σ_{ℓm} f^{λ_i}_{ℓm}(Q) Y_ℓ^μ(Q̂),
         
     and Q = k + G,
 
-    needs that does not depend on k: the G vectors, the interpolation table for f̄, the
+    needs that does not depend on k: the G vectors, the interpolation table for f, the
     transition dipole slopes for the Q = 0 term, and the self-interaction that has to be subtracted.
 
     # Arguments:
-    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f̄, with dimensions (n_lambda, n_q, n_keys).
+    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f, with dimensions (n_lambda_i, n_q, n_keys).
     - rotated_R_bc::Array{Complex{T}, 3}: The same coefficients at q_bc alone, which is where the
       transition dipole of the Q = 0 term is read off.
-    - tau_of_lambda::Vector{SVector{3, T}}: The translation τ_{A,i} for each λ, in Å. Only the
-      distinct values are stored, since the phase depends on the molecule rather than on λ.
-    - image_of::Vector{Int}: The image index for each λ, which fixes which pairs share a molecule.
+    - tau_of_lambda_i::Vector{SVector{3, T}}: The translation τ_{A,i} for each λ_i, in Å. Only the
+      distinct values are stored, since the phase depends on the molecule rather than on λ_i.
+    - image_of::Vector{Int}: The image index for each λ_i, which fixes which pairs share a molecule.
     - lattice::CrystalLatticeData{T}: The crystal lattice.
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å. Must be uniform and start at zero.
     - q_bc_invA::T: The |q| at which the transition dipole is read off, in inverse Å.
@@ -449,7 +449,7 @@ function build_ewald_long_range(
     """
 
     # Get the dimensions.
-    n_lambda = size(rotated_R, 1)
+    n_lambda_i = size(rotated_R, 1)
     n_q = length(q_grid_invA)
 
     # A permittivity below 1 is unphysical, and would make the boundary term larger than the vacuum one.
@@ -457,9 +457,9 @@ function build_ewald_long_range(
 
     # Check that we have enough points for interpolation.
     n_q >= 3 || error("The Ewald long-range sum needs at least three q points, got $(n_q).")
-    # The dipole coefficients cover the same λ, but only the one q point they were evaluated at.
-    size(rotated_R_bc, 1) == n_lambda && size(rotated_R_bc, 3) == size(rotated_R, 3) || error(
-        "The dipole coefficients have size $(size(rotated_R_bc)), expected $((n_lambda, 1, size(rotated_R, 3))).")
+    # The dipole coefficients cover the same λ_i, but only the one q point they were evaluated at.
+    size(rotated_R_bc, 1) == n_lambda_i && size(rotated_R_bc, 3) == size(rotated_R, 3) || error(
+        "The dipole coefficients have size $(size(rotated_R_bc)), expected $((n_lambda_i, 1, size(rotated_R, 3))).")
     q_step = q_grid_invA[2] - q_grid_invA[1]
     # The Hermite interpolation assumes a uniform grid anchored at zero.
     abs(q_grid_invA[1]) < eps(T) ||
@@ -483,21 +483,21 @@ function build_ewald_long_range(
     n_keys_lr = (l_max_lr + 1)^2
 
     # Store the subset of rotated coefficients that we need for the LR sum.
-    f_table = Array{Complex{T}, 3}(undef, n_keys_lr, n_lambda, n_q_lr)
-    @inbounds for q_idx in 1:n_q_lr, lambda in 1:n_lambda, key in 1:n_keys_lr
-        f_table[key, lambda, q_idx] = rotated_R[lambda, q_idx, key]
+    f_table = Array{Complex{T}, 3}(undef, n_keys_lr, n_lambda_i, n_q_lr)
+    @inbounds for q_idx in 1:n_q_lr, lambda_i in 1:n_lambda_i, key in 1:n_keys_lr
+        f_table[key, lambda_i, q_idx] = rotated_R[lambda_i, q_idx, key]
     end
 
     # Also store the tangents for the Hermite interpolation. Premultiply by dx (i.e. don't divide by it) to save multiplying later.
     # Endpoints use one directional difference, interior points use central difference, hence the 1/2 for them.
-    f_tangent = Array{Complex{T}, 3}(undef, n_keys_lr, n_lambda, n_q_lr)
-    @inbounds for lambda in 1:n_lambda, key in 1:n_keys_lr
-        f_tangent[key, lambda, 1] = f_table[key, lambda, 2] - f_table[key, lambda, 1]
+    f_tangent = Array{Complex{T}, 3}(undef, n_keys_lr, n_lambda_i, n_q_lr)
+    @inbounds for lambda_i in 1:n_lambda_i, key in 1:n_keys_lr
+        f_tangent[key, lambda_i, 1] = f_table[key, lambda_i, 2] - f_table[key, lambda_i, 1]
         for q_idx in 2:(n_q_lr - 1)
-            f_tangent[key, lambda, q_idx] =
-                (f_table[key, lambda, q_idx + 1] - f_table[key, lambda, q_idx - 1]) / 2
+            f_tangent[key, lambda_i, q_idx] =
+                (f_table[key, lambda_i, q_idx + 1] - f_table[key, lambda_i, q_idx - 1]) / 2
         end
-        f_tangent[key, lambda, n_q_lr] = f_table[key, lambda, n_q_lr] - f_table[key, lambda, n_q_lr - 1]
+        f_tangent[key, lambda_i, n_q_lr] = f_table[key, lambda_i, n_q_lr] - f_table[key, lambda_i, n_q_lr - 1]
     end
 
     # Compute the G vectors. The cutoff bounds |Q| = |k + G|, so a G as far out as G_max plus the
@@ -506,18 +506,18 @@ function build_ewald_long_range(
 
     # Compute the q -> 0 term, and self-interaction term.
     dipole_slopes = dipole_slope_matrix(rotated_R_bc, q_bc_invA, l_max)
-    self_term = self_term_matrix(rotated_R, image_of, q_grid_invA, l_max, parameters.eta)
+    J_self = J_self_matrix(rotated_R, image_of, q_grid_invA, l_max, parameters.eta)
 
-    prefactor = T(4 * π * ALPHA_EM * HBAR_C_EV_ANGSTROM) / lattice.volume
+    prefactor = T(4 * π * ALPHA_EM * HBAR_C_EV_ANGSTROM) / lattice.V_cell
 
-    # Store the translations for each image.
+    # Store the tau for each image.
     n_images = maximum(image_of)
-    translations = [tau_of_lambda[findfirst(==(i), image_of)] for i in 1:n_images]
+    tau = [tau_of_lambda_i[findfirst(==(i), image_of)] for i in 1:n_images]
 
     return EwaldLongRangeData{T}(
         lattice, G_vectors, f_table, f_tangent, q_step, l_max_lr,
-        translations, copy(image_of),
-        dipole_slopes, self_term, parameters.eta, parameters.G_max, prefactor, T(epsilon_b),
+        tau, copy(image_of),
+        dipole_slopes, J_self, parameters.eta, parameters.G_max, prefactor, T(epsilon_b),
     )
 end
 
@@ -527,16 +527,16 @@ function dipole_slope_matrix(
         l_max::Int,
     )::Matrix{Complex{T}} where {T<:AbstractFloat}
     """
-    Read lim_{q→0} f̄_{1m}(q)/q for every λ and m off a single evaluation at q_bc.
+    Read lim_{q→0} f_{1m}(q)/q for every λ_i and m off a single evaluation at q_bc.
 
     # Arguments:
-    - rotated_R_bc::Array{Complex{T}, 3}: The rotated coefficients f̄ at q_bc alone, with
-      dimensions (n_lambda, 1, n_keys).
+    - rotated_R_bc::Array{Complex{T}, 3}: The rotated coefficients f at q_bc alone, with
+      dimensions (n_lambda_i, 1, n_keys).
     - q_bc_invA::T: The |q| at which the dipole is read off, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
 
     # Returns:
-    - Matrix{Complex{T}}: The slopes, with dimensions (n_lambda, 3) for m = -1, 0, 1, in Å.
+    - Matrix{Complex{T}}: The slopes, with dimensions (n_lambda_i, 3) for m = -1, 0, 1, in Å.
     """
 
     l_max >= 1 || error("The Ewald Q = 0 term needs the ℓ = 1 coefficients, but l_max = $(l_max).")
@@ -544,13 +544,13 @@ function dipole_slope_matrix(
         "The dipole coefficients should sit on a single q point, got $(size(rotated_R_bc, 2)).")
     q_bc_invA > 0 || error("The dipole evaluation point must be positive, got $(q_bc_invA).")
 
-    n_lambda = size(rotated_R_bc, 1)
-    slopes = Matrix{Complex{T}}(undef, n_lambda, 3)
+    n_lambda_i = size(rotated_R_bc, 1)
+    slopes = Matrix{Complex{T}}(undef, n_lambda_i, 3)
 
     @inbounds for (column, m) in enumerate(-1:1)
         key = 1 * 1 + (1 + m) + 1
-        for lambda in 1:n_lambda
-            slopes[lambda, column] = rotated_R_bc[lambda, 1, key] / q_bc_invA
+        for lambda_i in 1:n_lambda_i
+            slopes[lambda_i, column] = rotated_R_bc[lambda_i, 1, key] / q_bc_invA
         end
     end
 
@@ -560,23 +560,23 @@ end
 function check_dipole_against_oscillator_strength(
         R_bc::Array{Complex{T}, 3},
         q_bc_invA::T,
-        transition_energies_eV::Vector{T},
+        Delta_E_eV::Vector{T},
         f_osc::Vector{T},
         l_max::Int;
         tolerance::T = T(1e-2),
         f_osc_floor::T = T(1e-3),
     )::T where {T<:AbstractFloat}
     """
-    Check the dipole read off f̄_{1m}(q_bc)/q_bc against the oscillator strength from TD-DFT.
+    Check the dipole read off f_{1m}(q_bc)/q_bc against the oscillator strength from TD-DFT.
 
     TD-DFT gives f_osc = (2/3) ΔE |μ|² in atomic units without reference to the form factor.
-    The ℓ = 1 coefficients give the same number through|μ|² = (3/4π) Σ_m |f̄_{1m}(q_bc)/q_bc|²,
+    The ℓ = 1 coefficients give the same number through|μ|² = (3/4π) Σ_m |f_{1m}(q_bc)/q_bc|²,
     so the two disagreeing means the ℓ = 1 coefficients are wrong.
 
     # Arguments:
     - R_bc::Array{Complex{T}, 3}: Coefficients at q_bc alone, with dimensions (n_transitions, 1, n_keys).
     - q_bc_invA::T: The |q| at which the dipole is read off, in inverse Å.
-    - transition_energies_eV::Vector{T}: The transition energies ΔE, in eV.
+    - Delta_E_eV::Vector{T}: The transition energies ΔE, in eV.
     - f_osc::Vector{T}: The oscillator strength of each transition, dimensionless.
     - l_max::Int: The maximum angular momentum mode of the form factor.
     - tolerance::T: The largest fractional disagreement allowed on any checked transition.
@@ -589,8 +589,8 @@ function check_dipole_against_oscillator_strength(
     # Get the dipole moments from the ℓ = 1 coefficients.
     slopes = dipole_slope_matrix(R_bc, q_bc_invA, l_max)
     n_transitions = size(R_bc, 1)
-    length(transition_energies_eV) == n_transitions || error(
-        "There are $(length(transition_energies_eV)) energies for $(n_transitions) transitions.")
+    length(Delta_E_eV) == n_transitions || error(
+        "There are $(length(Delta_E_eV)) energies for $(n_transitions) transitions.")
     length(f_osc) == n_transitions || error(
         "There are $(length(f_osc)) oscillator strengths for $(n_transitions) transitions.")
 
@@ -602,7 +602,7 @@ function check_dipole_against_oscillator_strength(
         total = sum(abs2(slopes[transition, column]) for column in 1:3)
         dipole_from_form_factor = sqrt(T(3 / (4 * π)) * total)
         # |μ|² = (3/2) f_osc / ΔE in atomic units, converted from Bohr to Å.
-        energy_hartree = transition_energies_eV[transition] / T(HARTREE_EV)
+        energy_hartree = Delta_E_eV[transition] / T(HARTREE_EV)
         dipole_from_f_osc = sqrt(T(1.5) * f_osc[transition] / energy_hartree) * T(BOHR_ANGSTROM)
         relative_error = abs(dipole_from_form_factor - dipole_from_f_osc) / dipole_from_f_osc
         if relative_error > worst_error
@@ -620,7 +620,7 @@ function check_dipole_against_oscillator_strength(
     return worst_error
 end
 
-function self_term_matrix(
+function J_self_matrix(
         rotated_R::Array{Complex{T}, 3},
         image_of::Vector{Int},
         q_grid_invA::Vector{T},
@@ -628,28 +628,28 @@ function self_term_matrix(
         eta::T,
     )::Matrix{Complex{T}} where {T<:AbstractFloat}
     """
-    The self-interaction J^LR_{λλ'}(0) that the reciprocal sum includes but the physics does not,
+    The self-interaction J^self_{λ_iλ_j′} that the reciprocal sum includes but the physics does not,
     since a molecule does not interact with itself. It is subtracted from the ΔR = 0 couplings.
 
     At zero separation the phase drops out and the full integral reduces to a single radial integral:
 
-        J^LR_{λλ'}(0) = (α_EM ħc / 2π²) ∫dq exp(-q²/4η²) Σ_{ℓμ} f̄^λ_{ℓμ}(q) conj(f̄^{λ'}_{ℓμ}(q)).
+        J^self_{λ_iλ_j′} = (α_EM ħc / 2π²) ∫dq exp(-q²/4η²) Σ_{ℓm} f^{λ_i}_{ℓm}(q) conj(f^{λ_j′}_{ℓm}(q)).
 
     Only pairs on the same molecule are affected, so the matrix is zero between different images.
 
     # Arguments:
-    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f̄, with dimensions (n_lambda, n_q, n_keys).
-    - image_of::Vector{Int}: The image index for each λ.
+    - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f, with dimensions (n_lambda_i, n_q, n_keys).
+    - image_of::Vector{Int}: The image index for each λ_i.
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
     - eta::T: The splitting parameter η, in Å^{-1}.
 
     # Returns:
-    - Matrix{Complex{T}}: The self-interaction in eV, with dimensions (n_lambda, n_lambda).
+    - Matrix{Complex{T}}: The self-interaction in eV, with dimensions (n_lambda_i, n_lambda_i).
     """
 
     # Get the dimensions.
-    n_lambda = size(rotated_R, 1)
+    n_lambda_i = size(rotated_R, 1)
     n_q = length(q_grid_invA)
     n_keys = (l_max + 1)^2
 
@@ -666,24 +666,24 @@ function self_term_matrix(
     end
 
     prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
-    self_term = zeros(Complex{T}, n_lambda, n_lambda)
+    J_self = zeros(Complex{T}, n_lambda_i, n_lambda_i)
 
-    @inbounds for lambda_prime in 1:n_lambda, lambda in 1:lambda_prime
+    @inbounds for lambda_j in 1:n_lambda_i, lambda_i in 1:lambda_j
         # Skip pairs on different molecules.
-        image_of[lambda] == image_of[lambda_prime] || continue
+        image_of[lambda_i] == image_of[lambda_j] || continue
 
         total = zero(Complex{T})
         # Perform the integral.
         for key in 1:n_keys, q_idx in 1:n_q
-            total += weights[q_idx] * rotated_R[lambda, q_idx, key] * conj(rotated_R[lambda_prime, q_idx, key])
+            total += weights[q_idx] * rotated_R[lambda_i, q_idx, key] * conj(rotated_R[lambda_j, q_idx, key])
         end
 
         value = prefactor * total
-        self_term[lambda, lambda_prime] = value
-        self_term[lambda_prime, lambda] = conj(value)
+        J_self[lambda_i, lambda_j] = value
+        J_self[lambda_j, lambda_i] = conj(value)
     end
 
-    return self_term
+    return J_self
 end
 
 function compute_ewald_D(
@@ -721,11 +721,11 @@ function compute_ewald_D(
     """
 
     # Get the dimensions, and check the tensors match them.
-    n_lambda = length(data.image_of)
-    n_images = length(data.translations)
+    n_lambda_i = length(data.image_of)
+    n_images = length(data.tau)
     n_keys = (l_max + 1)^2
-    n_lambda == n_images * n_transitions || error(
-        "There are $(n_lambda) excitations for $(n_images) images of $(n_transitions) transitions.")
+    n_lambda_i == n_images * n_transitions || error(
+        "There are $(n_lambda_i) excitations for $(n_images) images of $(n_transitions) transitions.")
     pairs = build_transition_pairs(n_transitions)
     n_pairs = length(pairs.transitions_of_pair)
     n_Delta_rows = n_images * n_pairs
@@ -801,14 +801,14 @@ function compute_ewald_D(
                               h01 * Xi_table[key, image, Xi_node + 1] +
                               h11 * Xi_tangent[key, image, Xi_node + 1]) * harmonics[key]
             end
-            total_Xi += cis(dot(G, data.translations[image])) * amplitude
+            total_Xi += cis(dot(G, data.tau[image])) * amplitude
         end
 
         # Contract Δ with the shared Ξ sum, phased onto each molecule's position in the cell. Both
         # excitations of a block sit on the same molecule, so there is one phase for the whole block.
         weight = data.prefactor * exp(-(G_norm / (2 * data.eta))^2) / (G_norm * G_norm)
         for image in 1:n_images
-            phase = cis(dot(G, data.translations[image]))
+            phase = cis(dot(G, data.tau[image]))
             for pair in 1:n_pairs
                 row = Delta_row(image, pair, n_pairs)
                 amplitude = zero(Complex{T})
@@ -832,14 +832,14 @@ function compute_ewald_D(
     boundary_weight = data.prefactor * T(3) / (T(4 * π) * (2 * data.epsilon_b + one(T)))
     # At ε_b = Inf the weight is exactly zero, which is the conducting boundary condition.
     if !iszero(boundary_weight)
-        Delta_dipoles = dipole_slope_matrix(rotated_Delta_bc, q_bc_invA, l_max)
-        Xi_dipoles = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
-        total_Xi_dipoles = vec(sum(Xi_dipoles, dims = 1))
+        Delta_slopes = dipole_slope_matrix(rotated_Delta_bc, q_bc_invA, l_max)
+        Xi_slopes = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
+        total_Xi_slopes = vec(sum(Xi_slopes, dims = 1))
         @inbounds for image in 1:n_images, pair in 1:n_pairs
             row = Delta_row(image, pair, n_pairs)
             total = zero(Complex{T})
             for component in 1:3
-                total += Delta_dipoles[row, component] * conj(total_Xi_dipoles[component])
+                total += Delta_slopes[row, component] * conj(total_Xi_slopes[component])
             end
             (s, t) = pairs.transitions_of_pair[pair]
             value = boundary_weight * total
@@ -877,7 +877,7 @@ function compute_ewald_D(
         D_blocks[image, t, s] -= conj(value)
     end
 
-    # Δ K Ξ* is real for the real densities RKS gives us, so the imaginary part is round-off. Check
+    # Δ P̄ Ξ* is real for the real densities RKS gives us, so the imaginary part is round-off. Check
     # that before discarding it.
     scale = max(maximum(abs, real(D_blocks)), one(T))
     imaginary_residual = maximum(abs, imag(D_blocks))
@@ -895,7 +895,7 @@ end
         k::SVector{3, T},
     ) where {T<:AbstractFloat}
     """
-    Add the reciprocal-space long-range coupling 𝒥^LR_{λλ'}(k) to the Bloch Hamiltonian.
+    Add the reciprocal-space long-range coupling J_bar^LR_{λ_iλ_j′}(k) to the Bloch Hamiltonian.
 
     # Arguments:
     - H::Matrix{Complex{T}}: The Bloch Hamiltonian, whose upper triangle is accumulated into.
@@ -908,10 +908,10 @@ end
     """
 
     # Get the dimensions.
-    n_lambda = length(data.image_of)
+    n_lambda_i = length(data.image_of)
     l_max_lr = data.l_max_lr
     n_keys_lr = size(data.f_table, 1)
-    u = buffers.u
+    f_image = buffers.f_image
     harmonics = buffers.harmonics
     f_table = data.f_table
     f_tangent = data.f_tangent
@@ -959,29 +959,29 @@ end
         h11 = s_cubed - s_squared
 
 
-        # Now compute u_λ(Q) = exp(i Q⋅τ) Σ_key f̄_key(Q) Y_key, with f̄ interpolated by the Hermite stencil. 
-        @inbounds for lambda in 1:n_lambda
+        # Now compute f_{λ_i}(Q) = exp(i Q⋅τ) Σ_key f_key(Q) Y_key, with f interpolated by the Hermite stencil.
+        @inbounds for lambda_i in 1:n_lambda_i
             total = zero(Complex{T})
             @simd for key in 1:n_keys_lr
-                total += (h00 * f_table[key, lambda, node] +
-                          h10 * f_tangent[key, lambda, node] +
-                          h01 * f_table[key, lambda, node + 1] +
-                          h11 * f_tangent[key, lambda, node + 1]) * harmonics[key]
+                total += (h00 * f_table[key, lambda_i, node] +
+                          h10 * f_tangent[key, lambda_i, node] +
+                          h01 * f_table[key, lambda_i, node + 1] +
+                          h11 * f_tangent[key, lambda_i, node + 1]) * harmonics[key]
             end
-            u[lambda] = total
+            f_image[lambda_i] = total
         end
 
         # Multiply by the image phases.
-        @inbounds for image in eachindex(data.translations)
-            buffers.image_phases[image] = cis(dot(Q, data.translations[image]))
+        @inbounds for image in eachindex(data.tau)
+            buffers.image_phases[image] = cis(dot(Q, data.tau[image]))
         end
-        @inbounds for lambda in 1:n_lambda
-            u[lambda] *= buffers.image_phases[data.image_of[lambda]]
+        @inbounds for lambda_i in 1:n_lambda_i
+            f_image[lambda_i] *= buffers.image_phases[data.image_of[lambda_i]]
         end
 
-        # Accumulate weight * u u^† into the upper triangle ('U') of H.
+        # Accumulate weight * f_image f_image^† into the upper triangle ('U') of H.
         weight = data.prefactor * exp(-(Q_norm / (2 * data.eta))^2) / (Q_norm * Q_norm)
-        BLAS.her!('U', weight, u, H)
+        BLAS.her!('U', weight, f_image, H)
     end
 
     return nothing
@@ -995,9 +995,9 @@ end
     Add the Q = 0 term of the long-range sum, which a sample surrounded by a medium of permittivity
     ε_b reduces to
 
-        (μ_λ . conj(μ_{λ'})) / (2ε_b + 1).
+        (μ_λ_i . conj(μ_{λ_j′})) / (2ε_b + 1).
 
-    Each dipole is written in terms of the ℓ = 1 coefficients as μ_{λ,-m} = -i √(3/4π) (-1)^m lim f̄^λ_{1m}(q)/q.
+    Each dipole is written in terms of the ℓ = 1 coefficients as μ_{λ_i,-m} = -i √(3/4π) (-1)^m lim f^{λ_i}_{1m}(q)/q.
 
     # Arguments:
     - H::Matrix{Complex{T}}: The Bloch Hamiltonian, whose upper triangle is accumulated into.
@@ -1008,20 +1008,20 @@ end
     """
 
     # Get the dimensions.
-    n_lambda = length(data.image_of)
+    n_lambda_i = length(data.image_of)
     slopes = data.dipole_slopes
     weight = data.prefactor * T(3) / (T(4 * π) * (2 * data.epsilon_b + one(T)))
 
     # Nothing to add in the conducting limit, so skip the loop rather than adding zeros.
     iszero(weight) && return nothing
 
-    @inbounds for lambda_prime in 1:n_lambda, lambda in 1:lambda_prime
+    @inbounds for lambda_j in 1:n_lambda_i, lambda_i in 1:lambda_j
         total = zero(Complex{T})
-        # Sum (lim f̄^λ_{1m}(q)/q) conj(lim f̄^{λ'}_{1m}(q)/q) over the three m.
+        # Sum (lim f^{λ_i}_{1m}(q)/q) conj(lim f^{λ_j′}_{1m}(q)/q) over the three m.
         for column in 1:3
-            total += slopes[lambda, column] * conj(slopes[lambda_prime, column])
+            total += slopes[lambda_i, column] * conj(slopes[lambda_j, column])
         end
-        H[lambda, lambda_prime] += weight * total
+        H[lambda_i, lambda_j] += weight * total
     end
 
     return nothing

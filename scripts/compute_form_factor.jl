@@ -11,14 +11,14 @@ using Quaternionic
 
 # Import everything that we need from SCarFFF.
 using StaticArrays
-using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids
+using SCarFFF: compute_cartesian_form_factor, compute_fft_form_factor, compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids
 using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_crystal_lattice,
                                   compute_spherical_form_factor_with_densities,
                                   rotate_R_tensors, rotate_crystal_R_tensors,
-                                  compute_coherent_crystal_f_lm,
-                                  compute_incoherent_crystal_f_lm, project_f_lm,
+                                  compute_coherent_unit_cell_f_sq_lm,
+                                  compute_incoherent_unit_cell_f_sq_lm, project_f_sq_lm,
                                   band_energy_range, build_energy_grid, describe_energy_grid,
-                                  incoherent_structure_factor, integrate_energy, trim_energy_axis,
+                                  incoherent_intensity_lm_E, integrate_energy, trim_energy_axis,
                                   apply_structure_function_prefactor!,
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
@@ -90,14 +90,14 @@ function print_gamma_point_shifts(
     """
 
     # Get the crystal spectrum at the Gamma point.
-    n_lambda = length(basis.energies)
-    n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
-    eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells, vecs = false)
+    n_lambda_i = length(basis.Delta_E_monomer)
+    n_neighbour_cells = couplings === nothing ? 0 : length(couplings.Delta_R)
+    eigensystem = BlochEigensystem(basis, long_range; n_neighbour_cells = n_neighbour_cells, vecs = false)
     solve_bloch_energies!(eigensystem, basis, SVector{3, T}(0, 0, 0), couplings, long_range)
 
     # Get the monomer spectrum at the Gamma point.
-    uncoupled = sort(basis.energies)
-    coupled = eigensystem.energies
+    uncoupled = sort(basis.Delta_E_monomer)
+    coupled = eigensystem.Delta_E
 
     # Fixed-width columns, with a rule between manifolds so the Davydov blocks are visible.
     cell(x) = lpad(string(round(x, digits = 4)), 15)
@@ -109,7 +109,7 @@ function print_gamma_point_shifts(
     println("  " * rpad("", 7) * "\u2502" * lpad("[eV]", 16) * "\u2502" *
             lpad("[eV]", 16) * "\u2502" * lpad("[eV]", 16))
     println(rule)
-    for state in 1:n_lambda
+    for state in 1:n_lambda_i
         if state > 1 && !isapprox(uncoupled[state], uncoupled[state - 1]; rtol = 1e-8)
             println(rule)
         end
@@ -130,7 +130,7 @@ function sample_band_plane(
         basis, lattice, couplings, long_range, plane::String, n_points::Int, ::Type{T},
     ) where {T<:AbstractFloat}
     """
-    Sample the Frenkel exciton band energies E_Ψ(k) over a Cartesian plane of the first Brillouin
+    Sample the Frenkel exciton band energies ΔE_n(k) over a Cartesian plane of the first Brillouin
     zone, so the axes line up with the form factor slices.
 
     # Arguments:
@@ -165,9 +165,9 @@ function sample_band_plane(
     axis_a_invA = collect(range(-half_widths[first_axis], half_widths[first_axis], length = n_points))
     axis_b_invA = collect(range(-half_widths[second_axis], half_widths[second_axis], length = n_points))
 
-    n_states = length(basis.energies)
+    n_states = length(basis.Delta_E_monomer)
     energies = fill(T(NaN), n_states, n_points, n_points)
-    n_cells = couplings === nothing ? 0 : length(couplings.cell_vectors)
+    n_neighbour_cells = couplings === nothing ? 0 : length(couplings.Delta_R)
 
     # Time reversal gives E(k) = E(-k) for any crystal, and the axes are symmetric about zero, so the
     # antipode of sample (i, j) is exactly sample (n + 1 - i, n + 1 - j). We get this for free.
@@ -185,7 +185,7 @@ function sample_band_plane(
     n_chunks = chunk_count(n_points, nthreads())
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
-            eigensystem = BlochEigensystem(basis, long_range; n_cells = n_cells, vecs = false)
+            eigensystem = BlochEigensystem(basis, long_range; n_neighbour_cells = n_neighbour_cells, vecs = false)
             for i in chunk_range(chunk, n_chunks, n_points)
                 for j in 1:n_points
                     to_be_solved[i, j] || continue
@@ -202,7 +202,7 @@ function sample_band_plane(
 
                     solve_bloch_energies!(eigensystem, basis, k_vector, couplings, long_range)
                     @inbounds for state in 1:n_states
-                        energies[state, i, j] = eigensystem.energies[state]
+                        energies[state, i, j] = eigensystem.Delta_E[state]
                     end
                 end
             end
@@ -261,10 +261,10 @@ function parse_commandline()::Dict{String, Any}
             help = "How to combine monomer form factors into the crystal form factor. 'coherent' solves the Frenkel exciton Bloch problem and mixes the molecular amplitudes with the resulting coefficients. 'incoherent' is the zeroth-order approximation that adds |f|^2 over the rotated images. Options: 'coherent' or 'incoherent'."
             default = "incoherent"
         "--coupling-method"
-            help = "How to sum the intermolecular couplings over the lattice (coherent crystal mode). 'ewald' splits the Coulomb kernel into a short-range real-space sum and a long-range reciprocal-space one, both of which converge exponentially, so the error is set by --ewald-epsilon. 'direct' sums the bare 1/r kernel out to --coupling-cutoff, which is only conditionally convergent and is kept as a cross-check. Options: 'ewald' or 'direct'."
+            help = "How to sum the intermolecular couplings over the lattice (coherent crystal mode). 'ewald' splits the Coulomb kernel into a short-range real-space sum and a long-range reciprocal-space one, both of which converge exponentially, so the error is set by --ewald-epsilon-tot. 'direct' sums the bare 1/r kernel out to --coupling-cutoff, which is only conditionally convergent and is kept as a cross-check. Options: 'ewald' or 'direct'."
             default = "ewald"
-        "--ewald-epsilon"
-            help = "Requested truncation error for the Ewald sums. Both the real- and reciprocal-space cutoffs are pinned to it, so this is the single accuracy knob."
+        "--ewald-epsilon-tot"
+            help = "Requested truncation error for the Ewald sums. The estimated error of each sum is epsilon_tot/sqrt(2), with exponential cutoffs; their prefactors are not yet calibrated."
             arg_type = Float64
             default = 1.0e-3
         "--ewald-eta"
@@ -276,7 +276,7 @@ function parse_commandline()::Dict{String, Any}
             arg_type = Float64
             default = 1.0
         "--epsilon-b"
-            help = "Permittivity of the medium surrounding the sample, which scales the Q = 0 boundary term of the Ewald reciprocal sum by 1/(2 eps_b + 1). 1 is a spherical sample in vacuum, and Inf is the conducting boundary condition, where the term vanishes. Not the Ewald truncation error, which is --ewald-epsilon."
+            help = "Permittivity of the medium surrounding the sample, which scales the Q = 0 boundary term of the Ewald reciprocal sum by 1/(2 eps_b + 1). 1 is a spherical sample in vacuum, and Inf is the conducting boundary condition, where the term vanishes. Not the Ewald truncation error, which is --ewald-epsilon-tot."
             arg_type = Float64
             default = 1.0
         "--q-bc"
@@ -284,7 +284,7 @@ function parse_commandline()::Dict{String, Any}
             arg_type = Float64
             default = 1.0e-4
         "--dE"
-            help = "Bin width in eV of the energy axis of the structure function f^2_lm(q, E). This is the only energy knob: the delta is a mollifier whose support is three bins, so a finer axis both resolves more and narrows the delta towards a true delta function, and the number of points follows from the band range. Cost downstream is linear in it."
+            help = "Bin width in eV of the energy axis of the structure function S_lm(q, E). This is the only energy knob: the delta is a mollifier whose support is three bins, so a finer axis both resolves more and narrows the delta towards a true delta function, and the number of points follows from the band range. Cost downstream is linear in it."
             arg_type = Float64
             default = 0.005
         "--band-range-star-stride"
@@ -298,10 +298,10 @@ function parse_commandline()::Dict{String, Any}
             default = 4
             range_tester = value -> value >= 1
         "--no-structure-factor"
-            help = "Skip the energy-resolved structure function f^2_lm(q, E) and write only the per-state f^2_lm(q)."
+            help = "Skip the energy-resolved structure function S_lm(q, E) and write only the per-state f^2_lm(q)."
             action = :store_true
         "--coupling-cutoff"
-            help = "Real-space cutoff in Angstroms for the intermolecular coupling sum, used only by --coupling-method direct. Under Ewald the cutoff is derived from --ewald-epsilon instead. A cutoff of 0 still couples the molecules within the unit cell, since those sit at zero lattice vector; it just excludes neighbouring cells. Use --no-couplings to switch the correction off entirely."
+            help = "Real-space cutoff in Angstroms for the intermolecular coupling sum, used only by --coupling-method direct. Under Ewald the cutoff is derived from --ewald-epsilon-tot instead. A cutoff of 0 still couples the molecules within the unit cell, since those sit at zero lattice vector; it just excludes neighbouring cells. Use --no-couplings to switch the correction off entirely."
             arg_type = Float64
             default = 40.0
         "--band-map-plane"
@@ -346,7 +346,7 @@ function parse_commandline()::Dict{String, Any}
             arg_type = Float64
             default = 1e-6
         "--compute-mode"
-            help = "Comma-separated list of outputs to compute/save. Spherical options: form_factor, R_tensor, f_lm_tensor. Cartesian options: V_only, form_factor, both."
+            help = "Comma-separated list of outputs to compute/save. Spherical options: form_factor, R_tensor, f_sq_lm_tensor. Cartesian options: V_only, form_factor, both."
             default = "form_factor,R_tensor"
         "--q-lim"
             help = "q-space limits in keV, comma-separated (e.g. 10,10,10) (FFT method)."
@@ -382,7 +382,7 @@ function parse_commandline()::Dict{String, Any}
             help = "Output directory for this run (e.g., ../runs/run_name). If not specified, defaults to ../runs/{smiles} for a single molecule."
             default = nothing
         "--compute-rates"
-            help = "Whether to compute DM scattering rates after the spherical form factor (spherical method only). Requires f_lm_tensor to be available."
+            help = "Whether to compute DM scattering rates after the spherical form factor (spherical method only). Requires f_sq_lm_tensor to be available."
             action = :store_true
         "--m-grid"
             help = "DM mass grid for rate computation: 'min_MeV,max_MeV,N' (log-spaced). E.g. '1.0,1000.0,100'."
@@ -424,24 +424,12 @@ function parse_transition_indices(indices_str::String, td_h5_path::String)::Vect
             while haskey(io, "X_state_$(count + 1)") && haskey(io, "Y_state_$(count + 1)")
                 count += 1
             end
-            count > 0 && return count, "X and Y amplitudes"
+            return count, "X and Y amplitudes"
 
-            if haskey(io, "transition_matrices")
-                return length(read(io, "transition_matrices")), "transition_matrices"
-            end
-
-            while haskey(io, "d_ij_state_$(count + 1)")
-                count += 1
-            end
-            count > 0 && return count, "d_ij matrices"
-
-            haskey(io, "energies_ev") && return length(read(io, "energies_ev")), "energies_ev"
-            return 0, "nothing"
         end
 
         n_transitions > 0 || error(
-            "Found no transitions in $(td_h5_path). Expected X_state_1 and Y_state_1, or one of the " *
-            "older transition_matrices or d_ij_state_1 layouts."
+            "Found no transitions in $(td_h5_path). Expected X_state_1 and Y_state_1."
         )
         println("Found $(n_transitions) transitions, counted from the $(source).")
 
@@ -608,8 +596,8 @@ function main()
         error("Invalid coupling method '$(args["coupling-method"])'. The supported options are 'ewald' and 'direct'.")
     coupling_cutoff = args["coupling-cutoff"]
     coupling_cutoff >= 0 || error("The coupling cutoff must not be negative, got $(coupling_cutoff).")
-    ewald_epsilon = args["ewald-epsilon"]
-    0 < ewald_epsilon < 1 || error("The Ewald truncation error must lie in (0, 1), got $(ewald_epsilon).")
+    epsilon_tot = args["ewald-epsilon-tot"]
+    0 < epsilon_tot < 1 || error("The Ewald truncation error must lie in (0, 1), got $(epsilon_tot).")
     ewald_eta = args["ewald-eta"]
     ewald_eta >= 0 || error("The Ewald splitting parameter must not be negative, got $(ewald_eta).")
     ewald_cost_ratio = args["ewald-cost-ratio"]
@@ -780,19 +768,20 @@ function main()
             N_phi = N_phi > 0 ? N_phi : default_phi
             threshold_val = T(args["threshold"])
             # Parse the compute-mode as a comma-separated list of outputs to compute/save.
-            valid_spherical_modes = Set(["form_factor", "R_tensor", "f_lm_tensor"])
-            compute_modes = Set(strip.(split(args["compute-mode"], ",")))
+            valid_spherical_modes = Set(["form_factor", "R_tensor", "f_sq_lm_tensor"])
+            requested_modes = strip.(split(args["compute-mode"], ","))
+            compute_modes = Set(requested_modes)
             for mode in compute_modes
                 if !(mode in valid_spherical_modes)
-                    error("Invalid compute-mode '$(mode)'. Valid spherical options are: form_factor, R_tensor, f_lm_tensor.")
+                    error("Invalid compute-mode '$(mode)'. Valid spherical options are: form_factor, R_tensor, f_sq_lm_tensor.")
                 end
             end
             need_grid = "form_factor" in compute_modes
             need_R = "R_tensor" in compute_modes
-            need_flm = "f_lm_tensor" in compute_modes
+            need_f_sq_lm = "f_sq_lm_tensor" in compute_modes
             compute_rates_flag = args["compute-rates"]
             if compute_rates_flag
-                need_flm = true  # f_lm tensor is required for rate computation.
+                need_f_sq_lm = true  # f_sq_lm tensor is required for rate computation.
             end
             if crystal_mode
                 # Both crystal orders rotate each conformer's R tensor into every image's
@@ -849,7 +838,7 @@ function main()
 
                 # Create a results dict for each conformer group.
                 conformer_results = Dict{String, Any}()
-                conformer_f_lm = Array{T, 3}[]
+                conformer_f_sq_lm = Array{T, 3}[]
 
                 # Only the Ewald split has a Q = 0 term, so only it needs the dipole at q_bc.
                 need_q_bc = crystal_order == "coherent" && !no_couplings && coupling_method == "ewald"
@@ -866,7 +855,7 @@ function main()
                     need_Delta_and_Xi = crystal_order == "coherent" && !no_couplings
                     Delta_and_Xi = nothing
                     if need_Delta_and_Xi
-                        R_tensor, f_s, f_lm, transition_energies_eV, Delta_and_Xi =
+                        R_tensor, f_s, f_sq_lm, Delta_E_eV, Delta_and_Xi =
                             compute_spherical_form_factor_with_densities(
                                 q_grid,
                                 theta_grid,
@@ -879,10 +868,10 @@ function main()
                                 use_gpu=use_gpu,
                                 need_grid=need_grid,
                                 need_R=need_R,
-                                need_flm=true
+                                need_f_sq_lm=true
                             )
                     else
-                        R_tensor, f_s, f_lm, transition_energies_eV = compute_spherical_form_factor(
+                        R_tensor, f_s, f_sq_lm, Delta_E_eV = compute_spherical_form_factor(
                             q_grid,
                             theta_grid,
                             phi_grid,
@@ -894,11 +883,11 @@ function main()
                             use_gpu=use_gpu,
                             need_grid=need_grid,
                             need_R=need_R,
-                            need_flm=true
+                            need_f_sq_lm=true
                         )
                     end
 
-                    # The Ewald Q = 0 term needs the transition dipole, which is the q → 0 limit off̄_{1m}(q)/q.
+                    # The Ewald Q = 0 term needs the transition dipole, which is the q → 0 limit of f_{1m}(q)/q.
                     R_bc = nothing
                     Delta_bc = nothing
                     Xi_bc = nothing
@@ -917,7 +906,7 @@ function main()
                                 use_gpu=use_gpu,
                                 need_grid=false,
                                 need_R=true,
-                                need_flm=false
+                                need_f_sq_lm=false
                             )
                         R_bc = R_both[:, 2:2, :]
                         Delta_bc = Delta_and_Xi_bc.Delta_R[:, 2:2, :]
@@ -930,17 +919,17 @@ function main()
                         end
                         dipole_error = check_dipole_against_oscillator_strength(
                             R_bc, T(q_bc * KEV_TO_INV_ANGSTROM),
-                            T.(transition_energies_eV), f_osc, l_max)
+                            T.(Delta_E_eV), f_osc, l_max)
                         println("Conformer $(conformer_label): the dipole at q_bc = $(q_bc) keV matches " *
                                 "the oscillator strength to $(round(dipole_error * 100, digits = 4))%.")
                     end
 
-                    push!(conformer_f_lm, f_lm)
+                    push!(conformer_f_sq_lm, f_sq_lm)
                     conformer_results[conformer_label] = (
                         R_tensor = R_tensor,
                         f_s = f_s,
-                        f_lm = f_lm,
-                        transition_energies_eV = transition_energies_eV,
+                        f_sq_lm = f_sq_lm,
+                        Delta_E_eV = Delta_E_eV,
                         Delta_and_Xi = Delta_and_Xi,
                         R_bc = R_bc,
                         Delta_bc = Delta_bc,
@@ -952,12 +941,13 @@ function main()
                         transition_output_dir = joinpath(mol_output_dir, "conformers", conformer_label, string(transition_idx))
                         mkpath(transition_output_dir)
 
-                        transition_energy = transition_energies_eV[batch_idx]
+                        transition_energy = Delta_E_eV[batch_idx]
                         output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
                         h5open(output_path, "w") do io
                             if f_s !== nothing
                                 f_s_slice = f_s[batch_idx, :, :, :]
                                 write(io, "f_s", f_s_slice)
+                                HDF5.attributes(io["f_s"])["units"] = "dimensionless"
                                 write(io, "theta_grid", theta_grid) # Radians.
                                 write(io, "phi_grid", phi_grid) # Radians.
                             end
@@ -965,19 +955,20 @@ function main()
                                 R_slice = R_tensor[batch_idx, :, :]
                                 write(io, "R_tensor", R_slice)
                             end
-                            if f_lm !== nothing
-                                f_lm_slice = f_lm[batch_idx, :, :]
-                                write(io, "f_lm", f_lm_slice)
+                            if f_sq_lm !== nothing
+                                f_sq_lm_slice = f_sq_lm[batch_idx, :, :]
+                                write(io, "f_sq_lm", f_sq_lm_slice)
+                                HDF5.attributes(io["f_sq_lm"])["units"] = "dimensionless"
                             end
                             write(io, "q_grid", q_grid) # keV.
                             write(io, "transition_index", transition_idx)
-                            write(io, "transition_energy_eV", transition_energy)
+                            write(io, "Delta_E_eV", transition_energy)
                         end
                     end
                 end
 
                 # Now compute the rates for each conformer group.
-                m_grid = nothing
+                m_chi_grid = nothing
                 N_rotations = nothing
                 if compute_rates_flag
 
@@ -986,7 +977,7 @@ function main()
                     m_min = parse(Float64, m_vals_str[1])
                     m_max = parse(Float64, m_vals_str[2])
                     n_masses = parse(Int, m_vals_str[3])
-                    m_grid = T.(10 .^ range(log10(m_min), log10(m_max), n_masses))
+                    m_chi_grid = T.(10 .^ range(log10(m_min), log10(m_max), n_masses))
 
                     # Construct the rotation grid.
                     N_rotations_arg = args["N-rotations"]
@@ -1000,10 +991,10 @@ function main()
                     # Compute the rates for each conformer.
                     for conformer_label in conformer_labels
                         conformer_rate_results = compute_rates(
-                            conformer_results[conformer_label].f_lm,
+                            conformer_results[conformer_label].f_sq_lm,
                             q_grid,
-                            m_grid,
-                            T.(conformer_results[conformer_label].transition_energies_eV),
+                            m_chi_grid,
+                            T.(conformer_results[conformer_label].Delta_E_eV),
                             N_rotations
                         )
 
@@ -1011,7 +1002,7 @@ function main()
                         conformer_output_dir = joinpath(mol_output_dir, "conformers", conformer_label)
                         mkpath(conformer_output_dir)
 
-                        mchi_vals = T[row.mchi_MeV for row in conformer_rate_results]
+                        m_chi_vals = T[row.m_chi_MeV for row in conformer_rate_results]
                         rate_max_vals = T[row.rate_max for row in conformer_rate_results]
                         rate_min_vals = T[row.rate_min for row in conformer_rate_results]
                         rate_mean_vals = T[row.rate_mean for row in conformer_rate_results]
@@ -1021,7 +1012,7 @@ function main()
                         h5open(rates_h5_path, "w") do io
                             # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e
                             # and ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
-                            write(io, "mchi_MeV", mchi_vals)
+                            write(io, "m_chi_MeV", m_chi_vals)
                             write(io, "rate_max", rate_max_vals)
                             write(io, "rate_min", rate_min_vals)
                             write(io, "rate_mean", rate_mean_vals)
@@ -1033,12 +1024,12 @@ function main()
                 # Turn the individual conformer results into the crystal results.
                 conformer_sets = build_crystal_conformer_sets(crystal_metadata, T)
 
-                # set_f_lm is aggregated over one conformer group (e.g. 1_A), the other is
-                # aggregated over all groups. This f_lm-space path remains only for incoherent crystal
+                # set_f_sq_lm is aggregated over one conformer group (e.g. 1_A), the other is
+                # aggregated over all groups. This f_sq_lm-space path remains only for incoherent crystal
                 # rates. The plotted incoherent form factor is built separately on the angular grid.
                 need_incoherent_rates = compute_rates_flag
-                set_f_lm, aggregate_f_lm = need_incoherent_rates ?
-                    construct_crystal_f_lm_tensors(conformer_labels, conformer_f_lm, conformer_sets) :
+                set_f_sq_lm, aggregate_f_sq_lm = need_incoherent_rates ?
+                    construct_unit_cell_f_sq_lm_tensors(conformer_labels, conformer_f_sq_lm, conformer_sets) :
                     (nothing, nothing)
                 conformer_set_occupancies = T[conformer_set.occupancy for conformer_set in conformer_sets]
 
@@ -1068,7 +1059,7 @@ function main()
                     any(isnothing, conformer_R_tensors) &&
                         error("The crystal path needs the R tensor for every conformer, but at least one is missing.")
 
-                    conformer_energy_lists = [T.(conformer_results[label].transition_energies_eV) for label in conformer_labels]
+                    conformer_energy_lists = [T.(conformer_results[label].Delta_E_eV) for label in conformer_labels]
                     basis = build_excitation_basis(images, conformer_energy_lists)
 
                     # Rotate each conformer's coefficients into every image's orientation using D matrices.
@@ -1113,28 +1104,28 @@ function main()
                 if crystal_order != "coherent"
                     # Nothing here depends on k, so there is no Bloch problem to solve: no couplings,
                     # no Ewald sum, no symmetry stars and no diagonalisation.
-                    incoherent_timing = @timed compute_incoherent_crystal_f_lm(
+                    incoherent_timing = @timed compute_incoherent_unit_cell_f_sq_lm(
                         rotated_R, basis, q_grid_invA, theta_grid, phi_grid, l_max;
                         need_grid = need_grid)
-                    crystal_state_f_lm, crystal_f_s = incoherent_timing.value
-                    push!(stage_times, "incoherent f_lm" => incoherent_timing.time)
+                    crystal_state_f_sq_lm, I_uc = incoherent_timing.value
+                    push!(stage_times, "incoherent f_sq_lm" => incoherent_timing.time)
 
-                    # Build the energy axis and spread the f_lm coefficients over it.
+                    # Build the energy axis and spread the f_sq_lm coefficients over it.
                     # We use the raw monomer energies here for the energy grid, since there are no bands.
-                    crystal_structure_factor = nothing
+                    crystal_S_lm = nothing
                     crystal_energy_grid = nothing
                     if need_structure_factor
-                        # Basis.energies is indexed by λ, and the first n_trans entries are just the energies for one molecule. 
-                        transition_energies = basis.energies[1:basis.n_transitions]
+                        # basis.Delta_E_monomer is indexed by λ_i, and the first n_trans entries are just the energies for one molecule.
+                        transition_energies = basis.Delta_E_monomer[1:basis.n_transitions]
                         crystal_energy_grid = build_energy_grid(
                             minimum(transition_energies), maximum(transition_energies),
                             T(energy_step))
-                        structure_timing = @timed incoherent_structure_factor(
-                            crystal_state_f_lm, transition_energies, crystal_energy_grid)
-                        crystal_structure_factor = structure_timing.value
+                        structure_timing = @timed incoherent_intensity_lm_E(
+                            crystal_state_f_sq_lm, transition_energies, crystal_energy_grid)
+                        crystal_S_lm = structure_timing.value
                         # The 2π/V_cell that makes this the structure function rather than the bare sum.
-                        apply_structure_function_prefactor!(crystal_structure_factor, lattice.volume)
-                        push!(stage_times, "structure function f_lm(q, E)" => structure_timing.time)
+                        apply_structure_function_prefactor!(crystal_S_lm, lattice.V_cell)
+                        push!(stage_times, "structure function f_sq_lm(q, E)" => structure_timing.time)
                     end
 
                     print_stage_timings("Crystal stage timings", stage_times)
@@ -1147,9 +1138,10 @@ function main()
                         lattice = lattice,
                         dominant_group = dominant_group,
                         dominant_occupancy = dominant_occupancy,
-                        state_f_lm = crystal_state_f_lm,
-                        f_s = crystal_f_s,
-                        structure_factor = crystal_structure_factor,
+                        state_f_sq_lm = crystal_state_f_sq_lm,
+                        f_uc = nothing,
+                        I_uc = I_uc,
+                        S_lm = crystal_S_lm,
                         energy_grid = crystal_energy_grid,
                         band_summary = nothing,
                         couplings = nothing,
@@ -1171,7 +1163,7 @@ function main()
                     else
                         if coupling_method == "ewald"
                             ewald_parameters = choose_ewald_parameters(
-                                lattice, ewald_epsilon; eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                                lattice, epsilon_tot; eta = ewald_eta, cost_ratio = ewald_cost_ratio)
                             # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
                             real_cutoff = ewald_parameters.R_max + image_translation_span(basis)
                         else
@@ -1182,13 +1174,13 @@ function main()
 
                         # Precompute the Gaunt coefficients for the coupling.
                         coupling_gaunt_path = joinpath(@__DIR__, "..", "src", "data", "gaunt_coefficients",
-                                                       "gaunt_coefficients_coupling_lmax$(l_max)$(type_suffix).h5")
+                                                       "Gaunt_l1$(l_max)_l2$(2 * l_max)_l3$(l_max)$(type_suffix).h5")
                         if force_recomp || !isfile(coupling_gaunt_path)
-                            precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, coupling_gaunt_path, T)
+                            precompute_gaunt_coefficients(l_max, 2 * l_max, l_max, coupling_gaunt_path, T)
                         end
 
                         if ewald_parameters === nothing
-                            println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.vectors)) cells).")
+                            println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.Delta_R)) cells).")
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
@@ -1196,24 +1188,24 @@ function main()
                             set_D_couplings!(basis, D_blocks)
                             push!(stage_times, "couplings J and D" => correction_timing.time)
                         else
-                            tau_of_lambda = [basis.images[basis.image_of[lambda]].translation
-                                             for lambda in 1:length(basis.energies)]
+                            tau_of_lambda_i = [basis.images[basis.image_of[lambda_i]].tau
+                                             for lambda_i in 1:length(basis.Delta_E_monomer)]
                             long_range_timing = @timed build_ewald_long_range(
-                                rotated_R, rotated_R_bc, tau_of_lambda, basis.image_of, lattice,
+                                rotated_R, rotated_R_bc, tau_of_lambda_i, basis.image_of, lattice,
                                 q_grid_invA, q_bc_invA, l_max,
                                 ewald_parameters; epsilon_b = epsilon_b)
                             crystal_long_range = long_range_timing.value
                             push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
 
                             # Print a summary of the Ewald parameters.
-                            expected_G = lattice.volume * ewald_parameters.G_max^3 / (6 * π^2)
+                            expected_G = lattice.V_cell * ewald_parameters.G_max^3 / (6 * π^2)
                             supercell = supercell_radius(lattice)
                             widened = ewald_parameters.R_max <= supercell * (1 + 1e-12) ?
                                 " (widened to the 3x3x3 supercell)" : ""
-                            println("Ewald split at ε = $(ewald_parameters.epsilon): " *
+                            println("Ewald split at ε_tot = $(ewald_parameters.epsilon_tot): " *
                                     "η = $(round(ewald_parameters.eta, digits = 4)) Å^-1, " *
                                     "R_max = $(round(ewald_parameters.R_max, digits = 2)) Å$(widened) " *
-                                    "($(length(cells.vectors)) cells searched, padded by the cell span), " *
+                                    "($(length(cells.Delta_R)) cells searched, padded by the cell span), " *
                                     "G_max = $(round(ewald_parameters.G_max, digits = 4)) Å^-1 " *
                                     "(N_G ≈ $(round(Int, expected_G)), $(length(crystal_long_range.G_vectors)) candidates), " *
                                     "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
@@ -1224,7 +1216,7 @@ function main()
                                 parameters = ewald_parameters)
                             crystal_couplings, D_blocks_short_range = correction_timing.value
                             push!(stage_times, "short-range J and D(ΔR)" => correction_timing.time)
-                            subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
+                            subtract_self_term!(crystal_couplings, cells, crystal_long_range.J_self)
 
                             D_long_range_timing = @timed compute_ewald_D(
                                 rotated_Delta, rotated_Xi,
@@ -1280,29 +1272,29 @@ function main()
                     # This streams over q internally, projecting each block onto real spherical
                     # harmonics as it goes, so the full |f|^2 grid is never held in memory. Overwritten
                     # need grid is specfied.
-                    coherent_timing = @timed compute_coherent_crystal_f_lm(
+                    coherent_timing = @timed compute_coherent_unit_cell_f_sq_lm(
                         rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max,
                         stars;
                         need_grid = need_grid, couplings = crystal_couplings,
                         long_range = crystal_long_range, energy_grid = crystal_energy_grid)
-                    crystal_state_f_lm, crystal_band_summary, crystal_f_s, crystal_structure_factor,
+                    crystal_state_f_sq_lm, crystal_band_summary, f_uc, crystal_S_lm,
                         crystal_outside_grid = coherent_timing.value
 
                     # The axis was built wider than the bands need, so trim the empty ends if necessary.
-                    if crystal_structure_factor !== nothing
+                    if crystal_S_lm !== nothing
                         # The 2π/V_cell that makes this the structure function rather than the bare sum.
-                        apply_structure_function_prefactor!(crystal_structure_factor, lattice.volume)
-                        built_points = length(crystal_energy_grid.energies)
-                        crystal_structure_factor, crystal_energy_grid =
-                            trim_energy_axis(crystal_structure_factor, crystal_energy_grid)
-                        trimmed_points = built_points - length(crystal_energy_grid.energies)
+                        apply_structure_function_prefactor!(crystal_S_lm, lattice.V_cell)
+                        built_points = length(crystal_energy_grid.E)
+                        crystal_S_lm, crystal_energy_grid =
+                            trim_energy_axis(crystal_S_lm, crystal_energy_grid)
+                        trimmed_points = built_points - length(crystal_energy_grid.E)
                         trimmed_points == 0 ||
                             println("  Trimmed $(trimmed_points) empty bins of $(built_points) " *
                                     "off the ends of the energy axis.")
                     end
-                    push!(stage_times, "coherent f_lm (H(k), diagonalise, project)" => coherent_timing.time)
+                    push!(stage_times, "coherent f_sq_lm (H(k), diagonalise, project)" => coherent_timing.time)
 
-                    # Optionally sample E_Ψ(k) over a plane of the first Brillouin zone, for plotting.
+                    # Optionally sample ΔE_n(k) over a plane of the first Brillouin zone, for plotting.
                     # Everything it needs is already built, so this is just the sweep, and it inherits
                     # the run's own q grid, ε and l_max rather than being told them a second time.
                     band_planes = band_map_plane == "none" ? String[] :
@@ -1324,7 +1316,7 @@ function main()
                     print_gamma_point_shifts(
                         basis, lattice, crystal_couplings, crystal_long_range, T)
 
-                    # Check that ∫ dE f²_lm(q, E) = Σ_Ψ f²_lm(q), which should hold exactly in theory.
+                    # Check that ∫dE S_lm = (2π/V_cell) Σ_n f²_{n,uc;lm}, with no averaging.
                     if crystal_energy_grid !== nothing
                         println("\n" * describe_energy_grid(crystal_energy_grid))
 
@@ -1332,12 +1324,12 @@ function main()
                         crystal_outside_grid == 0 ||
                             println("  WARNING: $(crystal_outside_grid) states fell outside the " *
                                     "energy axis and were pinned to its ends. Decrease sweep size.")
-                        integrated = integrate_energy(crystal_structure_factor, crystal_energy_grid)
+                        integrated = integrate_energy(crystal_S_lm, crystal_energy_grid)
                         # S_lm carries the 2π/V_cell, so the states it integrates back to need it too.
-                        summed = dropdims(sum(crystal_state_f_lm, dims = 1), dims = 1) .*
-                                 (T(2 * π) / lattice.volume)
+                        summed = dropdims(sum(crystal_state_f_sq_lm, dims = 1), dims = 1) .*
+                                 (T(2 * π) / lattice.V_cell)
                         residual = maximum(abs, integrated .- summed) / maximum(abs, summed)
-                        println("  sum rule, ∫dE S_lm(q, E) against (2π/V_cell) Σ_Ψ f²_lm(q): " *
+                        println("  sum rule, ∫dE S_lm(q, E) against (2π/V_cell) Σ_n f²_lm(q): " *
                                 string(round(residual, sigdigits = 3)) * " relative.")
                     end
                     println()
@@ -1349,9 +1341,10 @@ function main()
                         dominant_group = dominant_group,
                         dominant_occupancy = dominant_occupancy,
                         band_summary = crystal_band_summary,
-                        state_f_lm = crystal_state_f_lm,
-                        f_s = crystal_f_s,
-                        structure_factor = crystal_structure_factor,
+                        state_f_sq_lm = crystal_state_f_sq_lm,
+                        f_uc = f_uc,
+                        I_uc = nothing,
+                        S_lm = crystal_S_lm,
                         energy_grid = crystal_energy_grid,
                         couplings = crystal_couplings,
                         cells = cells,
@@ -1364,7 +1357,7 @@ function main()
                 end
 
 
-                # One file per crystal, either order. Coherent is indexed by crystal state Ψ, which
+                # One file per crystal, either order. Coherent is indexed by band n, which
                 # is a mixture of monomer transitions and so has no per-transition decomposition;
                 # incoherent is indexed by monomer transition. The layout is otherwise the same, so
                 # the plotting does not care which it is beyond reading crystal_order.
@@ -1374,72 +1367,82 @@ function main()
 
                     coherent_basis = crystal_results.basis
 
-                    coherent_path = joinpath(crystal_output_dir, "crystal_f_lm$(type_suffix).h5")
+                    coherent_path = joinpath(crystal_output_dir, "crystal_form_factors$(type_suffix).h5")
                     h5open(coherent_path, "w") do io
                         # Which order (coherent or incoherent) produced this, so a reader knows what the first axis indexes.
                         write(io, "crystal_order", crystal_results.order)
+                        write(io, "V_cell_A3", crystal_results.lattice.V_cell)
 
-                        # Coherent: crystal states Ψ, ordered by ascending energy at each q.
+                        # Coherent: bands n, ordered by ascending energy at each q.
                         # Incoherent: monomer transitions.
-                        write(io, "state_f_lm", crystal_results.state_f_lm)
+                        write(io, "f_sq_lm", crystal_results.state_f_sq_lm)
+                        HDF5.attributes(io["f_sq_lm"])["units"] = "dimensionless"
 
                         # The structure function, summed over states.
-                        if crystal_results.structure_factor !== nothing
-                            write(io, "structure_factor_f_lm", crystal_results.structure_factor) # Å^-3 eV^-1.
-                            write(io, "energy_grid_eV", crystal_results.energy_grid.energies)
+                        if crystal_results.S_lm !== nothing
+                            write(io, "S_lm", crystal_results.S_lm) # Å^-3 eV^-1.
+                            HDF5.attributes(io["S_lm"])["units"] = "angstrom^-3 eV^-1"
+                            write(io, "E_grid_eV", crystal_results.energy_grid.E)
                             # The width of the broadening function, used in place of the delta.
                             write(io, "sigma_E_eV", crystal_results.energy_grid.sigma)
                         end
 
-                        # The unsquared form factor on the (q, θ, ϕ) grid, if it was asked for.
-                        if crystal_results.f_s !== nothing
-                            write(io, "f_s", crystal_results.f_s)
+                        # Coherent amplitudes and incoherent intensities have different names.
+                        if crystal_results.f_uc !== nothing || crystal_results.I_uc !== nothing
+                            if crystal_results.f_uc !== nothing
+                                write(io, "f_uc", crystal_results.f_uc)
+                                HDF5.attributes(io["f_uc"])["units"] = "dimensionless"
+                            else
+                                write(io, "I_uc", crystal_results.I_uc)
+                                HDF5.attributes(io["I_uc"])["units"] = "dimensionless"
+                            end
                             write(io, "theta_grid", theta_grid) # Radians.
                             write(io, "phi_grid", phi_grid) # Radians.
                         end
                         if crystal_results.band_summary !== nothing
-                            write(io, "band_energy_min_eV", crystal_results.band_summary[:, 1])
-                            write(io, "band_energy_max_eV", crystal_results.band_summary[:, 2])
-                            write(io, "band_energy_mean_eV", crystal_results.band_summary[:, 3])
+                            write(io, "Delta_E_band_min_eV", crystal_results.band_summary[:, 1])
+                            write(io, "Delta_E_band_max_eV", crystal_results.band_summary[:, 2])
+                            write(io, "Delta_E_band_mean_eV", crystal_results.band_summary[:, 3])
                         end
 
                         # Unperturbed monomer energies are present for both crystal orders. The
                         # environment shifts belong only to the coherent Frenkel Hamiltonian.
-                        write(io, "localised_energies_eV", coherent_basis.energies)
+                        write(io, "Delta_E_monomer_eV", coherent_basis.Delta_E_monomer)
                         if crystal_results.order == "coherent"
-                            # D_{λλ'}, zero unless λ and λ' sit on the same molecule.
+                            # D_{λ_iλ_j′}, zero unless λ and λ' sit on the same molecule.
                             write(io, "D_eV", coherent_basis.D_couplings)
                         end
 
                         # Save the lattice vectors and image translations.
                         write(io, "lattice_A", Matrix{T}(crystal_results.lattice.direct))
-                        write(io, "image_translations_A",
-                              reduce(hcat, [image.translation for image in coherent_basis.images]))
+                        write(io, "tau_A",
+                              reduce(hcat, [image.tau for image in coherent_basis.images]))
                         write(io, "image_of", coherent_basis.image_of)
                         # Needed alongside image_of to read D's blocks back.
                         write(io, "transition_of", coherent_basis.transition_of)
 
-                        # Save everything needed to rebuild H(k), and hence E_Ψ(k) and C(k), at any k
-                        # later:
+                        # Save everything needed to rebuild H(k), and hence ΔE_n(k) and C(k), at any k
+                        # later, using the stored J_deltaR which includes the self subtraction under Ewald:
                         #
-                        #     H(k) = diag(E) + D + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
+                        #     H(k) = diag(ΔE_λ_i) + D + Σ_ΔR J_deltaR(ΔR) exp(i k . ΔR) + J_bar^LR(k).
                         if crystal_results.couplings !== nothing
                             couplings_group = create_group(io, "couplings")
                             write(couplings_group, "method", coupling_method)
-                            write(couplings_group, "cell_vectors", reduce(hcat, crystal_results.cells.vectors)) # Å.
+                            write(couplings_group, "Delta_R_A", reduce(hcat, crystal_results.cells.Delta_R)) # Å.
                             # The real-space sum over ΔR. Under "ewald" this is the short-range half
                             # alone, with the long-range self interaction already subtracted at ΔR = 0.
                             # Under "direct" it is the whole coupling, and there is no long_range group.
-                            write(couplings_group, "J_real_space_eV", crystal_results.couplings.values)
+                            write(couplings_group, "J_deltaR_eV", crystal_results.couplings.J_deltaR)
+                            HDF5.attributes(couplings_group["J_deltaR_eV"])["units"] = "eV"
 
                             if crystal_results.long_range !== nothing
                                 long_range = crystal_results.long_range
-                                # The reciprocal-space half, 𝒥^LR(k). It depends on k, so what is saved
+                                # The reciprocal-space half, J_bar^LR(k). It depends on k, so what is saved
                                 # is the ingredients that rebuild it rather than a table over ΔR.
                                 long_range_group = create_group(couplings_group, "long_range")
                                 write(long_range_group, "eta", crystal_results.ewald_parameters.eta) # Å^-1.
                                 # The Ewald truncation error, which is not the medium permittivity below.
-                                write(long_range_group, "epsilon", crystal_results.ewald_parameters.epsilon)
+                                write(long_range_group, "epsilon_tot", crystal_results.ewald_parameters.epsilon_tot)
                                 # The permittivity of the medium around the sample, scaling the Q = 0 term.
                                 write(long_range_group, "epsilon_b", long_range.epsilon_b)
                                 write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max) # Å.
@@ -1459,7 +1462,7 @@ function main()
                             for plane in crystal_results.band_planes
                                 (plane_axes, plane_energies) = crystal_results.band_maps[plane]
                                 plane_group = create_group(band_group, plane)
-                                write(plane_group, "energies_eV", plane_energies)
+                                write(plane_group, "Delta_E_eV", plane_energies)
                                 write(plane_group, "axis_a_keV", plane_axes[1])
                                 write(plane_group, "axis_b_keV", plane_axes[2])
                             end
@@ -1479,19 +1482,19 @@ function main()
                     conformer_rate_grids = Array{T, 2}[]
                     # Compute the rates for each conformer set (e.g. 1_A, 1_B, etc.)
                     for (set_idx, conformer_set) in enumerate(conformer_sets)
-                        transition_energies_eV = T.(conformer_results[conformer_set.label].transition_energies_eV)
-                        rate_grid = compute_rates_by_orientation(set_f_lm[set_idx], q_grid, m_grid, transition_energies_eV, N_rotations)
+                        Delta_E_eV = T.(conformer_results[conformer_set.label].Delta_E_eV)
+                        rate_grid = compute_rates_by_orientation(set_f_sq_lm[set_idx], q_grid, m_chi_grid, Delta_E_eV, N_rotations)
                         push!(conformer_rate_grids, rate_grid)
                     end
 
                     # Combine the sets into a total crystal rate grid.
-                    rate_results = combine_crystal_rate_grids(conformer_rate_grids, conformer_set_occupancies, m_grid)
+                    rate_results = combine_crystal_rate_grids(conformer_rate_grids, conformer_set_occupancies, m_chi_grid)
 
                     # Save the results to disk.
                     crystal_output_dir = joinpath(mol_output_dir, "crystal")
                     mkpath(crystal_output_dir)
 
-                    mchi_vals = T[row.mchi_MeV for row in rate_results]
+                    m_chi_vals = T[row.m_chi_MeV for row in rate_results]
                     rate_max_vals = T[row.rate_max for row in rate_results]
                     rate_min_vals = T[row.rate_min for row in rate_results]
                     rate_mean_vals = T[row.rate_mean for row in rate_results]
@@ -1501,7 +1504,7 @@ function main()
                     h5open(rates_h5_path, "w") do io
                         # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e and
                         # ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
-                        write(io, "mchi_MeV", mchi_vals)
+                        write(io, "m_chi_MeV", m_chi_vals)
                         write(io, "rate_max", rate_max_vals)
                         write(io, "rate_min", rate_min_vals)
                         write(io, "rate_mean", rate_mean_vals)
@@ -1526,7 +1529,7 @@ function main()
                 println("      φ ∈ [0, 2π] with $(N_phi) points.")
 
                 # Compute the spherical form factor.
-                R_tensor, f_s, f_lm, transition_energies_eV = compute_spherical_form_factor(
+                R_tensor, f_s, f_sq_lm, Delta_E_eV = compute_spherical_form_factor(
                     q_grid,
                     theta_grid,
                     phi_grid,
@@ -1538,18 +1541,18 @@ function main()
                     use_gpu=use_gpu,
                     need_grid=need_grid,
                     need_R=need_R,
-                    need_flm=need_flm
+                    need_f_sq_lm=need_f_sq_lm
                 )
 
                 rate_results = nothing
 
                 # Compute DM scattering rates if requested.
-                if compute_rates_flag && f_lm !== nothing
+                if compute_rates_flag && f_sq_lm !== nothing
                     m_vals_str = split(args["m-grid"], ",")
                     m_min = parse(Float64, m_vals_str[1])
                     m_max = parse(Float64, m_vals_str[2])
                     n_masses = parse(Int, m_vals_str[3])
-                    m_grid = T.(10 .^ range(log10(m_min), log10(m_max), n_masses))
+                    m_chi_grid = T.(10 .^ range(log10(m_min), log10(m_max), n_masses))
 
                     N_rotations_arg = args["N-rotations"]
                     N_rotations = if N_rotations_arg !== nothing
@@ -1559,7 +1562,7 @@ function main()
                         nothing
                     end
 
-                    rate_results = compute_rates(f_lm, q_grid, m_grid, T.(transition_energies_eV), N_rotations)
+                    rate_results = compute_rates(f_sq_lm, q_grid, m_chi_grid, T.(Delta_E_eV), N_rotations)
                 end
 
                 # Save the results to disk.
@@ -1569,7 +1572,7 @@ function main()
                     transition_output_dir = joinpath(mol_output_dir, "spherical", "transition_$(transition_idx)")
                     mkpath(transition_output_dir)
 
-                    transition_energy = transition_energies_eV[batch_idx]
+                    transition_energy = Delta_E_eV[batch_idx]
 
                     # Save to HDF5.
                     output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
@@ -1577,6 +1580,7 @@ function main()
                         if f_s !== nothing
                             f_s_slice = f_s[batch_idx, :, :, :]
                             write(io, "f_s", f_s_slice)
+                            HDF5.attributes(io["f_s"])["units"] = "dimensionless"
                             write(io, "theta_grid", theta_grid) # Radians.
                             write(io, "phi_grid", phi_grid) # Radians.
                         end
@@ -1584,13 +1588,14 @@ function main()
                             R_slice = R_tensor[batch_idx, :, :]
                             write(io, "R_tensor", R_slice)
                         end
-                        if f_lm !== nothing
-                            f_lm_slice = f_lm[batch_idx, :, :]
-                            write(io, "f_lm", f_lm_slice)
+                        if f_sq_lm !== nothing
+                            f_sq_lm_slice = f_sq_lm[batch_idx, :, :]
+                            write(io, "f_sq_lm", f_sq_lm_slice)
+                            HDF5.attributes(io["f_sq_lm"])["units"] = "dimensionless"
                         end
                         write(io, "q_grid", q_grid) # keV.
                         write(io, "transition_index", transition_idx)
-                        write(io, "transition_energy_eV", transition_energy)
+                        write(io, "Delta_E_eV", transition_energy)
                     end
                 end
 
@@ -1598,7 +1603,7 @@ function main()
                     spherical_output_dir = joinpath(mol_output_dir, "spherical")
                     mkpath(spherical_output_dir)
 
-                    mchi_vals = T[row.mchi_MeV for row in rate_results]
+                    m_chi_vals = T[row.m_chi_MeV for row in rate_results]
                     rate_max_vals = T[row.rate_max for row in rate_results]
                     rate_min_vals = T[row.rate_min for row in rate_results]
                     rate_mean_vals = T[row.rate_mean for row in rate_results]
@@ -1608,7 +1613,7 @@ function main()
                     h5open(rates_h5_path, "w") do io
                         # These are the raw VSDM rates, so they need multiplying by N_cell, σ̄_e and
                         # ρ_χ to become a physical rate. Masses are in MeV, qmax_keV in keV.
-                        write(io, "mchi_MeV", mchi_vals)
+                        write(io, "m_chi_MeV", m_chi_vals)
                         write(io, "rate_max", rate_max_vals)
                         write(io, "rate_min", rate_min_vals)
                         write(io, "rate_mean", rate_mean_vals)
@@ -1642,7 +1647,7 @@ function main()
             println("      qz ∈ [$(qz_grid[1]), $(qz_grid[end])] keV with $(N_qz) points.")
 
             # Compute the FFT form factor.
-            form_factors, transition_densities, r_lim, transition_energies_eV = compute_fft_form_factor(
+            form_factors, transition_densities, r_lim, Delta_E_eV = compute_fft_form_factor(
                 qx_grid,
                 qy_grid,
                 qz_grid,
@@ -1659,18 +1664,19 @@ function main()
 
                 form_factor = form_factors[batch_idx, :, :, :]
                 transition_density = transition_densities[batch_idx, :, :, :]
-                transition_energy_eV = transition_energies_eV[batch_idx]
+                transition_energy = Delta_E_eV[batch_idx]
 
                 output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
                 h5open(output_path, "w") do io
                     write(io, "form_factor", form_factor)
                     write(io, "transition_density", transition_density) # Å^-3.
+                    HDF5.attributes(io["transition_density"])["units"] = "angstrom^-3"
                     write(io, "qx_grid", qx_grid) # keV.
                     write(io, "qy_grid", qy_grid) # keV.
                     write(io, "qz_grid", qz_grid) # keV.
                     write(io, "r_lim", r_lim) # Å.
                     write(io, "transition_index", transition_idx)
-                    write(io, "transition_energy_eV", transition_energy_eV)
+                    write(io, "Delta_E_eV", transition_energy)
                 end
             end
         elseif method == "cartesian"
@@ -1712,7 +1718,7 @@ function main()
             println("      qz ∈ [$(qz_grid[1]), $(qz_grid[end])] keV with $(N_qz) points.")
 
             # Compute the Cartesian form factor.
-            V_tensors, form_factor, transition_energies_eV = compute_cartesian_form_factor(
+            V_tensors, form_factor, Delta_E_eV = compute_cartesian_form_factor(
                 qx_grid,
                 qy_grid,
                 qz_grid,
@@ -1729,7 +1735,7 @@ function main()
                 transition_output_dir = joinpath(mol_output_dir, "cartesian", "transition_$(transition_idx)")
                 mkpath(transition_output_dir)
 
-                transition_energy = transition_energies_eV[batch_idx]
+                transition_energy = Delta_E_eV[batch_idx]
 
                 output_path = joinpath(transition_output_dir, "fs_grid$(type_suffix).h5")
                 h5open(output_path, "w") do io
@@ -1747,7 +1753,7 @@ function main()
                     write(io, "qy_grid", qy_grid) # keV.
                     write(io, "qz_grid", qz_grid) # keV.
                     write(io, "transition_index", transition_idx)
-                    write(io, "transition_energy_eV", transition_energy)
+                    write(io, "Delta_E_eV", transition_energy)
                 end
             end
         else

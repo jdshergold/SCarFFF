@@ -241,19 +241,19 @@ function compute_oscillator_strength(h5_file_path::String, q_max_fit::Real; meth
     # Load the form factor and momentum grid from the HDF5 file.
     method = lowercase(method)
 
-    transition_energy_eV = zero(Float64)
+    Delta_E_eV = zero(Float64)
     T = Float64
     f_s_sq_av = Float64[]
     q_subset = Float64[]
 
     if method == "spherical"
-        f_s, q_grid, theta_grid, phi_grid, transition_energy_eV = h5open(h5_file_path, "r") do io
+        f_s, q_grid, theta_grid, phi_grid, Delta_E_eV = h5open(h5_file_path, "r") do io
             (
                 read(io, "f_s"),
                 read(io, "q_grid"),
                 read(io, "theta_grid"),
                 read(io, "phi_grid"),
-                read(io, "transition_energy_eV")
+                read(io, "Delta_E_eV")
             )
         end
 
@@ -286,13 +286,13 @@ function compute_oscillator_strength(h5_file_path::String, q_max_fit::Real; meth
         f_s_sq_av = perform_angular_average(f_s_sq_subset, theta_grid, phi_grid)
 
     elseif method == "fft" || method == "cartesian"
-        form_factor, qx_grid, qy_grid, qz_grid, transition_energy_eV = h5open(h5_file_path, "r") do io
+        form_factor, qx_grid, qy_grid, qz_grid, Delta_E_eV = h5open(h5_file_path, "r") do io
             (
                 read(io, "form_factor"),
                 read(io, "qx_grid"),
                 read(io, "qy_grid"),
                 read(io, "qz_grid"),
-                read(io, "transition_energy_eV")
+                read(io, "Delta_E_eV")
             )
         end
 
@@ -312,7 +312,7 @@ function compute_oscillator_strength(h5_file_path::String, q_max_fit::Real; meth
     mu_sq_o3 = compute_transition_dipole_moment(f_s_sq_av, q_subset) # Includes the 1/3 factor.
 
     # Construct the oscillator strength from what we have.
-    transition_energy_keV = T(transition_energy_eV) * T(0.001)
+    transition_energy_keV = T(Delta_E_eV) * T(0.001)
     f_osc = T(2.0) * T(ELECTRON_MASS_KEV) * transition_energy_keV * mu_sq_o3
     return f_osc
 end

@@ -12,6 +12,8 @@ from matplotlib.colors import SymLogNorm
 import numpy as np
 import warnings
 
+from plot_quantities import crystal_grid_key, crystal_group_grid, crystal_quantity_label, read_structure_function
+
 
 # Suppress monotonic grid warnings from pcolormesh when plotting warped grids.
 # These are really annoying.
@@ -20,11 +22,6 @@ warnings.filterwarnings(
     message="The input coordinates to pcolormesh are interpreted as cell centers",
     category=UserWarning,
 )
-
-# Ensure that trapz is defined, so that all versions of numpy are compatible.
-if not hasattr(np, 'trapz'):
-    np.trapz = getattr(np, 'trapezoid', None)
-
 
 # Crystal state grouping. We group by n_mols * n_degenerate, so e.g. a 4 molecule cell with
 # 3 degenerate states per monomer would e.g. have 12 states grouped into one for plotting.
@@ -52,14 +49,14 @@ def cluster_monomer_transitions(monomer_energies, threshold):
     return clusters
 
 
-def build_state_groups(monomer_energies, n_cell, threshold, group_size=0):
+def build_state_groups(monomer_energies, n_states_per_transition, threshold, group_size=0):
     """
     Work out which crystal states belong in each plotting group.
 
     # Arguments:
     - monomer_energies::np.ndarray: The monomer transition energies in eV.
-    - n_cell::int: The number of molecules in the unit cell, which is how many crystal states each
-      monomer transition gives rise to.
+    - n_states_per_transition::int: The number of stored states per monomer transition. In the coherent case this is
+      the number of molecular images, which is how many bands each monomer transition gives rise to.
     - threshold::float: Degeneracy threshold in eV, used when group_size is not given.
     - group_size::int: A fixed number of states per group, overriding the clustering. Zero uses the
       clustering, and one gives a group per state.
@@ -69,19 +66,19 @@ def build_state_groups(monomer_energies, n_cell, threshold, group_size=0):
     - list[int]: How many monomer transitions each group covers.
     """
 
-    n_states = n_cell * len(monomer_energies)
+    n_states = n_states_per_transition * len(monomer_energies)
 
     if group_size > 0:
         if n_states % group_size:
             raise ValueError(f"{n_states} states do not divide into groups of {group_size}.")
         bounds = [(start, start + group_size) for start in range(0, n_states, group_size)]
-        return bounds, [group_size / n_cell] * len(bounds)
+        return bounds, [group_size / n_states_per_transition] * len(bounds)
 
     bounds = []
     degeneracies = []
     start = 0
     for cluster in cluster_monomer_transitions(monomer_energies, threshold):
-        size = n_cell * len(cluster)
+        size = n_states_per_transition * len(cluster)
         bounds.append((start, start + size))
         degeneracies.append(len(cluster))
         start += size
@@ -89,7 +86,7 @@ def build_state_groups(monomer_energies, n_cell, threshold, group_size=0):
     return bounds, degeneracies
 
 
-def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean):
+def describe_groups(bounds, degeneracies, n_states_per_transition, band_min, band_max, band_mean):
     """
     Build a human readable summary of the grouping, and say which boundaries can still be crossed.
 
@@ -100,7 +97,7 @@ def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean)
     # Arguments:
     - bounds::list[tuple[int, int]]: The state index range of each group.
     - degeneracies::list[int]: Monomer transitions covered by each group.
-    - n_cell::int: Molecules per unit cell.
+    - n_states_per_transition::int: Molecules per unit cell.
     - band_min::np.ndarray: Per state minimum band energy in eV.
     - band_max::np.ndarray: Per state maximum band energy in eV.
     - band_mean::np.ndarray: Per state mean band energy in eV.
@@ -109,7 +106,7 @@ def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean)
     - list[str]: Lines describing the grouping.
     """
 
-    lines = [f"{len(bounds)} groups from {n_cell} molecules per cell:"]
+    lines = [f"{len(bounds)} groups from {n_states_per_transition} molecules per cell:"]
     lows = [band_min[first:last].min() for first, last in bounds]
     highs = [band_max[first:last].max() for first, last in bounds]
 
@@ -132,12 +129,12 @@ def describe_groups(bounds, degeneracies, n_cell, band_min, band_max, band_mean)
 
 
 
-def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
+def plot_structure_factor(crystal_path, output_dir, top_n=8, dpi=200):
     """
-    Draw the structure function f^2_{lm}(q, E) over the (q, dE) plane, one panel per mode.
+    Draw S_{ell m}(q,E), including 2π/V_cell, over the (q,E) plane, one panel per mode.
 
     # Arguments:
-    - coherent_path::Path: The crystal HDF5, carrying structure_factor_f_lm and energy_grid_eV.
+    - crystal_path::Path: The crystal HDF5, carrying S_lm and E_grid_eV.
     - output_dir::Path: Directory to write the figure into.
     - top_n::int: How many of the dominant (l, m) modes to draw beside the monopole.
     - dpi::int: Figure resolution.
@@ -146,18 +143,16 @@ def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
     - None.
     """
 
-    with h5py.File(coherent_path, "r") as crystal_file:
+    with h5py.File(crystal_path, "r") as crystal_file:
         # Julia writes (n_energy, n_q, n_keys), and HDF5 reverses it.
-        structure_factor = np.array(crystal_file["structure_factor_f_lm"]).T
-        energy_grid = crystal_file["energy_grid_eV"][()]
-        q_grid = crystal_file["q_grid"][()]
+        structure_factor, energy_grid, q_grid = read_structure_function(crystal_file)
 
     # Compute the step size.
     step = (energy_grid[-1] - energy_grid[0]) / (len(energy_grid) - 1)
 
     # Use the same top modes as the energy-independent form factor, since their integrated weight should be the same.
     integrated = structure_factor.sum(axis=0) * step
-    modes = [mode for mode in get_top_flm_modes(integrated, q_grid, top_n=top_n + 1)
+    modes = [mode for mode in get_top_f_sq_lm_modes(integrated, q_grid, top_n=top_n + 1)
              if mode != (0, 0)][:top_n]
 
     # Always plot the isotropic mode first.
@@ -167,7 +162,6 @@ def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
 
     figure, axes = plt.subplots(n_rows, n_columns, figsize=(4.6 * n_columns, 3.6 * n_rows),
                                 squeeze=False, sharex=True, sharey=True, layout="constrained")
-    extent = [q_grid[0], q_grid[-1], energy_grid[0], energy_grid[-1]]
 
     # Use the same scale for all modes, to makew them easier to compare.
     limit = max(np.abs(structure_factor[:, :, l * l + (l + m)]).max() for l, m in panels) or 1.0
@@ -177,13 +171,13 @@ def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
     for index, (l, m) in enumerate(panels):
         row, column = divmod(index, n_columns)
         axis = axes[row][column]
-        image = axis.imshow(structure_factor[:, :, l * l + (l + m)], origin="lower", extent=extent,
-                            aspect="auto", cmap="RdBu_r", norm=norm)
+        image = axis.pcolormesh(q_grid, energy_grid, structure_factor[:, :, l * l + (l + m)],
+                                shading="nearest", cmap="RdBu_r", norm=norm)
         axis.set_title(rf"$\ell = {l},\ m = {m}$")
         if row == n_rows - 1:
             axis.set_xlabel(r"$q$ (keV)")
         if column == 0:
-            axis.set_ylabel(r"$\Delta E$ (eV)")
+            axis.set_ylabel(r"$E$ (eV)")
 
     # Any panels left over on the last row would otherwise render as empty axes.
     for index in range(len(panels), n_rows * n_columns):
@@ -191,19 +185,19 @@ def plot_structure_factor(coherent_path, output_dir, top_n=8, dpi=200):
         axes[row][column].axis("off")
 
     figure.colorbar(image, ax=axes, shrink=0.6,
-                    label=r"$f^2_{\ell m}(q, \Delta E)\,[\mathrm{eV}^{-1}]$")
+                    label=r"$S_{\ell m}(q,E)$ [Å$^{-3}$ eV$^{-1}$]")
     output_dir.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_dir / "structure_factor_qE.png", dpi=dpi, bbox_inches="tight")
     plt.close(figure)
 
 
-def plot_band_energies(coherent_path, output_dir, dpi=200):
+def plot_band_energies(crystal_path, output_dir, dpi=200):
     """
-    Draw E_Psi(k) over the sampled Brillouin zone planes, one figure per crystal state.
+    Draw ΔE_n(k) over the sampled Brillouin zone planes, one figure per crystal state.
     Points outside the zone are NaN and render blank, which will happen for some space groups.
 
     # Arguments:
-    - coherent_path::Path: The coherent crystal HDF5, carrying the maps in its band_map group.
+    - crystal_path::Path: The coherent crystal HDF5, carrying the maps in its band_map group.
     - output_dir::Path: Directory to write the per state figures into.
     - dpi::int: Figure resolution.
 
@@ -213,13 +207,13 @@ def plot_band_energies(coherent_path, output_dir, dpi=200):
 
     labels = {"xy": ("k_x", "k_y"), "xz": ("k_x", "k_z"), "yz": ("k_y", "k_z")}
 
-    with h5py.File(coherent_path, "r") as coherent_file:
-        band_group = coherent_file["band_map"]
+    with h5py.File(crystal_path, "r") as crystal_file:
+        band_group = crystal_file["band_map"]
         planes = [p.decode() if isinstance(p, bytes) else p for p in band_group["planes"][()]]
         maps = {}
         for plane in planes:
             # Julia writes (n_states, n_a, n_b); HDF5 reverses it, so transpose back.
-            maps[plane] = (np.array(band_group[plane]["energies_eV"]).T,
+            maps[plane] = (np.array(band_group[plane]["Delta_E_eV"]).T,
                            band_group[plane]["axis_a_keV"][()],
                            band_group[plane]["axis_b_keV"][()])
 
@@ -232,15 +226,14 @@ def plot_band_energies(coherent_path, output_dir, dpi=200):
         for plane_index, plane in enumerate(planes):
             energies, axis_a, axis_b = maps[plane]
             axis = axes[0, plane_index]
-            image = axis.imshow(energies[state].T, origin="lower",
-                                extent=[axis_a[0], axis_a[-1], axis_b[0], axis_b[-1]],
-                                aspect="auto", cmap="viridis")
+            image = axis.pcolormesh(axis_a, axis_b, energies[state].T,
+                                    shading="nearest", cmap="viridis")
             first_label, second_label = labels[plane]
             axis.set_xlabel(rf"${first_label}$ (keV)")
             axis.set_ylabel(rf"${second_label}$ (keV)")
-            figure.colorbar(image, ax=axis, label=r"$E_\Psi\,[\mathrm{eV}]$")
+            figure.colorbar(image, ax=axis, label=r"$\Delta E_n(\mathbf{k})\,[\mathrm{eV}]$")
 
-        figure.suptitle(rf"Frenkel exciton band $\Psi_{{{state + 1}}}$ over the first Brillouin zone")
+        figure.suptitle(rf"Frenkel exciton band $n={state + 1}$ over the first Brillouin zone")
         figure.tight_layout()
         figure.savefig(output_dir / f"state_{state + 1:02d}.png", dpi=dpi, bbox_inches="tight")
         plt.close(figure)
@@ -356,7 +349,7 @@ def parse_cli_args():
         help="Whether to plot the transition density (FFT method only).",
     )
     parser.add_argument(
-        "--plot-flm-modes",
+        "--plot-f-sq-lm-modes",
         action="store_true",
         help="Whether to plot dominant f^2_{lm}(q) modes (spherical method only).",
     )
@@ -440,54 +433,55 @@ def parse_cli_args():
     )
 
     # A crystal run puts everything in one file, named based on whatever method was used.
-    parsed_args.coherent = False
-    parsed_args.coherent_path = None
+    parsed_args.crystal = False
+    parsed_args.crystal_path = None
     parsed_args.crystal_order = None
     if parsed_args.crystal_mode:
-        for candidate in ["crystal_f_lm_f64.h5", "crystal_f_lm_f32.h5"]:
+        for candidate in ["crystal_form_factors_f64.h5", "crystal_form_factors_f32.h5"]:
             path = parsed_args.results_root / candidate
             if path.exists():
-                parsed_args.coherent_path = path
+                parsed_args.crystal_path = path
                 break
 
-    if parsed_args.coherent_path is not None:
-        with h5py.File(parsed_args.coherent_path, "r") as order_file:
-            order = order_file["crystal_order"][()] if "crystal_order" in order_file else b"coherent"
+    if parsed_args.crystal_path is not None:
+        with h5py.File(parsed_args.crystal_path, "r") as order_file:
+            order = order_file["crystal_order"][()]
         parsed_args.crystal_order = order.decode() if isinstance(order, bytes) else str(order)
-        parsed_args.coherent = True
+        parsed_args.crystal = True
 
-        with h5py.File(parsed_args.coherent_path, "r") as coherent_file:
-            # f_s is only written when the form factor itself was asked for, whereas state_f_lm
-            # always is, so take the state count from state_f_lm and note whether there is a grid
+        with h5py.File(parsed_args.crystal_path, "r") as crystal_file:
+            # f_s is only written when the form factor itself was asked for, whereas state_f_sq_lm
+            # always is, so take the state count from state_f_sq_lm and note whether there is a grid
             # to slice at all. Without one the bands can still be drawn.
-            parsed_args.has_grid = "f_s" in coherent_file
-            n_states = coherent_file["state_f_lm"].shape[2]
-            n_transitions = coherent_file["transition_indices"].shape[0]
-            parsed_args.n_molecules = len(np.unique(coherent_file["image_of"][()]))
-            localised = coherent_file["localised_energies_eV"][()]
+            parsed_args.has_grid = any(key in crystal_file for key in ("f_uc", "I_uc"))
+            parsed_args.original_transitions = crystal_file["transition_indices"][()]
+            n_states = crystal_file["f_sq_lm"].shape[2]
+            n_transitions = crystal_file["transition_indices"].shape[0]
+            parsed_args.n_molecules = len(np.unique(crystal_file["image_of"][()]))
+            localised = crystal_file["Delta_E_monomer_eV"][()]
             # Band statistics exist only for the coherent order, since the incoherent has no bands.
-            has_bands = "band_energy_mean_eV" in coherent_file
-            band_min = coherent_file["band_energy_min_eV"][()] if has_bands else None
-            band_max = coherent_file["band_energy_max_eV"][()] if has_bands else None
-            band_mean = coherent_file["band_energy_mean_eV"][()] if has_bands else None
+            has_bands = "Delta_E_band_mean_eV" in crystal_file
+            band_min = crystal_file["Delta_E_band_min_eV"][()] if has_bands else None
+            band_max = crystal_file["Delta_E_band_max_eV"][()] if has_bands else None
+            band_mean = crystal_file["Delta_E_band_mean_eV"][()] if has_bands else None
 
-        # Coherent groups run over crystal states, so each monomer transition contributes n_cell of
-        # them; incoherent groups run over the monomer transitions themselves, so n_cell is 1 and the
+        # Coherent groups run over crystal states, so each monomer transition contributes n_states_per_transition of
+        # them; incoherent groups run over the monomer transitions themselves, so n_states_per_transition is 1 and the
         # same clustering gives one group per degenerate manifold either way.
-        n_cell = n_states // n_transitions
+        n_states_per_transition = n_states // n_transitions
         if parsed_args.group_states or parsed_args.group_size > 0:
             # The basis runs over transitions fastest, so the first block of localised energies is
             # the monomer transition energies.
             monomer_energies = localised[:n_transitions]
             try:
                 parsed_args.group_bounds, degeneracies = build_state_groups(
-                    monomer_energies, n_cell, parsed_args.degeneracy_threshold,
+                    monomer_energies, n_states_per_transition, parsed_args.degeneracy_threshold,
                     group_size=parsed_args.group_size)
             except ValueError as error:
                 print(error)
                 sys.exit(1)
             if has_bands:
-                for line in describe_groups(parsed_args.group_bounds, degeneracies, n_cell,
+                for line in describe_groups(parsed_args.group_bounds, degeneracies, n_states_per_transition,
                                             band_min, band_max, band_mean):
                     print(line)
             else:
@@ -511,13 +505,36 @@ def parse_cli_args():
 
         # Summing |f|^2 over a group discards the phase, so the signed modes have nothing to show.
         grouped = any(last - first > 1 for first, last in parsed_args.group_bounds)
-        if grouped and any(m != "modsq" for m in parsed_args.modes):
-            print("Grouped crystal plots sum |f|^2, so only --modes modsq is available; "
-                  "drop --group-states for the signed modes.")
+        if (grouped or parsed_args.crystal_order == "incoherent") and any(m != "modsq" for m in parsed_args.modes):
+            print("Crystal intensity plots average |f|^2, so only --modes modsq is available; "
+                  "signed modes need a single coherent band (--group-size 1).")
             sys.exit(1)
         parsed_args.grouped = grouped
 
     return parsed_args
+
+
+def angular_slice(data, grid, angle, axis):
+    """
+    Interpolate a spherical grid to the angle defining a Cartesian plane.
+
+    # Arguments:
+    - data::np.ndarray: The spherical grid values.
+    - grid::np.ndarray: The sampled angles, in radians.
+    - angle::float: The angle to evaluate, in radians.
+    - axis::int: The angular axis in data.
+
+    # Returns:
+    - np.ndarray: The values at the requested angle.
+    """
+    upper = int(np.searchsorted(grid, angle))
+    if upper < len(grid) and np.isclose(grid[upper], angle, rtol=0, atol=1e-12):
+        return np.take(data, upper, axis=axis)
+    if upper == 0 or upper == len(grid):
+        raise ValueError("The requested plane is outside the angular grid.")
+    lower = upper - 1
+    weight = (angle - grid[lower]) / (grid[upper] - grid[lower])
+    return (1 - weight) * np.take(data, lower, axis=axis) + weight * np.take(data, upper, axis=axis)
 
 
 def extract_plane_data_spherical(f_s, theta_grid, phi_grid, q_grid, plane):
@@ -546,10 +563,13 @@ def extract_plane_data_spherical(f_s, theta_grid, phi_grid, q_grid, plane):
     else:
         f_s_trimmed = f_s
 
+    # Close the periodic grid so the slices cover every azimuth, including the seam.
+    phi = np.append(phi, phi[0] + 2 * np.pi)
+    f_s_trimmed = np.concatenate((f_s_trimmed, f_s_trimmed[:, :1, :]), axis=1)
+
     if plane == "xy":
-        # In the q_z = 0 plane, theta = pi/2.
-        theta_idx = int(np.abs(theta_grid - np.pi / 2).argmin())
-        plane_data = f_s_trimmed[theta_idx, :, :]
+        # Interpolate to theta = pi/2 if the grid does not contain it exactly.
+        plane_data = angular_slice(f_s_trimmed, theta_grid, np.pi / 2, axis=0)
 
         # Convert to Cartesian coordinates.
         q_mesh, phi_mesh = np.meshgrid(q_grid, phi, indexing="xy")
@@ -560,11 +580,8 @@ def extract_plane_data_spherical(f_s, theta_grid, phi_grid, q_grid, plane):
 
     elif plane == "xz":
         # In the q_y = 0 plane, we need both phi = 0 (corresponding to x > 0) and phi = pi (corresponding to x < 0).
-        phi0_idx = int(np.abs(phi - 0.0).argmin())
-        phiPi_idx = int(np.abs(phi - np.pi).argmin())
-
-        plane_phi0 = f_s_trimmed[:, phi0_idx, :]
-        plane_phiPi = f_s_trimmed[:, phiPi_idx, :]
+        plane_phi0 = angular_slice(f_s_trimmed, phi, 0.0, axis=1)
+        plane_phiPi = angular_slice(f_s_trimmed, phi, np.pi, axis=1)
 
         # Convert to Cartesian coordinates.
         q_mesh, theta_mesh = np.meshgrid(q_grid, theta_grid, indexing="xy")
@@ -588,11 +605,8 @@ def extract_plane_data_spherical(f_s, theta_grid, phi_grid, q_grid, plane):
 
     elif plane == "yz":
         # In the q_x = 0 plane, we need both phi = pi/2 (corresponding to y > 0) and phi = 3pi/2 (corresponding to y < 0).
-        phiPi2_idx = int(np.abs(phi - np.pi / 2).argmin())
-        phi3Pi2_idx = int(np.abs(phi - 3 * np.pi / 2).argmin())
-
-        plane_phiPi2 = f_s_trimmed[:, phiPi2_idx, :]
-        plane_phi3Pi2 = f_s_trimmed[:, phi3Pi2_idx, :]
+        plane_phiPi2 = angular_slice(f_s_trimmed, phi, np.pi / 2, axis=1)
+        plane_phi3Pi2 = angular_slice(f_s_trimmed, phi, 3 * np.pi / 2, axis=1)
 
         # Convert to Cartesian coordinates.
         q_mesh, theta_mesh = np.meshgrid(q_grid, theta_grid, indexing="xy")
@@ -629,7 +643,7 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
 
     # Arguments:
     - data_3d::np.ndarray: The 3D array of values on Cartesian grid.
-    - coord_lim::np.ndarray: The coordinate limits [x_max, y_max, z_max].
+    - coord_lim::tuple or np.ndarray: The saved momentum axes, or the FFT real-space half widths.
     - plane::str: Which plane to plot. One of "xy", "xz", or "yz".
     - coord_type::str: Type of coordinates, this is "q" for momentum space, or "r" for real space.
 
@@ -640,14 +654,16 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
     - label1::str: The axis label for first coordinate.
     - label2::str: The axis label for second coordinate.
     """
-    # The data has shape (nx, ny, nz) with coordinates from -coord_lim to +coord_lim.
     nx, ny, nz = data_3d.shape
-    
-    # Create the coordinate arrays.
-    x_coords = np.linspace(-coord_lim[0], coord_lim[0], nx)
-    y_coords = np.linspace(-coord_lim[1], coord_lim[1], ny)
-    z_coords = np.linspace(-coord_lim[2], coord_lim[2], nz)
-    
+
+    # Momentum axes come from the saved grids. The FFT spatial grid excludes its upper endpoint.
+    if coord_type == "q":
+        x_coords, y_coords, z_coords = coord_lim
+    else:
+        x_coords = np.linspace(-coord_lim[0], coord_lim[0], nx, endpoint=False)
+        y_coords = np.linspace(-coord_lim[1], coord_lim[1], ny, endpoint=False)
+        z_coords = np.linspace(-coord_lim[2], coord_lim[2], nz, endpoint=False)
+
     # Set up the axis labels based on coordinate type.
     if coord_type == "q":
         x_label = r"$q_x\ \mathrm{[keV]}$"
@@ -660,7 +676,7 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
     
     if plane == "xy":
         # Extract the slice at z = 0.
-        z_idx = nz // 2
+        z_idx = int(np.argmin(np.abs(z_coords)))
         plane_data = data_3d[:, :, z_idx]
         
         # Create the meshgrids for plotting.
@@ -670,7 +686,7 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
         
     elif plane == "xz":
         # Extract the slice at y = 0.
-        y_idx = ny // 2
+        y_idx = int(np.argmin(np.abs(y_coords)))
         plane_data = data_3d[:, y_idx, :]
         
         # Create the meshgrids for plotting.
@@ -680,7 +696,7 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
         
     elif plane == "yz":
         # Extract the slice at x = 0.
-        x_idx = nx // 2
+        x_idx = int(np.argmin(np.abs(x_coords)))
         plane_data = data_3d[x_idx, :, :]
         
         # Create the meshgrids for plotting.
@@ -696,13 +712,14 @@ def extract_plane_data_cartesian(data_3d, coord_lim, plane, coord_type="q"):
     return plane_data, coord1, coord2, label1, label2
 
 
-def extract_domain_data(data, mode, already_squared=False):
+def extract_domain_data(data, mode, already_squared=False, is_transition_density=False):
     """
     Get the correct data to plot based on the selected mode.
 
     # Arguments:
     - data::np.ndarray: Array of form factor or transition density values.
     - mode::str: What to plot for form factors. Should be one of "modsq", "Im", or "Re". This is ignored for transition density.
+    - is_transition_density::bool: Whether the data is a real-space transition density.
     - already_squared::bool: Whether the data is already |f|^2, which it is when crystal states have
       been summed over a group, since the sum has to happen after squaring.
 
@@ -715,15 +732,14 @@ def extract_domain_data(data, mode, already_squared=False):
     # A summed group is real but is still a form factor, so it must not fall through to the
     # transition density branch below.
     if already_squared:
-        return data, r"$\sum_{\Psi \in g} |f_s(\mathbf{q})|^2$", "viridis", False
+        if mode != "modsq":
+            raise ValueError("An intensity has no Re or Im amplitude; select modsq.")
+        return data, r"Mean intensity", "viridis", False
 
-    # Check if the data is complex (form factor) or real (transition density).
-    is_complex = np.iscomplexobj(data)
-    
-    if not is_complex:
+    if is_transition_density:
         # We just plot the transition density directly.
         plot_data = data
-        label = r"$\rho(\mathbf{r})\ [\mathrm{\AA^{-3}}]$"
+        label = r"$\Phi^{g\to s}(\mathbf{r})$ [Å$^{-3}$]"
         cmap = "RdBu_r"
         symmetric = True
     else:
@@ -751,7 +767,7 @@ def extract_domain_data(data, mode, already_squared=False):
     return plot_data, label, cmap, symmetric
 
 
-def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=None):
+def apply_plot_limits(coord1, coord2, plane_data, args, plane, momentum_space=True):
     """
     Apply the plot range limits specified in args.
     
@@ -761,8 +777,7 @@ def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=N
     - plane_data::np.ndarray: Data to plot.
     - args::argparse.Namespace: Command line arguments.
     - plane::str: Which plane is being plotted.
-    - data_is_complex::bool or None: Whether the underlying data is complex-valued.
-      If None, this is inferred from plane_data.
+    - momentum_space::bool: Whether the coordinates are momenta rather than positions.
     
     # Returns:
     - coord1_limited::np.ndarray: Limited first coordinate meshgrid.
@@ -771,14 +786,8 @@ def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=N
     - xlim::tuple: x-axis limits for plotting.
     - ylim::tuple: y-axis limits for plotting.
     """
-    # Check if the data is complex (form factor) or real (transition density).
-    if data_is_complex is None:
-        is_complex = np.iscomplexobj(plane_data)
-    else:
-        is_complex = data_is_complex
-    
-    # Determine which coordinates correspond to which axes for this plane.
-    if not is_complex:
+    # Pick the limits from the physical coordinates, including real-valued intensities.
+    if not momentum_space:
         # Use real-space coordinates (x, y, z) for the transition density.
         if plane == "xy":
             coord1_min, coord1_max = args.x_min, args.x_max
@@ -851,29 +860,29 @@ def apply_plot_limits(coord1, coord2, plane_data, args, plane, data_is_complex=N
     return coord1, coord2, plane_data, xlim, ylim
 
 
-def get_top_flm_modes(f_lm, q_grid, top_n=8):
+def get_top_f_sq_lm_modes(f_sq_lm, q_grid, top_n=8):
     """
     Get the dominant f^2_{lm}(q) modes ranked by integrated absolute area.
 
     # Arguments:
-    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - f_sq_lm::np.ndarray: The f_sq_lm tensor with shape (n_q, n_keys).
     - q_grid::np.ndarray: The |q| grid in keV.
     - top_n::int: Number of top modes to return (default: 8).
 
     # Returns:
     - top_modes::list: The dominant (l, m) modes.
     """
-    n_keys = f_lm.shape[1]
+    n_keys = f_sq_lm.shape[1]
     l_max = int(np.sqrt(n_keys)) - 1
     areas = {}
     for l in range(l_max + 1):
         for m in range(-l, l + 1):
             key = l * l + (l + m) + 1
-            areas[(l, m)] = np.trapz(np.abs(f_lm[:, key - 1]), q_grid)
+            areas[(l, m)] = np.trapezoid(np.abs(f_sq_lm[:, key - 1]), q_grid)
     top_modes = sorted(areas, key=areas.get, reverse=True)[:top_n]
     return top_modes
 
-def build_flm_style_map(modes):
+def build_f_sq_lm_style_map(modes):
     """
     Build a consistent line-style map for a collection of f^2_{lm}(q) modes.
     This ensures that modes keep a consistent style between individual conformers and crystal averages. 
@@ -897,14 +906,14 @@ def build_flm_style_map(modes):
     return style_map
 
 
-def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_map=None,
+def plot_f_sq_lm_panel(ax, f_sq_lm, q_grid, title=None, top_n=8, top_modes=None, style_map=None,
                    ylabel=None):
     """
     Plot the top N f^2_{lm}(q) modes on a single set of axes.
 
     # Arguments:
     - ax::matplotlib.axes.Axes: The axes to plot on.
-    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - f_sq_lm::np.ndarray: The f_sq_lm tensor with shape (n_q, n_keys).
     - q_grid::np.ndarray: The |q| grid in keV.
     - title::str or None: Optional panel title.
     - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
@@ -914,16 +923,16 @@ def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_
     """
     # Find the top modes if not provided.
     if top_modes is None:
-        top_modes = get_top_flm_modes(f_lm, q_grid, top_n=top_n)
+        top_modes = get_top_f_sq_lm_modes(f_sq_lm, q_grid, top_n=top_n)
     if style_map is None:
-        style_map = build_flm_style_map(top_modes)
+        style_map = build_f_sq_lm_style_map(top_modes)
 
     # Plot each of the top modes.
     for l, m in sorted(top_modes):
         key = l * l + (l + m) + 1
         style = style_map[(l, m)]
         label = rf"$({l},\,{m})$"
-        ax.plot(q_grid, f_lm[:, key - 1], lw=1.2, ls=style["linestyle"], color=style["color"], label=label)
+        ax.plot(q_grid, f_sq_lm[:, key - 1], lw=1.2, ls=style["linestyle"], color=style["color"], label=label)
 
     ax.axhline(0, color="k", lw=0.8, ls="--")
     ax.set_xlabel(r"$q\ [\mathrm{keV}]$")
@@ -934,34 +943,34 @@ def plot_flm_panel(ax, f_lm, q_grid, title=None, top_n=8, top_modes=None, style_
         ax.set_title(title)
 
 
-def plot_flm_modes(f_lm, q_grid, output_dir, top_n=8, ylabel=None):
+def plot_f_sq_lm_modes(f_sq_lm, q_grid, output_dir, top_n=8, ylabel=None):
     """
     Plot the top N f^2_{lm}(q) modes by integrated absolute area on a single set of axes.
     Lines are grouped by l (same colour) with distinct linestyles for different m.
 
     # Arguments:
-    - f_lm::np.ndarray: The f_lm tensor with shape (n_q, n_keys).
+    - f_sq_lm::np.ndarray: The f_sq_lm tensor with shape (n_q, n_keys).
     - q_grid::np.ndarray: The |q| grid in keV.
     - output_dir::Path: Directory to save the output plot.
     - top_n::int: Number of top modes to plot, ranked by integrated absolute area (default: 8).
     - ylabel::str or None: Optional y-axis label.
     """
     fig, ax = plt.subplots(figsize=(7, 4))
-    plot_flm_panel(ax, f_lm, q_grid, top_n=top_n, ylabel=ylabel)
+    plot_f_sq_lm_panel(ax, f_sq_lm, q_grid, top_n=top_n, ylabel=ylabel)
     fig.tight_layout()
 
-    fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output_dir / "f_sq_lm_modes.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, output_dir, top_n=8,
+def plot_crystal_form_factors_modes(f_sq_lm, conformer_f_sq_lm, conformer_titles, q_grid, output_dir, top_n=8,
                            ylabel=None):
     """
     Plot the aggregate crystal f^2_{lm}(q) modes together with each conformer contribution.
 
     # Arguments:
-    - f_lm::np.ndarray: The aggregate crystal f_lm tensor with shape (n_q, n_keys).
-    - conformer_f_lm::np.ndarray: The conformer tensors with shape (n_conformers, n_q, n_keys).
+    - f_sq_lm::np.ndarray: The aggregate crystal f_sq_lm tensor with shape (n_q, n_keys).
+    - conformer_f_sq_lm::np.ndarray: The conformer tensors with shape (n_conformers, n_q, n_keys).
     - conformer_titles::list: The conformer panel titles.
     - q_grid::np.ndarray: The |q| grid in keV.
     - output_dir::Path: Directory to save the output plot.
@@ -969,25 +978,25 @@ def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, outpu
     - ylabel::str or None: Optional y-axis label for the aggregate crystal panel.
     """
     # Find the top modes for the whole crystal and each conformer.
-    crystal_top_modes = get_top_flm_modes(f_lm, q_grid, top_n=top_n)
-    conformer_top_modes = [get_top_flm_modes(conformer_f_lm[i], q_grid, top_n=top_n) for i in range(len(conformer_titles))]
+    crystal_top_modes = get_top_f_sq_lm_modes(f_sq_lm, q_grid, top_n=top_n)
+    conformer_top_modes = [get_top_f_sq_lm_modes(conformer_f_sq_lm[i], q_grid, top_n=top_n) for i in range(len(conformer_titles))]
     all_top_modes = list(crystal_top_modes)
     for top_modes in conformer_top_modes:
         for mode in top_modes:
             if mode not in all_top_modes:
                 all_top_modes.append(mode)
     # Build the style map based on all modes, too keep it consistent between panels.
-    style_map = build_flm_style_map(all_top_modes)
+    style_map = build_f_sq_lm_style_map(all_top_modes)
 
     n_panels = 1 + len(conformer_titles)
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 4.5), squeeze=False, sharex=True)
 
-    plot_flm_panel(axes[0, 0], f_lm, q_grid, title="Crystal aggregate", top_n=top_n,
+    plot_f_sq_lm_panel(axes[0, 0], f_sq_lm, q_grid, title="Crystal aggregate", top_n=top_n,
                    top_modes=crystal_top_modes, style_map=style_map, ylabel=ylabel)
     for panel_idx, conformer_title in enumerate(conformer_titles, start=1):
-        plot_flm_panel(
+        plot_f_sq_lm_panel(
             axes[0, panel_idx],
-            conformer_f_lm[panel_idx - 1],
+            conformer_f_sq_lm[panel_idx - 1],
             q_grid,
             title=conformer_title,
             top_n=top_n,
@@ -996,7 +1005,7 @@ def plot_crystal_flm_modes(f_lm, conformer_f_lm, conformer_titles, q_grid, outpu
         )
 
     fig.tight_layout()
-    fig.savefig(output_dir / "flm_modes.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output_dir / "f_sq_lm_modes.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1021,7 +1030,7 @@ def plot_scattering_rates(rates_dir):
         return False
 
     with h5py.File(input_path, "r") as rate_file:
-        mchi = rate_file["mchi_MeV"][()]
+        m_chi = rate_file["m_chi_MeV"][()]
         rate_max = rate_file["rate_max"][()]
         rate_min = rate_file["rate_min"][()]
         rate_mean = rate_file["rate_mean"][()]
@@ -1029,15 +1038,15 @@ def plot_scattering_rates(rates_dir):
     fig, ax = plt.subplots(figsize=(7, 4))
 
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    ax.plot(mchi, rate_max, lw=1.2, ls="-",  color=colors[0], label=r"Maximum")
-    ax.plot(mchi, rate_min, lw=1.2, ls="--", color=colors[1], label=r"Minimum")
-    ax.plot(mchi, rate_mean, lw=1.2, ls="-.", color=colors[2], label=r"Mean")
+    ax.plot(m_chi, rate_max, lw=1.2, ls="-",  color=colors[0], label=r"Maximum over sampled orientations")
+    ax.plot(m_chi, rate_min, lw=1.2, ls="--", color=colors[1], label=r"Minimum over sampled orientations")
+    ax.plot(m_chi, rate_mean, lw=1.2, ls="-.", color=colors[2], label=r"Mean over sampled orientations")
 
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel(r"$m_\chi\ [\mathrm{MeV}]$")
     ax.set_ylabel(r"Dimensionless rate")
-    ax.set_xlim(mchi[0], mchi[-1])
+    ax.set_xlim(m_chi[0], m_chi[-1])
     ax.legend(fontsize=8, ncol=3)
     fig.tight_layout()
 
@@ -1057,10 +1066,10 @@ def main():
         args.transition_indices = "1"
     transitions_to_plot = [t.strip() for t in args.transition_indices.split(",")]
 
-    # The slices need the (q, θ, ϕ) grid. The f_lm modes and the bands do not.
-    slices_available = not args.coherent or getattr(args, "has_grid", True)
+    # The slices need the (q, θ, ϕ) grid. The f_sq_lm modes and the bands do not.
+    slices_available = not args.crystal or getattr(args, "has_grid", True)
     if not slices_available:
-        print("No f_s in the crystal output, so there are no slices to plot. Re-run with "
+        print("No f_uc or I_uc grid in the crystal output, so there are no slices to plot. Re-run with "
               "--compute-mode including form_factor if the group slice plots are wanted.")
 
     # Check if molecule directory exists.
@@ -1108,10 +1117,10 @@ def main():
         # Arguments:
         - tidx::str: Transition index to plot.
         """
-        if args.coherent:
+        if args.crystal:
             # One file holds every crystal state, so tidx selects a slice rather than a directory.
-            input_path = args.coherent_path
-            output_dir = args.coherent_path.parent / (
+            input_path = args.crystal_path
+            output_dir = args.crystal_path.parent / (
                 f"group_{tidx}" if args.grouped else f"state_{tidx}")
         else:
             tdir = get_transition_dir(tidx)
@@ -1140,11 +1149,11 @@ def main():
                 f_s = None
                 theta_grid = None
                 phi_grid = None
-                if "f_s" in ff_file:
+                if (args.crystal and any(key in ff_file for key in ("f_uc", "I_uc"))) or (not args.crystal and "f_s" in ff_file):
                     theta_grid = ff_file["theta_grid"][()]
                     phi_grid = ff_file["phi_grid"][()]
 
-                    if args.coherent:
+                    if args.crystal:
                         # Julia writes (n_states, n_q, n_theta, n_phi), which HDF5 reverses to
                         # (n_phi, n_theta, n_q, n_states). Take the group, then match the layout below.
                         group = int(tidx)
@@ -1152,28 +1161,7 @@ def main():
                             print(f"  Group {group} is out of range, the run has {args.n_groups}.")
                             return []
                         first, last = args.group_bounds[group - 1]
-                        # Normalise each plotted group per molecule. The coherent grid holds complex
-                        # state amplitudes, while each incoherent entry already holds an intensity
-                        # summed over every molecular image.
-                        n_members = last - first
-                        stored_is_intensity = args.crystal_order == "incoherent" # If incoherent, then the stored data is |f|^2.
-
-                        if stored_is_intensity:
-                            f_s = None
-                            for state in range(first, last):
-                                contribution = ff_file["f_s"][:, :, :, state]
-                                f_s = contribution if f_s is None else f_s + contribution
-                            f_s = f_s / (args.n_molecules * n_members)
-                        elif n_members == 1:
-                            # A single state keeps its phase, so the signed modes still work, and
-                            # sqrt(1) leaves the amplitude alone.
-                            f_s = ff_file["f_s"][:, :, :, first]
-                        else:
-                            f_s = None
-                            for state in range(first, last):
-                                contribution = np.abs(ff_file["f_s"][:, :, :, state]) ** 2
-                                f_s = contribution if f_s is None else f_s + contribution
-                            f_s = f_s / n_members # N_members = N_mol * N_degen for the coherent case.
+                        f_s = crystal_group_grid(ff_file, args.crystal_order, first, last, args.n_molecules)
                     else:
                         f_s = ff_file["f_s"][()]
 
@@ -1182,20 +1170,20 @@ def main():
                     # Python reads as (n_phi, n_theta, n_q), so transpose to (n_theta, n_phi, n_q).
                     f_s = np.transpose(f_s, (1, 0, 2))
 
-                # Load f_lm if requested, and transpose because of the usual Julia vs Python nonsense.
-                f_lm = None
-                conformer_f_lm = None
+                # Load f_sq_lm if requested, and transpose because of the usual Julia vs Python nonsense.
+                f_sq_lm = None
+                conformer_f_sq_lm = None
                 conformer_titles = None
-                if args.plot_flm_modes and "state_f_lm" in ff_file:
+                if args.plot_f_sq_lm_modes and args.crystal:
                     # Average the plotted group, matching the slice above. Incoherent entries just divided by N instad.
                     first, last = args.group_bounds[int(tidx) - 1]
-                    f_lm = ff_file["state_f_lm"][:, :, first:last].mean(axis=2).T
+                    f_sq_lm = ff_file["f_sq_lm"][:, :, first:last].mean(axis=2).T
                     if args.crystal_order == "incoherent":
-                        f_lm = f_lm / args.n_molecules
-                elif args.plot_flm_modes and "f_lm" in ff_file:
-                    f_lm = ff_file["f_lm"][()].T
-                elif args.plot_flm_modes:
-                    print(f"  Warning: f_lm not found for transition {tidx}. Was f_lm_tensor included in COMPUTE_MODES?")
+                        f_sq_lm = f_sq_lm / args.n_molecules
+                elif args.plot_f_sq_lm_modes and "f_sq_lm" in ff_file:
+                    f_sq_lm = ff_file["f_sq_lm"][()].T
+                elif args.plot_f_sq_lm_modes:
+                    print(f"  Warning: f_sq_lm not found for transition {tidx}. Was f_sq_lm_tensor included in COMPUTE_MODES?")
                 
             elif args.method == "fft":
                 # Load form factor data.
@@ -1205,7 +1193,7 @@ def main():
                 qz_grid = ff_file["qz_grid"][()]
 
                 # Compute q_lim from the grid.
-                q_lim = np.array([qx_grid.max(), qy_grid.max(), qz_grid.max()])
+                q_lim = (qx_grid, qy_grid, qz_grid)
 
                 # Julia writes with shape (nx, ny, nz), but HDF5 reverses to (nz, ny, nx).
                 # Transpose to get (nx, ny, nz).
@@ -1228,7 +1216,7 @@ def main():
                 qz_grid = ff_file["qz_grid"][()]
 
                 # Compute q_lim from the grid.
-                q_lim = np.array([qx_grid.max(), qy_grid.max(), qz_grid.max()])
+                q_lim = (qx_grid, qy_grid, qz_grid)
 
                 # Julia writes with shape (nx, ny, nz), but HDF5 reverses to (nz, ny, nx).
                 # Transpose to get (nx, ny, nz).
@@ -1242,9 +1230,9 @@ def main():
                 phi_grid,
                 q_grid,
                 output_dir,
-                f_lm if args.plot_flm_modes else None,
-                conformer_f_lm if args.plot_flm_modes else None,
-                conformer_titles if args.plot_flm_modes else None,
+                f_sq_lm if args.plot_f_sq_lm_modes else None,
+                conformer_f_sq_lm if args.plot_f_sq_lm_modes else None,
+                conformer_titles if args.plot_f_sq_lm_modes else None,
             ]
         elif args.method == "fft":
             return [None, None, None, None, form_factor, q_lim, output_dir, transition_density if args.plot_transition_density else None, r_lim if args.plot_transition_density else None]
@@ -1257,8 +1245,8 @@ def main():
     if args.method == "spherical":
         if slices_available:
             plots_to_generate.append(("form_factor", False))
-        if args.plot_flm_modes:
-            plots_to_generate.append(("flm_modes", False))
+        if args.plot_f_sq_lm_modes:
+            plots_to_generate.append(("f_sq_lm_modes", False))
     elif args.method == "fft":
         plots_to_generate.append(("form_factor", False))
         if args.plot_transition_density:
@@ -1294,22 +1282,20 @@ def main():
                 # We only plot the transition density, no modes.
                 modes_to_plot = [None]  # Single plot, no mode label.
 
-            # Plot the f_lm^2 coefficients.
-            elif plot_type == "flm_modes":
+            # Plot the f_sq_lm^2 coefficients.
+            elif plot_type == "f_sq_lm_modes":
                 if run_outputs[5] is not None:
-                    flm_ylabel = None
-                    if args.crystal_order == "incoherent":
-                        flm_ylabel = (r"$\frac{1}{N}\sum_{(i,s)\in g} "
-                                      r"f^2_{\ell m,i s}(q)$")
-                    elif args.crystal_order == "coherent" and args.grouped:
-                        flm_ylabel = (r"$\frac{1}{N}\sum_{\Psi\in g} "
-                                      r"f^2_{\ell m,\Psi}(q)$")
+                    f_sq_lm_ylabel = None
+                    if args.crystal:
+                        first, last = args.group_bounds[int(tidx) - 1]
+                        f_sq_lm_ylabel = crystal_quantity_label(args.crystal_order, first, last,
+                            args.n_molecules, args.original_transitions, coefficients=True)
                     if run_outputs[6] is not None and run_outputs[7] is not None:
-                        plot_crystal_flm_modes(run_outputs[5], run_outputs[6], run_outputs[7],
-                                               run_outputs[3], output_dir, ylabel=flm_ylabel)
+                        plot_crystal_form_factors_modes(run_outputs[5], run_outputs[6], run_outputs[7],
+                                               run_outputs[3], output_dir, ylabel=f_sq_lm_ylabel)
                     else:
-                        plot_flm_modes(run_outputs[5], run_outputs[3], output_dir,
-                                       ylabel=flm_ylabel)
+                        plot_f_sq_lm_modes(run_outputs[5], run_outputs[3], output_dir,
+                                       ylabel=f_sq_lm_ylabel)
                 completed += 1
                 print(f"  Plotting {completed}/{total_plots}...", end="\r", flush=True)
                 continue
@@ -1355,27 +1341,17 @@ def main():
                         )
 
                     # Extract the domain data.
-                    domain_is_complex = np.iscomplexobj(plane_data)
                     already_squared = (args.crystal_order is not None
                                        and not np.iscomplexobj(plane_data))
                     plot_data, cbar_label, cmap, symmetric = extract_domain_data(
                         # The incoherent grid holds |f|^2 already.
-                        plane_data, mode, already_squared=already_squared
+                        plane_data, mode, already_squared=already_squared, is_transition_density=is_transition_density
                     )
 
-                    if args.crystal_order == "incoherent":
-                        cbar_label = (r"$\frac{1}{N}\sum_{(i,s)\in g} "
-                                      r"|f_{i,s}(\mathbf{q})|^2$")
-                    elif args.crystal_order == "coherent" and already_squared:
-                        cbar_label = (r"$\frac{1}{N}\sum_{\Psi\in g} "
-                                      r"|f_{\Psi}(\mathbf{q})|^2$")
-                    elif args.crystal_order == "coherent":
-                        state_labels = {
-                            "modsq": r"$|f_{\Psi}(\mathbf{q})|^2$",
-                            "Re": r"$\mathrm{Re}[f_{\Psi}(\mathbf{q})]$",
-                            "Im": r"$\mathrm{Im}[f_{\Psi}(\mathbf{q})]$",
-                        }
-                        cbar_label = state_labels[mode]
+                    if args.crystal:
+                        first, last = args.group_bounds[int(tidx) - 1]
+                        cbar_label = crystal_quantity_label(args.crystal_order, first, last,
+                            args.n_molecules, args.original_transitions, mode=mode)
 
                     # Apply the plot limits.
                     coord1, coord2, plot_data, xlim, ylim = apply_plot_limits(
@@ -1384,7 +1360,7 @@ def main():
                         plot_data,
                         args,
                         plane,
-                        data_is_complex=domain_is_complex,
+                        momentum_space=not is_transition_density,
                     )
 
                     # Set the colourbar limits.
@@ -1414,11 +1390,22 @@ def main():
                     ax.set_aspect("equal", adjustable="box")
                     fixed_coordinate = {"xy": "z", "xz": "y", "yz": "x"}[plane]
                     coordinate = "" if is_transition_density else "q_"
-                    ax.set_title(rf"${coordinate}{fixed_coordinate}=0$")
+                    fixed_value = 0.0
+                    if args.method != "spherical":
+                        fixed_axis = {"xy": 2, "xz": 1, "yz": 0}[plane]
+                        if is_transition_density:
+                            half_width = run_outputs[8][fixed_axis]
+                            points = run_outputs[7].shape[fixed_axis]
+                            fixed_grid = np.linspace(-half_width, half_width, points, endpoint=False)
+                        else:
+                            fixed_grid = run_outputs[5][fixed_axis]
+                        fixed_value = fixed_grid[np.argmin(np.abs(fixed_grid))]
+                    units = "Å" if is_transition_density else "keV"
+                    ax.set_title(rf"${coordinate}{fixed_coordinate}={fixed_value:g}$ ({units})")
 
                     # Add the colourbar for each subplot.
                     cbar = fig.colorbar(pcm, ax=ax, pad=0.02, fraction=0.046)
-                    cbar.set_label(cbar_label, rotation=270, labelpad=20)
+                    cbar.set_label(cbar_label, rotation=270, labelpad=32)
 
             # Save the plot.
             fig.tight_layout()
@@ -1446,22 +1433,22 @@ def main():
 
     # The bands live beside the coherent output, written by the form factor run when it was asked
     # for a band map. They are not slices of q, so they get their own figure rather than a panel.
-    if args.coherent and args.coherent_path is not None:
-        with h5py.File(args.coherent_path, "r") as coherent_file:
-            has_bands = "band_map" in coherent_file
-            has_structure_factor = "structure_factor_f_lm" in coherent_file
+    if args.crystal and args.crystal_path is not None:
+        with h5py.File(args.crystal_path, "r") as crystal_file:
+            has_bands = "band_map" in crystal_file
+            has_structure_factor = any(key in crystal_file for key in ("S_lm",))
         if has_bands:
-            plot_band_energies(args.coherent_path, args.coherent_path.parent / "bands")
-        else:
+            plot_band_energies(args.crystal_path, args.crystal_path.parent / "bands")
+        elif args.crystal_order == "coherent":
             print("No band_map group in the coherent output, so no band energy figures. Re-run the "
                   "form factor with --band-map-plane to get them.")
 
         # Automatically plot the structure factor if it exists.
         if has_structure_factor:
-            plot_structure_factor(args.coherent_path,
-                                  args.coherent_path.parent / "structure_factor")
+            plot_structure_factor(args.crystal_path,
+                                  args.crystal_path.parent / "structure_factor")
         else:
-            print("No structure_factor_f_lm in the crystal output, so no (q, dE) figures. Re-run "
+            print("No S_lm in the crystal output, so no (q, E) figures. Re-run "
                   "the form factor without --no-structure-factor to get them.")
 
 

@@ -3,11 +3,11 @@ module ReadBasisSet
 using HDF5
 
 include("DensityMatrices.jl")
-using .DensityMatrices: build_transition_matrix, build_ground_state_matrix,
-                        build_pair_difference_matrix, to_real_density,
+using .DensityMatrices: build_T_gs, build_T_gg,
+                        build_Delta_T, to_real_density,
                         TransitionPairs, build_transition_pairs
 
-export get_molecular_data, MoleculeData, build_Delta_matrices,
+export get_molecular_data, MoleculeData, build_Delta_T_matrices,
        TransitionPairs, build_transition_pairs
 
 # Create a map from real spherical harmonic labels to m.
@@ -230,19 +230,19 @@ struct MoleculeData{T<:AbstractFloat}
     cartesian_prefactor::Vector{T} # Prefactor for each Cartesian term (e.g., 2.0, -1.0).
 
     # Transition matrices for excited states.
-    transition_matrices::Vector{Array{T, 2}}
-    ground_state_matrix::Array{T, 2}
+    T_gs::Vector{Array{T, 2}}
+    T_gg::Array{T, 2}
 
     # The TD-DFT amplitudes and MO coefficients, kept so that Δ_{st} can be built for whichever
     # pairs of states are asked for. Held complex, as PySCF gives them, so that Δ is only taken
     # real once it has been assembled.
-    X_matrices::Vector{Array{Complex{T}, 2}}
-    Y_matrices::Vector{Array{Complex{T}, 2}}
-    mo_coeff_occ::Array{Complex{T}, 2}
-    mo_coeff_vir::Array{Complex{T}, 2}
+    X_states::Vector{Array{Complex{T}, 2}}
+    Y_states::Vector{Array{Complex{T}, 2}}
+    C_o::Array{Complex{T}, 2}
+    C_v::Array{Complex{T}, 2}
 
     # Transition energies in eV.
-    transition_energies_eV::Vector{T}
+    Delta_E_eV::Vector{T}
 
     # Dimensions.
     n_primitives::Int
@@ -289,10 +289,10 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     cartesian_term_to_primitive = Int[]
     cartesian_term_to_orbital = Int[]
     cartesian_term_to_atom = Int[]
-    transition_matrices = Vector{Array{T, 2}}(undef, 0)
-    X_matrices = Vector{Array{Complex{T}, 2}}(undef, 0)
-    Y_matrices = Vector{Array{Complex{T}, 2}}(undef, 0)
-    transition_energies_eV = T[]
+    T_gs = Vector{Array{T, 2}}(undef, 0)
+    X_states = Vector{Array{Complex{T}, 2}}(undef, 0)
+    Y_states = Vector{Array{Complex{T}, 2}}(undef, 0)
+    Delta_E_eV = T[]
 
     # Now that we have the atom coordinates, we can determine the number of atoms and cuboid.
     n_atoms = size(atom_coordinates, 1)
@@ -300,22 +300,22 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
 
     # Build the AO basis transition density matrices from the MO coefficients and amplitudes, then
     # take the real part, which is checked rather than assumed.
-    mo_coeff_occ = h5_data["mo_coeff_occ"]
-    mo_coeff_vir = h5_data["mo_coeff_vir"]
-    ground_state_matrix = to_real_density(
-        build_ground_state_matrix(mo_coeff_occ), T; label = "ground-state density matrix")
-    n_transitions = length(h5_data["X_matrices"])
+    C_o = h5_data["C_o"]
+    C_v = h5_data["C_v"]
+    T_gg = to_real_density(
+        build_T_gg(C_o), T; label = "ground-state density matrix")
+    n_transitions = length(h5_data["X_states"])
     for idx in 1:n_transitions
-        X = h5_data["X_matrices"][idx]
-        Y = h5_data["Y_matrices"][idx]
-        transition_matrix = build_transition_matrix(
-            X, Y, mo_coeff_occ, mo_coeff_vir
+        X = h5_data["X_states"][idx]
+        Y = h5_data["Y_states"][idx]
+        transition_matrix = build_T_gs(
+            X, Y, C_o, C_v
         )
-        push!(transition_matrices, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
+        push!(T_gs, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
         # Keep the amplitudes themselves, since Δ_{st} needs them in pairs.
-        push!(X_matrices, Array{Complex{T}, 2}(X))
-        push!(Y_matrices, Array{Complex{T}, 2}(Y))
-        push!(transition_energies_eV, h5_data["energies_ev"][idx])
+        push!(X_states, Array{Complex{T}, 2}(X))
+        push!(Y_states, Array{Complex{T}, 2}(Y))
+        push!(Delta_E_eV, h5_data["Delta_E_eV"][idx])
     end
 
     # Open the basis set HDF5 file once and read the data for all orbitals.
@@ -418,13 +418,13 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         cartesian_b,
         cartesian_c,
         cartesian_prefactor,
-        transition_matrices,
-        ground_state_matrix,
-        X_matrices,
-        Y_matrices,
-        Array{Complex{T}, 2}(mo_coeff_occ),
-        Array{Complex{T}, 2}(mo_coeff_vir),
-        transition_energies_eV,
+        T_gs,
+        T_gg,
+        X_states,
+        Y_states,
+        Array{Complex{T}, 2}(C_o),
+        Array{Complex{T}, 2}(C_v),
+        Delta_E_eV,
         n_primitives,
         n_orbitals,
         n_atoms,
@@ -432,7 +432,7 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     )
 end
 
-function build_Delta_matrices(
+function build_Delta_T_matrices(
         mol::MoleculeData{T},
         transition_indices::Vector{Int},
     )::Vector{Array{T, 2}} where {T<:AbstractFloat}
@@ -451,20 +451,20 @@ function build_Delta_matrices(
     """
 
     pairs = build_transition_pairs(length(transition_indices))
-    Delta_matrices = Vector{Array{T, 2}}(undef, length(pairs.transitions_of_pair))
+    Delta_T_matrices = Vector{Array{T, 2}}(undef, length(pairs.transitions_of_pair))
 
     for (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
         state_s = transition_indices[s]
         state_t = transition_indices[t]
-        Delta = build_pair_difference_matrix(
-            mol.X_matrices[state_s], mol.Y_matrices[state_s],
-            mol.X_matrices[state_t], mol.Y_matrices[state_t],
-            mol.mo_coeff_occ, mol.mo_coeff_vir)
-        Delta_matrices[pair] = to_real_density(
+        Delta = build_Delta_T(
+            mol.X_states[state_s], mol.Y_states[state_s],
+            mol.X_states[state_t], mol.Y_states[state_t],
+            mol.C_o, mol.C_v)
+        Delta_T_matrices[pair] = to_real_density(
             Delta, T; label = "Δ density matrix for states ($(state_s), $(state_t))")
     end
 
-    return Delta_matrices
+    return Delta_T_matrices
 end
 
 function get_molecular_data(
@@ -490,25 +490,21 @@ function get_molecular_data(
         atom_symbols = read(io, "atom_symbols")
         atom_coordinates = restore_python_hdf5_order(read(io, "atom_coordinates")) # Bohr.
         ao_labels = read(io, "ao_labels")
-        energies_ev = read(io, "energies_ev")
+        Delta_E_eV = read(io, "Delta_E_eV")
 
         # Read the MO coefficients, which are shared across all transitions. The density matrices are
         # assembled from these and the X and Y amplitudes rather than being read ready-made, so that
         # the transition, ground state and difference densities can all be built from one file.
-        haskey(io, "mo_coeff_occ") || error(
-            "No 'mo_coeff_occ' found in $(td_dft_file). This file predates the switch to storing MO " *
-            "coefficients and X/Y amplitudes, so please re-run td_dft.py to regenerate it."
-        )
-        mo_coeff_occ = restore_python_hdf5_order(read(io, "mo_coeff_occ"))
-        mo_coeff_vir = restore_python_hdf5_order(read(io, "mo_coeff_vir"))
+        C_o = restore_python_hdf5_order(read(io, "C_o"))
+        C_v = restore_python_hdf5_order(read(io, "C_v"))
 
         # Read the per-transition X and Y amplitudes, which are stored under different keys.
-        X_matrices = []
-        Y_matrices = []
+        X_states = []
+        Y_states = []
         state_idx = 1
         while haskey(io, "X_state_$state_idx")
-            push!(X_matrices, restore_python_hdf5_order(read(io, "X_state_$state_idx")))
-            push!(Y_matrices, restore_python_hdf5_order(read(io, "Y_state_$state_idx")))
+            push!(X_states, restore_python_hdf5_order(read(io, "X_state_$state_idx")))
+            push!(Y_states, restore_python_hdf5_order(read(io, "Y_state_$state_idx")))
             state_idx += 1
         end
 
@@ -517,11 +513,11 @@ function get_molecular_data(
             "atom_symbols" => atom_symbols,
             "atom_coordinates" => atom_coordinates,
             "ao_labels" => ao_labels,
-            "energies_ev" => energies_ev,
-            "mo_coeff_occ" => mo_coeff_occ,
-            "mo_coeff_vir" => mo_coeff_vir,
-            "X_matrices" => X_matrices,
-            "Y_matrices" => Y_matrices
+            "Delta_E_eV" => Delta_E_eV,
+            "C_o" => C_o,
+            "C_v" => C_v,
+            "X_states" => X_states,
+            "Y_states" => Y_states
         )
     end
 

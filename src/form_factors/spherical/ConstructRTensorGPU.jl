@@ -36,15 +36,14 @@ export construct_R_tensor_gpu
     """
     h5open(path, "r") do io
         # Read in the indices and coefficients.
-        lambda = Vector{Int}(read(io, "lambda"))
-        mu = Vector{Int}(read(io, "mu"))
-        L = Vector{Int}(read(io, "L"))
-        l = Vector{Int}(read(io, "l"))
-        m = Vector{Int}(read(io, "m"))
-        coeffs = Vector{T}(read(io, "coefficients"))
-        # Reconstruct the lambda_mu_bins.
-        lambda_mu_bins = decode_bins(Vector{Int}(read(io, "lambda_mu_bins/data")), Vector{Int}(read(io, "lambda_mu_bins/offsets")))
-        return SparseGauntArray(lambda, mu, L, l, m, coeffs, lambda_mu_bins)
+        l1 = Vector{Int}(read(io, "l1"))
+        m1 = Vector{Int}(read(io, "m1"))
+        l2 = Vector{Int}(read(io, "l2"))
+        l3 = Vector{Int}(read(io, "l3"))
+        m3 = Vector{Int}(read(io, "m3"))
+        Gaunt_values = Vector{T}(read(io, "Gaunt_values"))
+        l1_m1_bins = decode_bins(Vector{Int}(read(io, "l1_m1_bins/data")), Vector{Int}(read(io, "l1_m1_bins/offsets")))
+        return SparseGauntArray(l1, m1, l2, l3, m3, Gaunt_values, l1_m1_bins)
     end
 end
 
@@ -244,7 +243,7 @@ function R_tensor_kernel!(
     q_powers::CuDeviceMatrix{T},
     i_powers::CuDeviceVector{Complex{T}},
     neg1_powers::CuDeviceVector{T},
-    tdm_prefactors::CuDeviceMatrix{T},
+    density_pair_weights::CuDeviceMatrix{T},
     threshold_values::CuDeviceVector{T},
     n_q::Int32,
     n_bins::Int32,
@@ -286,7 +285,7 @@ function R_tensor_kernel!(
     - q_powers::CuDeviceMatrix{T}: The precomputed q powers stored on the GPU.
     - i_powers::CuDeviceVector{Complex{T}}: The precomputed powers of i (the imaginary unit).
     - neg1_powers::CuDeviceVector{T}: The precomputed powers of -1.
-    - tdm_prefactors::CuDeviceMatrix{T}: The transition matrix prefactors for each (transition, bin) pair.
+    - density_pair_weights::CuDeviceMatrix{T}: The transition matrix prefactors for each (transition, bin) pair.
     - threshold_values::CuDeviceVector{T}: The per-transition threshold values for discarding small contributions.
     - n_q::Int32: The number of q points.
     - n_bins::Int32: The number of non-zero (i, j) bins.
@@ -313,7 +312,7 @@ function R_tensor_kernel!(
         W_start = W_bin_offsets[bin_idx]
         W_end = W_bin_offsets[bin_idx + Int32(1)] - Int32(1)
 
-        TDM_prefactor_bin = tdm_prefactors[transition_idx, bin_idx]
+        TDM_prefactor_bin = density_pair_weights[transition_idx, bin_idx]
 
         @inbounds for W_idx in W_start:W_end
             # Fetch the W tensor entry data for this thread.
@@ -596,7 +595,7 @@ function construct_R_tensor_gpu(
         lambda_max::Int,
         n_max::Int,
         gaunt_array_path::String,
-        transition_matrices::Vector{Matrix{T}},
+        density_matrices::Vector{Matrix{T}},
         cartesian_term_to_orbital::Vector{Int};
         threshold::T = zero(T),
         ij_chunk_size::Int = 50000,
@@ -605,16 +604,20 @@ function construct_R_tensor_gpu(
     """
     Construct the R_{ℓm}(q) tensor defined by:
 
-        R_{ℓm}(q) = 4 * (2π)^(5 / 2) * ∑_{ij} exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
-                  * ∑_{n} q^n ∑_{λ,μ} W_{ij,λμ}^{n} G_{λLℓ}^{μm} conj(Y_L^{m-μ}(Rhat_{ij})),
+        R_{ℓm}(q) = 4 * (2π)^(5 / 2) * ∑_{ij} T_{μ(i)ν(j)} exp(-σ_{ij}^2 q^2/2) ∑_{L} i^L j_L(q R_{ij})
+                  * ∑_{n} q^n ∑_{λ,μ} W_{ij,λμ}^{n} 𝒢_{λμ,LM}^{ℓm} conj(Y_L^{m-μ}(Rhat_{ij})),
 
-    where W_{ij,λμ}^{n} is the W tensor, G_{λLℓ}^{μm} are Gaunt coefficients, j_L are spherical Bessel functions,
+    where μ(i), ν(j) map Cartesian terms to AO indices, T is the per-spin density matrix,
+    and W_{ij,λμ}^{n} is the W tensor, 𝒢_{λμ,LM}^{ℓm} are Gaunt coefficients, j_L are spherical Bessel functions,
     and Y_L^M are spherical harmonics evaluated at Rhat_{ij}. For efficiency, we split the R into the positive and
     negative m components, and collapse the (ℓ, m) indices into a single linear key defined by:
 
         key(ℓ, m) = (ℓ(ℓ + 1))/2 + m + 1.
 
     For m < 0, we find the correct entry with |m|.
+
+    The shared Gaunt indices (l1,m1,l2,m2,l3,m3) are (λ,μ,L,M,ℓ,m) here,
+    with M = m - μ.
 
     # Arguments:
     - W_tensor::SparseWTensor{T}: The sparse W tensor stored on the CPU.
@@ -626,24 +629,24 @@ function construct_R_tensor_gpu(
     - lambda_max::Int: Maximum λ for the molecule.
     - n_max::Int: Maximum n for the molecule.
     - gaunt_array_path::String: Path to the precomputed Gaunt coefficients (HDF5 file).
-    - transition_matrices::Vector{Matrix{T}}: The transition matrices.
+    - density_matrices::Vector{Matrix{T}}: The per-spin AO density matrices, for transitions, the ground state or ΔT pairs.
     - cartesian_term_to_orbital::Vector{Int}: Mapping from Cartesian term index to orbital index.
     - threshold::T: A threshold value below which contributions satisfying (|TDM * W / max(TDM * W)| < threshold) will be discarded (default: 0.0).
     - w_chunk_size::Int: Number of W entries processed per thread to improve arithmetic intensity (default: 256).
 
     # Returns:
-    - R_tensor_pos::CuArray{Complex{T}, 3}: The R tensor for m ≥ 0 stored on the GPU with dimensions (n_transitions, n_q, n_keys_pos).
-    - R_tensor_neg::CuArray{Complex{T}, 3}: The R tensor for m < 0 stored on the GPU with dimensions (n_transitions, n_q, n_keys_pos).
+    - R_tensor_pos::CuArray{Complex{T}, 3}: The R tensor for m ≥ 0 stored on the GPU with dimensions (n_densities, n_q, n_keys_pos).
+    - R_tensor_neg::CuArray{Complex{T}, 3}: The R tensor for m < 0 stored on the GPU with dimensions (n_densities, n_q, n_keys_pos).
     """
 
     # Load Gaunt coefficients.
     gaunt_array = load_gaunt_array(gaunt_array_path, T)
-    gaunt_coeffs = gaunt_array.coefficients
+    gaunt_coeffs = gaunt_array.Gaunt_values
 
     # Preallocate the R tensor.
     L_max = l_max + lambda_max
     n_q = length(q_grid)
-    n_transitions = length(transition_matrices)
+    n_densities = length(density_matrices)
 
     if L_max > MAX_L_GLOBAL - 1
         error("L_max = $(L_max) exceeds MAX_L_GLOBAL - 1 = $(MAX_L_GLOBAL - 1). Increase MAX_L_GLOBAL or reduce l_max.")
@@ -674,10 +677,10 @@ function construct_R_tensor_gpu(
     # Allocate the R tensor on the GPU in flattened (transition, q, lm_key) layout for m ≥ 0 and m < 0 separately.
     # We use the same key as for the spherical harmonics, key(l, m) = (l(l+1))/2 + m + 1, and use |m| for the m < 0 case.
     n_keys_pos = (l_max + 1) * (l_max + 2) ÷ 2
-    R_tensor_pos_real = CUDA.zeros(T, n_transitions, n_q, n_keys_pos)
-    R_tensor_pos_imag = CUDA.zeros(T, n_transitions, n_q, n_keys_pos)
-    R_tensor_neg_real = CUDA.zeros(T, n_transitions, n_q, n_keys_pos)
-    R_tensor_neg_imag = CUDA.zeros(T, n_transitions, n_q, n_keys_pos)
+    R_tensor_pos_real = CUDA.zeros(T, n_densities, n_q, n_keys_pos)
+    R_tensor_pos_imag = CUDA.zeros(T, n_densities, n_q, n_keys_pos)
+    R_tensor_neg_real = CUDA.zeros(T, n_densities, n_q, n_keys_pos)
+    R_tensor_neg_imag = CUDA.zeros(T, n_densities, n_q, n_keys_pos)
 
     # Move the (i,j) objects to the GPU.
     sigma_ij_gpu = CuArray(sigma_ij)
@@ -720,8 +723,8 @@ function construct_R_tensor_gpu(
     # Precompute TDM prefactors and transition-specific thresholds for each (i, j) bin.
     n_compact_bins = length(ij_i_cpu)
     W_max = W_tensor.W_max
-    max_TDM_W = fill(zero(T), n_transitions)
-    tdm_prefactors_cpu = Array{T, 2}(undef, n_transitions, n_compact_bins)
+    max_TDM_W = fill(zero(T), n_densities)
+    density_pair_weights_cpu = Array{T, 2}(undef, n_densities, n_compact_bins)
 
     @inbounds for bin_idx in 1:n_compact_bins
         pair_i = ij_i_cpu[bin_idx]
@@ -729,17 +732,17 @@ function construct_R_tensor_gpu(
         orbital_i = cartesian_term_to_orbital[pair_i]
         orbital_j = cartesian_term_to_orbital[pair_j]
 
-        for transition_idx in 1:n_transitions
-            TDM = transition_matrices[transition_idx]
+        for transition_idx in 1:n_densities
+            TDM = density_matrices[transition_idx]
             # If i == j, we only take the diagonal element. Otherwise, sum both contributions.
             prefactor = pair_i == pair_j ? TDM[orbital_i, orbital_j] : TDM[orbital_i, orbital_j] + TDM[orbital_j, orbital_i]
-            tdm_prefactors_cpu[transition_idx, bin_idx] = prefactor
+            density_pair_weights_cpu[transition_idx, bin_idx] = prefactor
             max_TDM_W[transition_idx] = max(max_TDM_W[transition_idx], abs(prefactor) * W_max)
         end
     end
 
     threshold_values_cpu = similar(max_TDM_W)
-    @inbounds for transition_idx in 1:n_transitions
+    @inbounds for transition_idx in 1:n_densities
         threshold_values_cpu[transition_idx] = threshold * max_TDM_W[transition_idx]
     end
 
@@ -749,7 +752,7 @@ function construct_R_tensor_gpu(
     # Next, move the Gaunt coefficients to the GPU.
     # First we define the index and offset array for the (λ, μ) bins.
     n_nonzero_gaunt = length(gaunt_coeffs)
-    n_lambda_mu_bins = length(gaunt_array.lambda_mu_bins)
+    n_lambda_mu_bins = length(gaunt_array.l1_m1_bins)
     lambda_mu_indices_cpu = Vector{Int32}(undef, n_nonzero_gaunt)
     lambda_mu_offsets_cpu = Vector{Int32}(undef, n_lambda_mu_bins + 1)
 
@@ -758,7 +761,7 @@ function construct_R_tensor_gpu(
     @inbounds for bin_idx in 1:n_lambda_mu_bins
         # Set the start of the bin.
         lambda_mu_offsets_cpu[bin_idx] = current_position
-        bin = gaunt_array.lambda_mu_bins[bin_idx]
+        bin = gaunt_array.l1_m1_bins[bin_idx]
         # Now fill in the indices for this bin.
         for entry_idx in bin
             lambda_mu_indices_cpu[current_position] = Int32(entry_idx)
@@ -770,10 +773,10 @@ function construct_R_tensor_gpu(
     # Now move the remaining Gaunt data to the GPU.
     lambda_mu_indices_gpu = CuArray{Int32}(lambda_mu_indices_cpu)
     lambda_mu_offsets_gpu = CuArray{Int32}(lambda_mu_offsets_cpu)
-    gaunt_mu_gpu = CuArray{Int32}(gaunt_array.mu)
-    gaunt_L_gpu = CuArray{Int32}(gaunt_array.L)
-    gaunt_l_gpu = CuArray{Int32}(gaunt_array.l)
-    gaunt_m_gpu = CuArray{Int32}(gaunt_array.m)
+    gaunt_mu_gpu = CuArray{Int32}(gaunt_array.m1)
+    gaunt_L_gpu = CuArray{Int32}(gaunt_array.l2)
+    gaunt_l_gpu = CuArray{Int32}(gaunt_array.l3)
+    gaunt_m_gpu = CuArray{Int32}(gaunt_array.m3)
     gaunt_coeffs_gpu = CuArray{T}(gaunt_coeffs)
 
     # Compute the spherical harmonics on the GPU. We only do this for the non-zero (i, j) bins.
@@ -865,8 +868,8 @@ function construct_R_tensor_gpu(
 
         # Move the chunk-specific W data to GPU.
         # Extract the TDM prefactors for this chunk.
-        tdm_prefactors_chunk = tdm_prefactors_cpu[:, bin_start:bin_end]
-        tdm_prefactors_chunk_gpu = CuArray{T}(tdm_prefactors_chunk)
+        density_pair_weights_chunk = density_pair_weights_cpu[:, bin_start:bin_end]
+        density_pair_weights_chunk_gpu = CuArray{T}(density_pair_weights_chunk)
 
         # Compute the spherical harmonics tensor for this chunk.
         Ylm_tensor_chunk_gpu = compute_spherical_harmonics(L_max, R_ij_hat_gpu, Ylm_norms_gpu, ij_i_chunk_gpu, ij_j_chunk_gpu)
@@ -876,7 +879,7 @@ function construct_R_tensor_gpu(
 
         # Compute R using the W-major kernel for this chunk.
         threads = 256
-        total_wq_chunk = Int64(n_bins_chunk) * Int64(n_q) * Int64(n_transitions)
+        total_wq_chunk = Int64(n_bins_chunk) * Int64(n_q) * Int64(n_densities)
         blocks = cld(total_wq_chunk, threads)
         @cuda threads=threads blocks=blocks R_tensor_kernel!(
             R_tensor_pos_real, R_tensor_pos_imag, R_tensor_neg_real, R_tensor_neg_imag,
@@ -885,7 +888,7 @@ function construct_R_tensor_gpu(
             gaunt_coeffs_gpu, lambda_mu_indices_gpu, lambda_mu_offsets_gpu,
             gaunt_mu_gpu, gaunt_L_gpu, gaunt_l_gpu, gaunt_m_gpu,
             q_powers_gpu, i_powers_gpu, neg1_powers_gpu,
-            tdm_prefactors_chunk_gpu, threshold_values_gpu,
+            density_pair_weights_chunk_gpu, threshold_values_gpu,
             Int32(n_q), Int32(n_bins_chunk), Int32(l_max), Int32(lambda_max), Int32(L_max), total_wq_chunk
         )
 
@@ -897,7 +900,7 @@ function construct_R_tensor_gpu(
         CUDA.unsafe_free!(W_n_chunk_gpu)
         CUDA.unsafe_free!(W_values_chunk_gpu)
         CUDA.unsafe_free!(W_bin_offsets_chunk_gpu)
-        CUDA.unsafe_free!(tdm_prefactors_chunk_gpu)
+        CUDA.unsafe_free!(density_pair_weights_chunk_gpu)
         CUDA.unsafe_free!(ij_i_chunk_gpu)
         CUDA.unsafe_free!(ij_j_chunk_gpu)
     end
