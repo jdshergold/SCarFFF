@@ -9,7 +9,25 @@ using LinearAlgebra: norm
 using ..ConstructRTensor: fill_spherical_bessel_column!, KEV_TO_INV_ANGSTROM
 using ...FastPowers: fast_i_pow
 
-export construct_nuclear_R, split_density_R_tensors
+export construct_nuclear_R, split_density_R_tensors, Delta_row
+
+@inline function Delta_row(image_idx::Int, pair_idx::Int, n_pairs::Int)::Int
+    """
+    The row of the rotated Δ tensor that holds pair (s, t) of a given image.
+
+    Δ is laid out image-major with the pair running fastest, the same way λ runs over transitions
+    fastest and then over images.
+
+    # Arguments:
+    - image_idx::Int: The image index.
+    - pair_idx::Int: The (s, t) pair index within that image.
+    - n_pairs::Int: The number of pairs per image.
+
+    # Returns:
+    - Int: The row index into the rotated Δ tensor.
+    """
+    return (image_idx - 1) * n_pairs + pair_idx
+end
 
 function construct_nuclear_R(
         atom_coordinates::Matrix{T},

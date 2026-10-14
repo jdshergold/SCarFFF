@@ -219,7 +219,7 @@ end
     X = Complex{T}[0.4; -0.2;;]
     Y = Complex{T}[0.05; 0.12;;]
     ground = DM.build_ground_state_matrix(C_o)
-    difference = DM.build_difference_matrix(X, Y, C_o, C_v)
+    difference = DM.build_pair_difference_matrix(X, Y, X, Y, C_o, C_v)
     A = conj(X) * transpose(X) + Y * adjoint(Y)
     B = transpose(X) * conj(X) + adjoint(Y) * Y
     @test ground ≈ C_o * adjoint(C_o)
@@ -227,6 +227,67 @@ end
     # Both are observable densities, so both must come out Hermitian.
     @test ground ≈ adjoint(ground)
     @test difference ≈ adjoint(difference)
+
+    # A second state, so the off-diagonal pair s != t can be built. The amplitudes are complex and
+    # unrelated to the first state's.
+    X_t = Complex{T}[0.15 + 0.3im; 0.45;;]
+    Y_t = Complex{T}[-0.08; 0.02 - 0.11im;;]
+    Delta_st = DM.build_pair_difference_matrix(X, Y, X_t, Y_t, C_o, C_v)
+    Delta_ts = DM.build_pair_difference_matrix(X_t, Y_t, X, Y, C_o, C_v)
+    # A^(ts) and B^(ts), written out here independently of the function being tested.
+    A_ts = conj(X) * transpose(X_t) + Y_t * adjoint(Y)
+    B_ts = transpose(X_t) * conj(X) + adjoint(Y) * Y_t
+    @test Delta_st ≈ C_v * B_ts * adjoint(C_v) - C_o * A_ts * adjoint(C_o)
+    # Swapping the states gives the adjoint, since A^(ts)† = A^(st).
+    @test Delta_st ≈ adjoint(Delta_ts)
+    # Check that they really do differ.
+    @test !isapprox(Delta_st, Delta_ts)
+
+    # Real amplitudes, which is what RKS gives and all that to_real_density lets through. Being
+    # adjoints is not enough on its own: for a real density the adjoint is just the transpose.
+    X_real = T[0.22; 0.37;;]
+    Y_real = T[-0.06; 0.09;;]
+    C_o_real = real(C_o)
+    C_v_real = real(C_v)
+    real_st = DM.build_pair_difference_matrix(real(X), real(Y), X_real, Y_real, C_o_real, C_v_real)
+    real_ts = DM.build_pair_difference_matrix(X_real, Y_real, real(X), real(Y), C_o_real, C_v_real)
+    @test real_st ≈ transpose(real_ts)
+    # Neither matrix is symmetric by itself, so the test below is not comparing a density to itself.
+    @test !isapprox(real_st, real_ts)
+
+    # Swapping s and t transposes Δ in its AO indices μν. The density is built from φ_μ(r) φ_ν(r),
+    # which is symmetric in μν because the AOs are real, so the antisymmetric part of Δ contributes
+    # nothing and the two orderings give the same coefficients.
+    mktempdir() do tmp_dir
+        small_case = build_small_R_case(T, tmp_dir)
+        W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path, _, term_to_orbital =
+            small_case.inputs
+        both = RT.construct_R_tensor(
+            W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path,
+            Matrix{T}[real_st, real_ts], term_to_orbital)
+        @test both[1, :, :] ≈ both[2, :, :]
+    end
+
+    # The (s, t) pair tables.
+    for n_transitions in (1, 2, 5)
+        pairs = DM.build_transition_pairs(n_transitions)
+        n_pairs = div(n_transitions * (n_transitions + 1), 2)
+        @test length(pairs.transitions_of_pair) == n_pairs
+        # Every pair is stored with s <= t, and the reverse map is symmetric and inverts it.
+        for pair in 1:n_pairs
+            (s, t) = pairs.transitions_of_pair[pair]
+            @test s <= t
+            @test pairs.pair_of_transitions[s, t] == pair
+            @test pairs.pair_of_transitions[t, s] == pair
+        end
+        # The diagonal pairs sit at the triangular numbers.
+        for t in 1:n_transitions
+            @test pairs.pair_of_transitions[t, t] == div(t * (t + 1), 2)
+        end
+    end
+    # One transition leaves one pair, which is the layout D had before it carried pairs.
+    @test DM.build_transition_pairs(1).transitions_of_pair == [(1, 1)]
+    @test_throws ErrorException DM.build_transition_pairs(0)
 
     mktempdir() do tmp_dir
         small_case = build_small_R_case(T, tmp_dir)

@@ -275,14 +275,9 @@ function build_lambda_permutations(
     - Vector{Vector{Int}}: One permutation of 1:n_lambda per operation.
     """
 
-    # Allocate the array for, and build the map (A_i, s) -> λ.
     n_lambda = length(basis.energies)
-    n_images = length(basis.images)
-
-    lambda_of = zeros(Int, n_images, basis.n_transitions)
-    for lambda in 1:n_lambda
-        lambda_of[basis.image_of[lambda], basis.transition_of[lambda]] = lambda
-    end
+    # The basis already carries the (A_i, s) -> λ map.
+    lambda_of = basis.lambda_of
 
     # Now build λ -> Λ(λ).
     permutations = Vector{Vector{Int}}(undef, length(operations))

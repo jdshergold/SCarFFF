@@ -168,7 +168,8 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     - eta::T: The splitting parameter η, in Å^{-1}.
     - G_max::T: The reciprocal-space cutoff, in Å^{-1}.
     - prefactor::T: 4π α_EM ħc / V_cell, in eV Å^{-2}.
-    - include_dipole_term::Bool: Boundary choice: whether the Q = 0 term is the dipole average or zero.
+    - epsilon_b::T: The permittivity of the medium around the sample. Not to be confused with the Ewald truncation
+      error, which EwaldParameters calls epsilon.
     """
     lattice::CrystalLatticeData{T}
     G_vectors::Vector{SVector{3, T}}
@@ -183,7 +184,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     eta::T
     G_max::T
     prefactor::T
-    include_dipole_term::Bool
+    epsilon_b::T
 end
 
 struct EwaldLongRangeBuffers{T<:AbstractFloat, C}
@@ -411,7 +412,7 @@ function build_ewald_long_range(
         q_bc_invA::T,
         l_max::Int,
         parameters::EwaldParameters{T};
-        include_dipole_term::Bool = true,
+        epsilon_b::Real = 1,
     )::EwaldLongRangeData{T} where {T<:AbstractFloat}
     """
     Assemble everything the long-range sum
@@ -439,8 +440,7 @@ function build_ewald_long_range(
     - q_bc_invA::T: The |q| at which the transition dipole is read off, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
     - parameters::EwaldParameters{T}: The splitting parameter and cutoffs.
-    - include_dipole_term::Bool: Whether to use the dipole average at Q = 0, or set it to zero, which
-      is the conducting boundary condition.
+    - epsilon_b::Real: The permittivity of the medium around the sample.
 
     # Returns:
     - EwaldLongRangeData{T}: The k-independent long-range data.
@@ -449,6 +449,9 @@ function build_ewald_long_range(
     # Get the dimensions.
     n_lambda = size(rotated_R, 1)
     n_q = length(q_grid_invA)
+
+    # A permittivity below 1 is unphysical, and would make the boundary term larger than the vacuum one.
+    epsilon_b >= 1 || error("The medium permittivity must be at least 1, got $(epsilon_b).")
 
     # Check that we have enough points for interpolation.
     n_q >= 3 || error("The Ewald long-range sum needs at least three q points, got $(n_q).")
@@ -512,7 +515,7 @@ function build_ewald_long_range(
     return EwaldLongRangeData{T}(
         lattice, G_vectors, f_table, f_tangent, q_step, l_max_lr,
         translations, copy(image_of),
-        dipole_slopes, self_term, parameters.eta, parameters.G_max, prefactor, include_dipole_term,
+        dipole_slopes, self_term, parameters.eta, parameters.G_max, prefactor, T(epsilon_b),
     )
 end
 
@@ -697,7 +700,7 @@ function compute_ewald_diagonal(
         D_LR = D_reciprocal + D_boundary - D_self.
 
     Xi is summed over the unit cell once for each G before it is contracted with every difference
-    density. The boundary term is omitted when data.include_dipole_term is false.
+    density.
 
     # Arguments:
     - rotated_difference::Array{Complex{T},3}: Delta N for every local excitation.
@@ -807,12 +810,14 @@ function compute_ewald_diagonal(
         end
     end
 
-    # The G = 0 term, replaced by the angular-averaged dipole product. This is the boundary choice.
-    if data.include_dipole_term
+    # The G = 0 term, replaced by the dipole product scaled by 1/(2ε_b + 1). This is the boundary choice.
+    # The 3/4π comes from writing the dipoles in terms of the ℓ = 1 coefficients, as in add_dipole_term!.
+    boundary_weight = data.prefactor * T(3) / (T(4 * π) * (2 * data.epsilon_b + one(T)))
+    # At ε_b = Inf the weight is exactly zero, which is the conducting boundary condition.
+    if !iszero(boundary_weight)
         difference_slopes = dipole_slope_matrix(rotated_difference_bc, q_bc_invA, l_max)
         Xi_slopes = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
         total_Xi_slopes = vec(sum(Xi_slopes, dims = 1))
-        boundary_weight = data.prefactor / T(4 * π)
         @inbounds for lambda in 1:n_lambda
             total = zero(Complex{T})
             for component in 1:3
@@ -895,9 +900,9 @@ end
         Q_norm = norm(Q)
         Q_norm <= data.G_max || continue
 
-        # Use the dipole BC if specified.
+        # Replace the Q = 0 term by the dipole product set by ε_b.
         if Q_norm < T(Q_ZERO_TOLERANCE)
-            data.include_dipole_term && add_dipole_term!(H, data)
+            add_dipole_term!(H, data)
             continue
         end
 
@@ -961,11 +966,12 @@ end
         data::EwaldLongRangeData{T},
     ) where {T<:AbstractFloat}
     """
-    Add the Q = 0 term of the long-range sum, which the angular average ⟨Q̂_u Q̂_v⟩ = δ_uv/3 reduces to
+    Add the Q = 0 term of the long-range sum, which a sample surrounded by a medium of permittivity
+    ε_b reduces to
 
-        (1/3)(μ_λ . conj(μ_{λ'})) = (1/4π) Σ_m [lim f̄^λ_{1m}(q)/q] conj[lim f̄^{λ'}_{1m}(q)/q].
+        (μ_λ . conj(μ_{λ'})) / (2ε_b + 1).
 
-    This is just one choice of boundary condition. The conducting one sets it to zero instead.
+    Each dipole is written in terms of the ℓ = 1 coefficients as μ_{λ,-m} = -i √(3/4π) (-1)^m lim f̄^λ_{1m}(q)/q.
 
     # Arguments:
     - H::Matrix{Complex{T}}: The Bloch Hamiltonian, whose upper triangle is accumulated into.
@@ -978,11 +984,14 @@ end
     # Get the dimensions.
     n_lambda = length(data.image_of)
     slopes = data.dipole_slopes
-    weight = data.prefactor / T(4 * π)
+    weight = data.prefactor * T(3) / (T(4 * π) * (2 * data.epsilon_b + one(T)))
+
+    # Nothing to add in the conducting limit, so skip the loop rather than adding zeros.
+    iszero(weight) && return nothing
 
     @inbounds for lambda_prime in 1:n_lambda, lambda in 1:lambda_prime
         total = zero(Complex{T})
-        # Sum 1/4π * (lim f̄^λ_{1m}(q)/q) conj(lim f̄^{λ'}_{1m}(q)/q).
+        # Sum (lim f̄^λ_{1m}(q)/q) conj(lim f̄^{λ'}_{1m}(q)/q) over the three m.
         for column in 1:3
             total += slopes[lambda, column] * conj(slopes[lambda_prime, column])
         end

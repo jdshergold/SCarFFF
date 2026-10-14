@@ -275,9 +275,10 @@ function parse_commandline()::Dict{String, Any}
             help = "The cost of one reciprocal lattice vector relative to one real-space cell, which sets where the derived Ewald cutoffs balance. Only the ratio matters."
             arg_type = Float64
             default = 1.0
-        "--no-dipole-term"
-            help = "Drop the Q = 0 term of the Ewald reciprocal sum instead of replacing it with the angular-averaged transition dipole product, which is the conducting boundary condition."
-            action = :store_true
+        "--epsilon-b"
+            help = "Permittivity of the medium surrounding the sample, which scales the Q = 0 boundary term of the Ewald reciprocal sum by 1/(2 eps_b + 1). 1 is a spherical sample in vacuum, and Inf is the conducting boundary condition, where the term vanishes. Not the Ewald truncation error, which is --ewald-epsilon."
+            arg_type = Float64
+            default = 1.0
         "--q-bc"
             help = "The |q| in keV at which the transition dipole of the Ewald Q = 0 term is read off. Smaller is better, but it already agrees by the default value, 1e-4 keV."
             arg_type = Float64
@@ -613,7 +614,8 @@ function main()
     ewald_eta >= 0 || error("The Ewald splitting parameter must not be negative, got $(ewald_eta).")
     ewald_cost_ratio = args["ewald-cost-ratio"]
     ewald_cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(ewald_cost_ratio).")
-    no_dipole_term = args["no-dipole-term"]
+    epsilon_b = args["epsilon-b"]
+    epsilon_b >= 1 || error("The medium permittivity must be at least 1, got $(epsilon_b).")
     q_bc = args["q-bc"]
     q_bc > 0 || error("The dipole evaluation point q_bc must be positive, got $(q_bc).")
     energy_step = args["dE"]
@@ -1199,7 +1201,7 @@ function main()
                             long_range_timing = @timed build_ewald_long_range(
                                 rotated_R, rotated_R_bc, tau_of_lambda, basis.image_of, lattice,
                                 q_grid_invA, q_bc_invA, l_max,
-                                ewald_parameters; include_dipole_term = !no_dipole_term)
+                                ewald_parameters; epsilon_b = epsilon_b)
                             crystal_long_range = long_range_timing.value
                             push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
 
@@ -1215,7 +1217,6 @@ function main()
                                     "G_max = $(round(ewald_parameters.G_max, digits = 4)) Å^-1 " *
                                     "(N_G ≈ $(round(Int, expected_G)), $(length(crystal_long_range.G_vectors)) candidates), " *
                                     "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
-                            no_dipole_term && println("The Q = 0 term is dropped, so this is the conducting boundary condition.")
 
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_difference, rotated_Xi,
@@ -1434,7 +1435,10 @@ function main()
                                 # is the ingredients that rebuild it rather than a table over ΔR.
                                 long_range_group = create_group(couplings_group, "long_range")
                                 write(long_range_group, "eta", crystal_results.ewald_parameters.eta) # Å^-1.
+                                # The Ewald truncation error, which is not the medium permittivity below.
                                 write(long_range_group, "epsilon", crystal_results.ewald_parameters.epsilon)
+                                # The permittivity of the medium around the sample, scaling the Q = 0 term.
+                                write(long_range_group, "epsilon_b", long_range.epsilon_b)
                                 write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max) # Å.
                                 write(long_range_group, "G_max", crystal_results.ewald_parameters.G_max) # Å^-1.
                                 write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors)) # Å^-1.
@@ -1442,7 +1446,6 @@ function main()
                                 write(long_range_group, "q_step", long_range.q_step) # Å^-1.
                                 write(long_range_group, "l_max_lr", long_range.l_max_lr)
                                 write(long_range_group, "dipole_slopes", long_range.dipole_slopes) # Å.
-                                write(long_range_group, "include_dipole_term", long_range.include_dipole_term)
                             end
                         end
 

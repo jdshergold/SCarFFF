@@ -62,6 +62,7 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     # Fields:
     - image_of::Vector{Int}: The image index (A, i) for each λ.
     - transition_of::Vector{Int}: The transition index s for each λ, as a position in the requested transition list.
+    - lambda_of::Matrix{Int}: The λ carrying each (image, transition), which inverts the two above.
     - energies::Vector{T}: The monomer excitation energy E_{A,s} for each λ, in eV.
     - diagonal_corrections::Vector{T}: The environment shift D_{A_i,s} for each λ, in eV.
     - images::Vector{CrystalImage{T}}: The images themselves.
@@ -69,6 +70,7 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     """
     image_of::Vector{Int}
     transition_of::Vector{Int}
+    lambda_of::Matrix{Int}
     energies::Vector{T}
     diagonal_corrections::Vector{T}
     images::Vector{CrystalImage{T}}
@@ -103,6 +105,7 @@ function build_excitation_basis(
     n_lambda = length(images) * n_transitions
     image_of = Vector{Int}(undef, n_lambda)
     transition_of = Vector{Int}(undef, n_lambda)
+    lambda_of = Matrix{Int}(undef, length(images), n_transitions)
     energies = Vector{T}(undef, n_lambda)
 
     lambda = 0
@@ -117,12 +120,13 @@ function build_excitation_basis(
             lambda += 1
             image_of[lambda] = image_idx
             transition_of[lambda] = transition_idx
+            lambda_of[image_idx, transition_idx] = lambda
             energies[lambda] = conformer_transition_energies[conformer_idx][transition_idx]
         end
     end
 
     return CrystalExcitationBasis{T}(
-        image_of, transition_of, energies, zeros(T, n_lambda), images, n_transitions)
+        image_of, transition_of, lambda_of, energies, zeros(T, n_lambda), images, n_transitions)
 end
 
 function set_diagonal_corrections!(

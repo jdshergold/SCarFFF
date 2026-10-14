@@ -4,7 +4,8 @@ using HDF5
 
 include("DensityMatrices.jl")
 using .DensityMatrices: build_transition_matrix, build_ground_state_matrix,
-                        build_difference_matrix, to_real_density
+                        build_pair_difference_matrix, to_real_density,
+                        TransitionPairs, build_transition_pairs
 
 export get_molecular_data, MoleculeData
 
@@ -264,7 +265,7 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     nuclear_charges = [get(ATOMIC_NUMBERS, symbol) do
         error("Unknown element symbol '$(symbol)' in the TD-DFT data.")
     end for symbol in atom_symbols]
-    # PySCF writes these in Bohr, and everything downstream of here works in Angstroms.
+    # PySCF writes these in Bohr, and the rest of SCarFFF works in Angstroms.
     atom_coordinates = h5_data["atom_coordinates"] .* T(AU_TO_ANGSTROM)
     molecule_cuboid = Array{T}(undef, 0, 3)
     primitive_to_orbital = Int[]
@@ -301,7 +302,7 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         transition_matrix = build_transition_matrix(
             X, Y, mo_coeff_occ, mo_coeff_vir
         )
-        difference_matrix = build_difference_matrix(X, Y, mo_coeff_occ, mo_coeff_vir)
+        difference_matrix = build_pair_difference_matrix(X, Y, X, Y, mo_coeff_occ, mo_coeff_vir)
         push!(transition_matrices, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
         push!(difference_matrices, to_real_density(difference_matrix, T; label = "difference density matrix for state $(idx)"))
         push!(transition_energies_eV, h5_data["energies_ev"][idx])
