@@ -863,10 +863,10 @@ function main()
 
                     # The coherent correction also needs ΔN and Ξ. They go through the same R
                     # contraction, but remain internal rather than changing the molecular output.
-                    need_xi_and_dN = crystal_order == "coherent" && !no_couplings
-                    xi_and_dN = nothing
-                    if need_xi_and_dN
-                        R_tensor, f_s, f_lm, transition_energies_eV, xi_and_dN =
+                    need_Delta_and_Xi = crystal_order == "coherent" && !no_couplings
+                    Delta_and_Xi = nothing
+                    if need_Delta_and_Xi
+                        R_tensor, f_s, f_lm, transition_energies_eV, Delta_and_Xi =
                             compute_spherical_form_factor_with_densities(
                                 q_grid,
                                 theta_grid,
@@ -900,11 +900,11 @@ function main()
 
                     # The Ewald Q = 0 term needs the transition dipole, which is the q → 0 limit off̄_{1m}(q)/q.
                     R_bc = nothing
-                    difference_bc = nothing
+                    Delta_bc = nothing
                     Xi_bc = nothing
                     if need_q_bc
                         # We have to include the q = 0 point since there's a check for neutrality at the origin.
-                        R_both, _, _, _, xi_and_dN_bc =
+                        R_both, _, _, _, Delta_and_Xi_bc =
                             compute_spherical_form_factor_with_densities(
                                 T[0, q_bc],
                                 theta_grid,
@@ -920,8 +920,8 @@ function main()
                                 need_flm=false
                             )
                         R_bc = R_both[:, 2:2, :]
-                        difference_bc = xi_and_dN_bc.difference_R[:, 2:2, :]
-                        Xi_bc = xi_and_dN_bc.Xi_R[:, 2:2, :]
+                        Delta_bc = Delta_and_Xi_bc.Delta_R[:, 2:2, :]
+                        Xi_bc = Delta_and_Xi_bc.Xi_R[:, 2:2, :]
 
                         # TD-DFT reports the oscillator strength, which fixes the dipole without
                         # going near the form factor, so it catches a broken ℓ = 1 coefficient.
@@ -941,9 +941,9 @@ function main()
                         f_s = f_s,
                         f_lm = f_lm,
                         transition_energies_eV = transition_energies_eV,
-                        xi_and_dN = xi_and_dN,
+                        Delta_and_Xi = Delta_and_Xi,
                         R_bc = R_bc,
-                        difference_bc = difference_bc,
+                        Delta_bc = Delta_bc,
                         Xi_bc = Xi_bc,
                     )
 
@@ -1074,20 +1074,20 @@ function main()
                     # Rotate each conformer's coefficients into every image's orientation using D matrices.
                     # This keeps all images on the same unrotated q grid.
                     stage_times = Pair{String, Float64}[]
-                    rotated_difference = nothing
+                    rotated_Delta = nothing
                     rotated_Xi = nothing
                     rotated_R_bc = nothing
-                    rotated_difference_bc = nothing
+                    rotated_Delta_bc = nothing
                     rotated_Xi_bc = nothing
                     if crystal_order == "coherent" && !no_couplings
-                        conformer_difference = [conformer_results[label].xi_and_dN.difference_R
+                        conformer_Delta = [conformer_results[label].Delta_and_Xi.Delta_R
                                                 for label in conformer_labels]
-                        conformer_Xi = [conformer_results[label].xi_and_dN.Xi_R
+                        conformer_Xi = [conformer_results[label].Delta_and_Xi.Xi_R
                                         for label in conformer_labels]
                         rotate_timing = @timed rotate_crystal_R_tensors(
-                            conformer_R_tensors, conformer_difference, conformer_Xi,
+                            conformer_R_tensors, conformer_Delta, conformer_Xi,
                             images, basis, l_max)
-                        rotated_R, rotated_difference, rotated_Xi = rotate_timing.value
+                        rotated_R, rotated_Delta, rotated_Xi = rotate_timing.value
                     else
                         rotate_timing = @timed rotate_R_tensors(
                             conformer_R_tensors, images, basis, l_max)
@@ -1098,11 +1098,11 @@ function main()
                     # Rotate the dipole terms.
                     if need_q_bc
                         conformer_R_bc = [conformer_results[label].R_bc for label in conformer_labels]
-                        conformer_difference_bc = [conformer_results[label].difference_bc
+                        conformer_Delta_bc = [conformer_results[label].Delta_bc
                                                    for label in conformer_labels]
                         conformer_Xi_bc = [conformer_results[label].Xi_bc for label in conformer_labels]
-                        rotated_R_bc, rotated_difference_bc, rotated_Xi_bc = rotate_crystal_R_tensors(
-                            conformer_R_bc, conformer_difference_bc, conformer_Xi_bc,
+                        rotated_R_bc, rotated_Delta_bc, rotated_Xi_bc = rotate_crystal_R_tensors(
+                            conformer_R_bc, conformer_Delta_bc, conformer_Xi_bc,
                             images, basis, l_max)
                     end
 
@@ -1190,7 +1190,7 @@ function main()
                         if ewald_parameters === nothing
                             println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.vectors)) cells).")
                             correction_timing = @timed compute_crystal_corrections(
-                                rotated_R, rotated_difference, rotated_Xi,
+                                rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
                             crystal_couplings, diagonal_corrections = correction_timing.value
                             set_diagonal_corrections!(basis, diagonal_corrections)
@@ -1219,7 +1219,7 @@ function main()
                                     "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
 
                             correction_timing = @timed compute_crystal_corrections(
-                                rotated_R, rotated_difference, rotated_Xi,
+                                rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
                                 parameters = ewald_parameters)
                             crystal_couplings, diagonal_short_range = correction_timing.value
@@ -1227,8 +1227,8 @@ function main()
                             subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
 
                             diagonal_timing = @timed compute_ewald_diagonal(
-                                rotated_difference, rotated_Xi,
-                                rotated_difference_bc, rotated_Xi_bc,
+                                rotated_Delta, rotated_Xi,
+                                rotated_Delta_bc, rotated_Xi_bc,
                                 q_grid_invA, q_bc_invA, l_max,
                                 crystal_long_range)
                             set_diagonal_corrections!(

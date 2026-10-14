@@ -11,6 +11,7 @@ const DF = SF.DensityFormFactors
 const CJ = SF.CouplingJ
 const BH = SF.BlochHamiltonian
 const DM = SF.ReadBasisSet.DensityMatrices
+const RB = SF.ReadBasisSet
 
 function harmonic_values(direction::SVector{3, T}, l_max::Int) where {T<:AbstractFloat}
     """
@@ -295,21 +296,49 @@ end
             small_case.inputs
         mol = small_case.mol
 
-        # Batch order is transitions, ground, then one difference density per transition.
-        # As in, all_R = [transition_R_1, transition_R_2, ..., ground_R, difference_R_1, difference_R_2, ...].
-        densities = Matrix{T}[
-            mol.transition_matrices[1], mol.ground_state_matrix, mol.difference_matrices[1]]
+        # Batch order is transitions, ground, then one Δ density per (s, t) pair.
+        # As in, all_R = [transition_R_1, transition_R_2, ..., ground_R, Delta_R_1, Delta_R_2, ...].
+        densities = Matrix{T}[mol.transition_matrices[1], mol.ground_state_matrix]
+        append!(densities, RB.build_Delta_matrices(mol, [1]))
         all_R = RT.construct_R_tensor(
             W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path,
             densities, term_to_orbital)
-        transition_R, difference_R, Xi_R = DF.split_density_R_tensors(
+        transition_R, Delta_R, Xi_R = DF.split_density_R_tensors(
             all_R, 1, mol.atom_coordinates, mol.nuclear_charges, q_grid, l_max)
 
         # Check that splitting the transitions didn't change them.
         @test transition_R == all_R[1:1, :, :]
         # Check that the charge densities are zero at the orgin, as these are just integrals over the molecule charge density, N_e - sum_I Z_I = 0.
-        @test all(iszero, difference_R[:, 1, :])
+        @test all(iszero, Delta_R[:, 1, :])
         @test all(iszero, Xi_R[:, 1, :])
+
+        # Two transitions give three pairs, so the batch is 2 + 1 + 3 and Δ starts after the ground state.
+        # This molecule only has one state, so invent a second one by scaling its amplitudes. Any Δ
+        # built from X and Y is neutral at q = 0, so the split's neutrality check still applies.
+        X_1 = mol.X_matrices[1]
+        Y_1 = mol.Y_matrices[1]
+        X_2 = T(0.7) .* X_1
+        Y_2 = T(-0.4) .* Y_1
+        Delta_pair_matrices = Matrix{T}[
+            DM.build_pair_difference_matrix(X_1, Y_1, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir),
+            DM.build_pair_difference_matrix(X_1, Y_1, X_2, Y_2, mol.mo_coeff_occ, mol.mo_coeff_vir),
+            DM.build_pair_difference_matrix(X_2, Y_2, X_2, Y_2, mol.mo_coeff_occ, mol.mo_coeff_vir)]
+        two_state_densities = Matrix{T}[mol.transition_matrices[1], mol.transition_matrices[1],
+                                        mol.ground_state_matrix]
+        append!(two_state_densities, Delta_pair_matrices)
+        two_state_R = RT.construct_R_tensor(
+            W_ij, sigma_ij, R_ij_mod, R_ij_hat, q_grid, l_max, gaunt_path,
+            two_state_densities, term_to_orbital)
+        _, two_state_Delta, _ = DF.split_density_R_tensors(
+            two_state_R, 2, mol.atom_coordinates, mol.nuclear_charges, q_grid, l_max)
+        # Check that we have the right number of pairs, and that they pop up in the right place in R.
+        @test size(two_state_Delta, 1) == 3
+        for pair in 1:3
+            @test two_state_Delta[pair, 2:end, :] == two_state_R[3 + pair, 2:end, :]
+        end
+        # The off-diagonal pair is a different density from either diagonal one.
+        @test !isapprox(two_state_Delta[2, :, :], two_state_Delta[1, :, :])
+        @test !isapprox(two_state_Delta[2, :, :], two_state_Delta[3, :, :])
 
         # Expanding Z_lm against the harmonics must reproduce the point-charge sum it came from,
         # Σ_I Z_I exp(i q · R_I), which checks the i^l, Bessel and conj(Y) factors together.

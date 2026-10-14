@@ -7,7 +7,8 @@ using .DensityMatrices: build_transition_matrix, build_ground_state_matrix,
                         build_pair_difference_matrix, to_real_density,
                         TransitionPairs, build_transition_pairs
 
-export get_molecular_data, MoleculeData
+export get_molecular_data, MoleculeData, build_Delta_matrices,
+       TransitionPairs, build_transition_pairs
 
 # Create a map from real spherical harmonic labels to m.
 # For p and d orbitals the labels are named (e.g. "x", "z^2"); for f and above they are
@@ -231,7 +232,14 @@ struct MoleculeData{T<:AbstractFloat}
     # Transition matrices for excited states.
     transition_matrices::Vector{Array{T, 2}}
     ground_state_matrix::Array{T, 2}
-    difference_matrices::Vector{Array{T, 2}}
+
+    # The TD-DFT amplitudes and MO coefficients, kept so that Δ_{st} can be built for whichever
+    # pairs of states are asked for. Held complex, as PySCF gives them, so that Δ is only taken
+    # real once it has been assembled.
+    X_matrices::Vector{Array{Complex{T}, 2}}
+    Y_matrices::Vector{Array{Complex{T}, 2}}
+    mo_coeff_occ::Array{Complex{T}, 2}
+    mo_coeff_vir::Array{Complex{T}, 2}
 
     # Transition energies in eV.
     transition_energies_eV::Vector{T}
@@ -282,7 +290,8 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
     cartesian_term_to_orbital = Int[]
     cartesian_term_to_atom = Int[]
     transition_matrices = Vector{Array{T, 2}}(undef, 0)
-    difference_matrices = Vector{Array{T, 2}}(undef, 0)
+    X_matrices = Vector{Array{Complex{T}, 2}}(undef, 0)
+    Y_matrices = Vector{Array{Complex{T}, 2}}(undef, 0)
     transition_energies_eV = T[]
 
     # Now that we have the atom coordinates, we can determine the number of atoms and cuboid.
@@ -302,9 +311,10 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         transition_matrix = build_transition_matrix(
             X, Y, mo_coeff_occ, mo_coeff_vir
         )
-        difference_matrix = build_pair_difference_matrix(X, Y, X, Y, mo_coeff_occ, mo_coeff_vir)
         push!(transition_matrices, to_real_density(transition_matrix, T; label = "transition density matrix for state $(idx)"))
-        push!(difference_matrices, to_real_density(difference_matrix, T; label = "difference density matrix for state $(idx)"))
+        # Keep the amplitudes themselves, since Δ_{st} needs them in pairs.
+        push!(X_matrices, Array{Complex{T}, 2}(X))
+        push!(Y_matrices, Array{Complex{T}, 2}(Y))
         push!(transition_energies_eV, h5_data["energies_ev"][idx])
     end
 
@@ -410,13 +420,51 @@ function construct_molecular_data(h5_data::Dict, basis_h5_path::String; precisio
         cartesian_prefactor,
         transition_matrices,
         ground_state_matrix,
-        difference_matrices,
+        X_matrices,
+        Y_matrices,
+        Array{Complex{T}, 2}(mo_coeff_occ),
+        Array{Complex{T}, 2}(mo_coeff_vir),
         transition_energies_eV,
         n_primitives,
         n_orbitals,
         n_atoms,
         n_cartesian_terms
     )
+end
+
+function build_Delta_matrices(
+        mol::MoleculeData{T},
+        transition_indices::Vector{Int},
+    )::Vector{Array{T, 2}} where {T<:AbstractFloat}
+    """
+    Build the Δ_{st} density matrices for every pair of the requested transitions.
+
+    The pairs are indexed by position in transition_indices rather than by state number, matching
+    the way the excitation basis counts transitions.
+
+    # Arguments:
+    - mol::MoleculeData{T}: The molecule, carrying the amplitudes and MO coefficients.
+    - transition_indices::Vector{Int}: The states to build pairs from.
+
+    # Returns:
+    - Vector{Array{T, 2}}: One density matrix per pair, ordered by the TransitionPairs key.
+    """
+
+    pairs = build_transition_pairs(length(transition_indices))
+    Delta_matrices = Vector{Array{T, 2}}(undef, length(pairs.transitions_of_pair))
+
+    for (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
+        state_s = transition_indices[s]
+        state_t = transition_indices[t]
+        Delta = build_pair_difference_matrix(
+            mol.X_matrices[state_s], mol.Y_matrices[state_s],
+            mol.X_matrices[state_t], mol.Y_matrices[state_t],
+            mol.mo_coeff_occ, mol.mo_coeff_vir)
+        Delta_matrices[pair] = to_real_density(
+            Delta, T; label = "Δ density matrix for states ($(state_s), $(state_t))")
+    end
+
+    return Delta_matrices
 end
 
 function get_molecular_data(

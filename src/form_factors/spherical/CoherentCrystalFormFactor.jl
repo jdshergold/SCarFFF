@@ -109,39 +109,40 @@ end
 
 function rotate_crystal_R_tensors(
         conformer_R_tensors::Vector{Array{Complex{T}, 3}},
-        conformer_difference_R::Vector{Array{Complex{T}, 3}},
+        conformer_Delta_R::Vector{Array{Complex{T}, 3}},
         conformer_Xi_R::Vector{Array{Complex{T}, 3}},
         images::Vector{CrystalImage{T}},
         basis::CrystalExcitationBasis{T},
         l_max::Int,
     ) where {T<:AbstractFloat}
     """
-    Rotate the transition, difference and neutral ground-charge R tensors into every crystal image.
+    Rotate the transition, Δ and neutral ground-charge R tensors into every crystal image.
 
     The Wigner matrices are built once per image and shared by all three objects.
 
     # Arguments:
     - conformer_R_tensors::Vector{Array{Complex{T},3}}: Transition R tensor for each conformer.
-    - conformer_difference_R::Vector{Array{Complex{T},3}}: Difference R tensor for each conformer.
+    - conformer_Delta_R::Vector{Array{Complex{T},3}}: Δ R tensor for each conformer, one row per (s, t) pair.
     - conformer_Xi_R::Vector{Array{Complex{T},3}}: One Xi R tensor for each conformer.
     - images::Vector{CrystalImage{T}}: Molecular images in the unit cell.
     - basis::CrystalExcitationBasis{T}: The image-major local excitation basis.
     - l_max::Int: The largest angular mode.
 
     # Returns:
-    - Tuple: Rotated transition, difference and Xi tensors for all images.
+    - Tuple: Rotated transition, Δ and Xi tensors for all images.
     """
 
     # Get the dimensions.
     n_images = length(images)
     n_transitions = basis.n_transitions
+    n_pairs = div(n_transitions * (n_transitions + 1), 2)
     n_q = size(conformer_R_tensors[1], 2)
     n_keys = (l_max + 1)^2
     n_lambda = length(basis.energies)
 
-    # Allocate arrays to store the rotated tensors.
+    # Allocate arrays to store the rotated tensors. Δ has one row per pair rather than per λ.
     rotated_R = Array{Complex{T}, 3}(undef, n_lambda, n_q, n_keys)
-    rotated_difference = similar(rotated_R)
+    rotated_Delta = Array{Complex{T}, 3}(undef, n_images * n_pairs, n_q, n_keys)
     rotated_Xi = Array{Complex{T}, 3}(undef, n_images, n_q, n_keys)
 
     # The D blocks depend only on the image, so build them once per image rather than per λ.
@@ -159,17 +160,18 @@ function rotate_crystal_R_tensors(
                 blocks = image_blocks[image_idx]
                 # Pick out the reference R tensors for this image.
                 transition_R_for_conformer = conformer_R_tensors[image.conformer_index]
-                difference_R_for_conformer = conformer_difference_R[image.conformer_index]
+                Delta_R_for_conformer = conformer_Delta_R[image.conformer_index]
                 Xi_R_for_conformer = conformer_Xi_R[image.conformer_index]
 
                 # Check that the conformer has the right number of transitions.
                 size(transition_R_for_conformer, 1) == n_transitions || error(
                     "Conformer $(image.conformer_index) has $(size(transition_R_for_conformer, 1)) transitions, expected $(n_transitions).")
-                size(difference_R_for_conformer, 1) == n_transitions || error(
-                    "Conformer $(image.conformer_index) has the wrong number of difference densities.")
+                size(Delta_R_for_conformer, 1) == n_pairs || error(
+                    "Conformer $(image.conformer_index) has $(size(Delta_R_for_conformer, 1)) Δ densities, expected $(n_pairs).")
                 size(Xi_R_for_conformer, 1) == 1 || error("Each conformer should have one Ξ tensor.")
 
                 lambda_start = (image_idx - 1) * n_transitions
+                Delta_start = (image_idx - 1) * n_pairs
                 for l in 0:l_max
                     key_start = l * l + 1
                     width = 2 * l + 1
@@ -180,7 +182,7 @@ function rotate_crystal_R_tensors(
                     output_view = @view output[1:width]
 
                     for q_idx in 1:n_q
-                        # Rotate every transition and its difference density with the same D block.
+                        # Rotate every transition with this D block.
                         for transition in 1:n_transitions
                             lambda = lambda_start + transition
                             @inbounds for offset in 1:width
@@ -190,13 +192,17 @@ function rotate_crystal_R_tensors(
                             @inbounds for offset in 1:width
                                 rotated_R[lambda, q_idx, key_start + offset - 1] = parity * output_view[offset]
                             end
+                        end
 
+                        # Then every Δ pair, of which there are more than there are transitions.
+                        for pair in 1:n_pairs
+                            row = Delta_start + pair
                             @inbounds for offset in 1:width
-                                input_view[offset] = difference_R_for_conformer[transition, q_idx, key_start + offset - 1]
+                                input_view[offset] = Delta_R_for_conformer[pair, q_idx, key_start + offset - 1]
                             end
                             mul!(output_view, D_l, input_view)
                             @inbounds for offset in 1:width
-                                rotated_difference[lambda, q_idx, key_start + offset - 1] = parity * output_view[offset]
+                                rotated_Delta[row, q_idx, key_start + offset - 1] = parity * output_view[offset]
                             end
                         end
 
@@ -214,7 +220,7 @@ function rotate_crystal_R_tensors(
         end
     end
 
-    return rotated_R, rotated_difference, rotated_Xi
+    return rotated_R, rotated_Delta, rotated_Xi
 end
 
 @inline function contract_monomer_amplitudes!(
@@ -421,6 +427,13 @@ function compute_coherent_crystal_form_factor(
     chunk_occupancy = [zeros(Bool, n_energy, n_q_block) for _ in 1:n_chunks]
     chunk_outside = zeros(Int, n_chunks)
 
+    # Avoid BLAS oversubscription. Without this, the diagonalisation inside each task runs its own
+    # BLAS threads, and the order it sums in changes from run to run, so the bands move about at the
+    # level of the floating point precision.
+    blas_threads = BLAS.get_num_threads()
+    BLAS.set_num_threads(1)
+    try
+
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
             # Give each task its own caches.
@@ -564,6 +577,10 @@ function compute_coherent_crystal_form_factor(
         end
     end
 
+    finally
+        BLAS.set_num_threads(blas_threads)
+    end
+
     # Merge the per-task band statistics.
     band_stats = Matrix{T}(undef, n_lambda, 3)
     @inbounds for state_idx in 1:n_lambda
@@ -575,7 +592,7 @@ function compute_coherent_crystal_form_factor(
     # Mark which energies and q points are occupied.
     occupancy = zeros(Bool, n_energy, n_q_block)
     @inbounds for chunk in 1:n_chunks, index in eachindex(occupancy)
-        occupancy[index] |= chunk_occupancy[chunk][index] # a |= b means a = a | b. 
+        occupancy[index] |= chunk_occupancy[chunk][index] # a |= b means a = a | b.
     end
 
     return f_sq, band_stats, f_s, block, occupancy, sum(chunk_outside)

@@ -118,9 +118,9 @@ function split_density_R_tensors(
         threshold::T = zero(T),
     ) where {T<:AbstractFloat}
     """
-    Split the density batch, [R_s1, R_s2, ..., R_sn, R_g, dR_1,..., dR_n], where R_sn is
+    Split the density batch, [R_s1, R_s2, ..., R_sn, R_g, Δ_1,..., Δ_p], where R_sn is
     the nth transition R tensor (f_lm), R_g is the ground state R tensor, for the charge density,
-    denoted N_g in the notes, and dR_n difference R tensor, ΔN_n in the notes. Then build
+    denoted N_g in the notes, and Δ_p is the R tensor of the pth (s, t) pair. Then build
 
         Ξ_lm(q) = N_lm^(g)(q) - Z_lm(q).
 
@@ -128,7 +128,7 @@ function split_density_R_tensors(
 
     # Arguments:
     - all_R::Array{Complex{T},3}: The complete batched R tensor.
-    - n_transitions::Int: Number of transition and difference matrices in the batch.
+    - n_transitions::Int: Number of transitions.
     - atom_coordinates::Matrix{T}: Molecular-frame nuclear positions, in Angstroms.
     - nuclear_charges::Vector{Int}: Z_I for each atom.
     - q_grid::Vector{T}: The q grid, in keV.
@@ -136,20 +136,21 @@ function split_density_R_tensors(
     - threshold::T: The W-tensor threshold used to construct all_R.
 
     # Returns:
-    - Tuple: The transition R tensor, difference R tensor and Xi R tensor.
+    - Tuple: The transition R tensor, Δ R tensor and Xi R tensor.
     """
 
     # Check that we have the right number of R tensors to split up.
-    expected = 2 * n_transitions + 1
+    n_pairs = div(n_transitions * (n_transitions + 1), 2)
+    expected = n_transitions + 1 + n_pairs
     size(all_R, 1) == expected || error(
-        "The diagonal-density batch has $(size(all_R, 1)) matrices, expected $(expected).")
+        "The density batch has $(size(all_R, 1)) matrices, expected $(expected).")
     abs(q_grid[1]) <= eps(T) || error("The diagonal correction needs a q grid starting at zero.")
 
-    # Split into transition, GS, and difference R tensors.
+    # Split into transition, GS, and Δ R tensors.
     transition_R = all_R[1:n_transitions, :, :]
     ground_R = all_R[(n_transitions + 1):(n_transitions + 1), :, :]
-    difference_R = all_R[(n_transitions + 2):end, :, :]
-    
+    Delta_R = all_R[(n_transitions + 2):end, :, :]
+
     # Construct Ξ_lm(q).
     nuclear_R = construct_nuclear_R(atom_coordinates, nuclear_charges, q_grid, l_max)
     Xi_R = ground_R .- nuclear_R
@@ -158,18 +159,18 @@ function split_density_R_tensors(
     # numerical monopole would be amplified by the 1/G² Ewald kernel.
     charge_scale = max(T(sum(nuclear_charges)), one(T))
     tolerance = T(100) * max(eps(T), abs(threshold)) * charge_scale
-    difference_residual = maximum(abs, @view difference_R[:, 1, 1])
+    difference_residual = maximum(abs, @view Delta_R[:, 1, 1])
     Xi_residual = abs(Xi_R[1, 1, 1])
     difference_residual <= tolerance || error(
-        "The difference density is not neutral at q = 0: residual $(difference_residual), tolerance $(tolerance).")
+        "A Δ density is not neutral at q = 0: residual $(difference_residual), tolerance $(tolerance).")
     Xi_residual <= tolerance || error(
         "The ground-state charge form factor is not neutral at q = 0: residual $(Xi_residual), tolerance $(tolerance).")
 
     # The above checks that the origin is approximately neutral, so we don't lose anything. This now hard enforces it for stability.
-    @views fill!(difference_R[:, 1, 1], zero(Complex{T}))
+    @views fill!(Delta_R[:, 1, 1], zero(Complex{T}))
     Xi_R[1, 1, 1] = zero(Complex{T})
 
-    return transition_R, difference_R, Xi_R
+    return transition_R, Delta_R, Xi_R
 end
 
 end

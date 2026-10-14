@@ -14,6 +14,8 @@ using ..Ewald: EwaldParameters, short_range_kernel
 using ..BlochHamiltonian: CrystalExcitationBasis, CrystalCouplings
 using ..ConstructRTensor: fill_spherical_bessel_column!
 using ..ConstructFLMTensor: load_gaunt_array
+using ..DensityFormFactors: Delta_row
+using ..ReadBasisSet: build_transition_pairs
 using ..ProjectFLM: quadrature_weights
 using ..WignerRotations: WignerDBuffers, wigner_d_blocks!
 using ...FastPowers: fast_i_pow, fast_neg1_pow
@@ -405,9 +407,12 @@ function _compute_crystal_corrections(
         "$(length.(lambdas_of_image))."
     )
 
+    # Δ carries one row per (s, t) pair of each image, rather than one per λ.
+    pairs = build_transition_pairs(n_transitions)
+    n_pairs = length(pairs.transitions_of_pair)
     if have_dN_and_Xi
-        size(rotated_difference) == size(rotated_R) || error(
-            "The rotated difference tensor has size $(size(rotated_difference)), expected $(size(rotated_R)).")
+        size(rotated_difference) == (n_images * n_pairs, n_q, n_keys) || error(
+            "The rotated Δ tensor has size $(size(rotated_difference)), expected $((n_images * n_pairs, n_q, n_keys)).")
         size(rotated_Xi) == (n_images, n_q, n_keys) || error(
             "The rotated Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, n_q, n_keys)).")
     end
@@ -434,10 +439,13 @@ function _compute_crystal_corrections(
         [Matrix{Complex{T}}(undef, n_q, n_keys) for _ in 1:n_images] : nothing
     if have_dN_and_Xi
         for image_idx in 1:n_images
-            @inbounds for (slot, lambda) in enumerate(lambdas_of_image[image_idx]),
+            # Only the s = t pairs are used so far, so D stays diagonal until the off-diagonal
+            # blocks are wired up.
+            @inbounds for slot in 1:n_transitions,
                           key in 1:n_keys, q_idx in 1:n_q
+                row = Delta_row(image_idx, pairs.pair_of_transitions[slot, slot], n_pairs)
                 difference_coefficients[image_idx][slot, q_idx, key] =
-                    rotated_difference[lambda, q_idx, key]
+                    rotated_difference[row, q_idx, key]
             end
             @inbounds for key in 1:n_keys, q_idx in 1:n_q
                 Xi_coefficients[image_idx][q_idx, key] = conj(rotated_Xi[image_idx, q_idx, key])

@@ -8,6 +8,8 @@ using LinearAlgebra: norm, cross, dot, mul!, BLAS
 
 using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGSTROM,
                         HARTREE_EV, BOHR_ANGSTROM
+using ..DensityFormFactors: Delta_row
+using ..ReadBasisSet: build_transition_pairs
 
 export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
@@ -720,19 +722,34 @@ function compute_ewald_diagonal(
     n_lambda = length(data.image_of)
     n_images = length(data.translations)
     n_keys = (l_max + 1)^2
-    size(rotated_difference, 1) == n_lambda || error(
-        "There are $(size(rotated_difference, 1)) difference densities for $(n_lambda) excitations.")
+    # λ is image-major with the transitions running fastest, so this recovers how many there are.
+    n_transitions = div(n_lambda, n_images)
+    pairs = build_transition_pairs(n_transitions)
+    n_pairs = length(pairs.transitions_of_pair)
+    n_Delta_rows = n_images * n_pairs
+    size(rotated_difference, 1) == n_Delta_rows || error(
+        "There are $(size(rotated_difference, 1)) Δ densities for $(n_Delta_rows) image and pair combinations.")
     size(rotated_difference, 2) == length(q_grid_invA) && size(rotated_difference, 3) == n_keys || error(
-        "The difference tensor has size $(size(rotated_difference)), expected $((n_lambda, length(q_grid_invA), n_keys)).")
+        "The Δ tensor has size $(size(rotated_difference)), expected $((n_Delta_rows, length(q_grid_invA), n_keys)).")
     size(rotated_Xi, 1) == n_images || error(
         "There are $(size(rotated_Xi, 1)) Ξ tensors for $(n_images) images.")
     size(rotated_Xi, 2) == length(q_grid_invA) && size(rotated_Xi, 3) == n_keys || error(
         "The Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, length(q_grid_invA), n_keys)).")
-    # The boundary tensors cover the same λ and images, but only the one q point they sit on.
-    size(rotated_difference_bc) == (n_lambda, 1, n_keys) || error(
-        "The boundary ΔN tensor has size $(size(rotated_difference_bc)), expected $((n_lambda, 1, n_keys)).")
+    # The boundary tensors cover the same rows and images, but only the one q point they sit on.
+    size(rotated_difference_bc) == (n_Delta_rows, 1, n_keys) || error(
+        "The boundary Δ tensor has size $(size(rotated_difference_bc)), expected $((n_Delta_rows, 1, n_keys)).")
     size(rotated_Xi_bc) == (n_images, 1, n_keys) || error(
         "The boundary Ξ tensor has size $(size(rotated_Xi_bc)), expected $((n_images, 1, n_keys)).")
+
+    # The Δ row each λ reads, which for now is its s = t pair, so D stays diagonal until the
+    # off-diagonal blocks are wired up.
+    diagonal_row_of_lambda = Vector{Int}(undef, n_lambda)
+    for lambda in 1:n_lambda
+        image = data.image_of[lambda]
+        transition = lambda - (image - 1) * n_transitions
+        diagonal_row_of_lambda[lambda] =
+            Delta_row(image, pairs.pair_of_transitions[transition, transition], n_pairs)
+    end
 
     # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
     difference_table, difference_tangent, q_step, difference_l_max =
@@ -798,12 +815,13 @@ function compute_ewald_diagonal(
         # Contract ΔN with the shared Ξ sum, phased onto each molecule's position in the cell.
         weight = data.prefactor * exp(-(G_norm / (2 * data.eta))^2) / (G_norm * G_norm)
         for lambda in 1:n_lambda
+            row = diagonal_row_of_lambda[lambda]
             amplitude = zero(Complex{T})
             @simd for key in 1:size(difference_table, 1)
-                amplitude += (h00 * difference_table[key, lambda, difference_node] +
-                              h10 * difference_tangent[key, lambda, difference_node] +
-                              h01 * difference_table[key, lambda, difference_node + 1] +
-                              h11 * difference_tangent[key, lambda, difference_node + 1]) * harmonics[key]
+                amplitude += (h00 * difference_table[key, row, difference_node] +
+                              h10 * difference_tangent[key, row, difference_node] +
+                              h01 * difference_table[key, row, difference_node + 1] +
+                              h11 * difference_tangent[key, row, difference_node + 1]) * harmonics[key]
             end
             phase = cis(dot(G, data.translations[data.image_of[lambda]]))
             diagonal[lambda] += weight * phase * amplitude * conj(total_Xi)
@@ -821,7 +839,8 @@ function compute_ewald_diagonal(
         @inbounds for lambda in 1:n_lambda
             total = zero(Complex{T})
             for component in 1:3
-                total += difference_slopes[lambda, component] * conj(total_Xi_slopes[component])
+                total += difference_slopes[diagonal_row_of_lambda[lambda], component] *
+                         conj(total_Xi_slopes[component])
             end
             diagonal[lambda] += boundary_weight * total
         end
@@ -843,9 +862,10 @@ function compute_ewald_diagonal(
     self_prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
     @inbounds for lambda in 1:n_lambda
         image = data.image_of[lambda]
+        row = diagonal_row_of_lambda[lambda]
         self = zero(Complex{T})
         for key in 1:n_keys, q_idx in 1:n_q
-            self += radial_weights[q_idx] * rotated_difference[lambda, q_idx, key] *
+            self += radial_weights[q_idx] * rotated_difference[row, q_idx, key] *
                     conj(rotated_Xi[image, q_idx, key])
         end
         diagonal[lambda] -= self_prefactor * self
