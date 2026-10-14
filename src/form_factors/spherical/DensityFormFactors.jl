@@ -1,4 +1,4 @@
-# This module constructs the extra spherical form factors needed by the diagonal crystal correction.
+# This module constructs the extra spherical form factors needed by the same-molecule crystal couplings D.
 
 module DensityFormFactors
 
@@ -144,7 +144,7 @@ function split_density_R_tensors(
     expected = n_transitions + 1 + n_pairs
     size(all_R, 1) == expected || error(
         "The density batch has $(size(all_R, 1)) matrices, expected $(expected).")
-    abs(q_grid[1]) <= eps(T) || error("The diagonal correction needs a q grid starting at zero.")
+    abs(q_grid[1]) <= eps(T) || error("The D correction needs a q grid starting at zero.")
 
     # Split into transition, GS, and Δ R tensors.
     transition_R = all_R[1:n_transitions, :, :]
@@ -159,10 +159,10 @@ function split_density_R_tensors(
     # numerical monopole would be amplified by the 1/G² Ewald kernel.
     charge_scale = max(T(sum(nuclear_charges)), one(T))
     tolerance = T(100) * max(eps(T), abs(threshold)) * charge_scale
-    difference_residual = maximum(abs, @view Delta_R[:, 1, 1])
+    Delta_residual = maximum(abs, @view Delta_R[:, 1, 1])
     Xi_residual = abs(Xi_R[1, 1, 1])
-    difference_residual <= tolerance || error(
-        "A Δ density is not neutral at q = 0: residual $(difference_residual), tolerance $(tolerance).")
+    Delta_residual <= tolerance || error(
+        "A Δ density is not neutral at q = 0: residual $(Delta_residual), tolerance $(tolerance).")
     Xi_residual <= tolerance || error(
         "The ground-state charge form factor is not neutral at q = 0: residual $(Xi_residual), tolerance $(tolerance).")
 

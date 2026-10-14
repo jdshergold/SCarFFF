@@ -11,7 +11,7 @@ using FastLapackInterface: HermitianEigenWs
 using ..Ewald: EwaldLongRangeData, EwaldLongRangeBuffers, add_long_range!
 
 export CrystalImage, CrystalExcitationBasis, build_excitation_basis, CrystalCouplings,
-       set_diagonal_corrections!, build_bloch_hamiltonian!, solve_bloch_hamiltonian!,
+       set_D_couplings!, build_bloch_hamiltonian!, solve_bloch_hamiltonian!,
        solve_bloch_energies!, BlochEigensystem
 
 struct CrystalCouplings{T<:AbstractFloat}
@@ -46,7 +46,7 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     """
     The localised excitation basis λ = (A, i, s), flattened to a single index.
 
-    The ordering defined here is the one contract used by both the Bloch Hamiltonian and the
+    The ordering defined here is used by both the Bloch Hamiltonian and the
     coherent form factor sum, so that the eigenvector components line up with the molecular
     amplitudes. It is image-major, so λ runs over transitions fastest, then over images.
 
@@ -64,7 +64,8 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     - transition_of::Vector{Int}: The transition index s for each λ, as a position in the requested transition list.
     - lambda_of::Matrix{Int}: The λ carrying each (image, transition), which inverts the two above.
     - energies::Vector{T}: The monomer excitation energy E_{A,s} for each λ, in eV.
-    - diagonal_corrections::Vector{T}: The environment shift D_{A_i,s} for each λ, in eV.
+    - D_couplings::Matrix{T}: The same-molecule couplings D_{λλ'} in eV, non-zero only for λ and λ'
+      on the same image.
     - images::Vector{CrystalImage{T}}: The images themselves.
     - n_transitions::Int: The number of transitions per image.
     """
@@ -72,7 +73,7 @@ struct CrystalExcitationBasis{T<:AbstractFloat}
     transition_of::Vector{Int}
     lambda_of::Matrix{Int}
     energies::Vector{T}
-    diagonal_corrections::Vector{T}
+    D_couplings::Matrix{T}
     images::Vector{CrystalImage{T}}
     n_transitions::Int
 end
@@ -126,28 +127,49 @@ function build_excitation_basis(
     end
 
     return CrystalExcitationBasis{T}(
-        image_of, transition_of, lambda_of, energies, zeros(T, n_lambda), images, n_transitions)
+        image_of, transition_of, lambda_of, energies, zeros(T, n_lambda, n_lambda),
+        images, n_transitions)
 end
 
-function set_diagonal_corrections!(
+function set_D_couplings!(
         basis::CrystalExcitationBasis{T},
-        corrections::AbstractVector,
+        blocks::AbstractArray{<:Real, 3},
     )::CrystalExcitationBasis{T} where {T<:AbstractFloat}
     """
-    Store the diagonal crystal shifts D in the localised excitation basis.
+    Store the same-molecule couplings D in the localised excitation basis.
+
+    D only couples excitations on the same molecule, so it arrives as one block per image and is
+    spread onto the (λ, λ') pairs here.
 
     # Arguments:
-    - basis::CrystalExcitationBasis{T}: The basis whose diagonal corrections are overwritten.
-    - corrections::AbstractVector: One finite correction in eV for every lambda.
+    - basis::CrystalExcitationBasis{T}: The basis whose D couplings are overwritten.
+    - blocks::AbstractArray{<:Real,3}: D in eV, with dimensions (n_images, n_transitions, n_transitions).
 
     # Returns:
-    - CrystalExcitationBasis{T}: The same basis, with its D vector updated.
+    - CrystalExcitationBasis{T}: The same basis, with its D updated.
     """
 
-    length(corrections) == length(basis.energies) || error(
-        "There are $(length(corrections)) diagonal corrections for $(length(basis.energies)) localised excitations.")
-    all(isfinite, corrections) || error("The diagonal corrections contain a non-finite value.")
-    basis.diagonal_corrections .= T.(corrections)
+    # Get the dimensions of the D blocks.
+    n_images = length(basis.images)
+    n_transitions = basis.n_transitions
+    size(blocks) == (n_images, n_transitions, n_transitions) || error(
+        "The D blocks have size $(size(blocks)), expected $((n_images, n_transitions, n_transitions)).")
+    all(isfinite, blocks) || error("The D blocks contain a non-finite value.")
+
+    # D is real symmetric for the real densities RKS gives us, so check that each block is symmetric.
+    for image in 1:n_images, t in 1:n_transitions, s in 1:t
+        isapprox(blocks[image, s, t], blocks[image, t, s]; atol = sqrt(eps(T))) || error(
+            "The D block of image $(image) is not symmetric at ($(s), $(t)): " *
+            "$(blocks[image, s, t]) against $(blocks[image, t, s]).")
+    end
+
+    # Spread the D blocks onto the (λ, λ') pairs.
+    fill!(basis.D_couplings, zero(T))
+    for image in 1:n_images, t in 1:n_transitions, s in 1:n_transitions
+        basis.D_couplings[basis.lambda_of[image, s], basis.lambda_of[image, t]] =
+            T(blocks[image, s, t])
+    end
+
     return basis
 end
 
@@ -231,11 +253,14 @@ end
     """
     Assemble the Bloch Hamiltonian
 
-        H_{A_i s, B_j t}(k) = (E_{A,s} + D_{A_i,s}) δ_{AB} δ_{ij} δ_{st}
-                              + Σ_{ΔR} J_{A_i s, B_j t}(ΔR) e^{i k . ΔR} + 𝒥^LR_{A_i s, B_j t}(k).
+        H_{A_i s, B_j t}(k) = E_{A,s} δ_{AB} δ_{ij} δ_{st} + D_{A_i s, B_j t}
+                              + Σ_{ΔR} J_{A_i s, B_j t}(ΔR) e^{i k . ΔR} + 𝒥^LR_{A_i s, B_j t}(k),
 
-    Passing no couplings leaves H diagonal and k-independent, which is the zeroth-order (incoherent) limit in
-    which the crystal excitations are just the localised molecular ones. The couplings are split into the
+    where D couples excitations on the same molecule, so it is zero unless A_i = B_j, but it does
+    mix different transitions s and t of that molecule.
+
+    Setting D and both parts of J to zero leaves H diagonal and k-independent, which is the zeroth-order
+    (incoherent) limit in which the crystal excitations are just the localised molecular ones. The couplings are split into the
     short- (J) and long-range (𝒥) parts using Ewald summation.
 
     # Arguments:
@@ -254,10 +279,15 @@ end
     H = eigensystem.H
     fill!(H, zero(Complex{T}))
 
-    # Diagonal: the monomer excitation energy plus the environment shift.
+    # Diagonal: the monomer excitation energy.
     @inbounds for lambda in eachindex(basis.energies)
-        H[lambda, lambda] = Complex{T}(
-            basis.energies[lambda] + basis.diagonal_corrections[lambda])
+        H[lambda, lambda] = Complex{T}(basis.energies[lambda])
+    end
+
+    # D, which shifts each excitation and mixes those on the same molecule. Upper triangle only,
+    # like J below, since the mirror at the end fills the rest in.
+    @inbounds for lambda_prime in axes(basis.D_couplings, 2), lambda in 1:lambda_prime
+        H[lambda, lambda_prime] += Complex{T}(basis.D_couplings[lambda, lambda_prime])
     end
 
     # Off-diagonal: the lattice-summed excitation transfer.

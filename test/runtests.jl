@@ -56,6 +56,92 @@ function rotate_test_R(R::Array{Complex{T}, 3}, rotation, l_max::Int) where {T<:
     return rotated
 end
 
+function neutral_test_R(n_densities::Int, q_grid::Vector{T}, l_max::Int)::Array{Complex{T}, 3} where {T<:AbstractFloat}
+    """
+    Construct neutral test densities with different coefficients for each row and angular mode.
+
+    # Arguments:
+    - n_densities::Int: The number of densities.
+    - q_grid::Vector{T}: The |q| grid, in inverse Angstroms.
+    - l_max::Int: The largest angular mode.
+
+    # Returns:
+    - Array{Complex{T},3}: The test R tensor, with dimensions (n_densities, n_q, n_keys).
+    """
+
+    R = zeros(Complex{T}, n_densities, length(q_grid), (l_max + 1)^2)
+    for density in 1:n_densities, (q_idx, q) in enumerate(q_grid), l in 0:l_max
+        radial = (l == 0 ? q^2 : q^l) * exp(-q^2 / 2)
+        R[density, q_idx, l * l + l + 1] =
+            (isodd(l) ? Complex{T}(0, 1) : Complex{T}(1, 0)) *
+            T(0.03 + 0.04 * density) * radial
+        for m in 1:l
+            positive_key = l * l + l + m + 1
+            negative_key = l * l + l - m + 1
+            value = Complex{T}(T(0.07 * density + 0.02 * m), T(-0.03 * density + 0.05 * l)) * radial
+            R[density, q_idx, positive_key] = value
+            R[density, q_idx, negative_key] = T((-1)^(m - l)) * conj(value)
+        end
+    end
+    return R
+end
+
+function angular_D_reference(
+        Delta_R::Array{Complex{T}, 3},
+        Xi_R::Matrix{Complex{T}},
+        separation::SVector{3, T},
+        q_grid::Vector{T},
+        radial_weights::Vector{T},
+    )::Vector{Complex{T}} where {T<:AbstractFloat}
+    """
+    Integrate Δ(q) Ξ*(q) exp(i q ⋅ d) over directions without pair frames or Gaunt coefficients.
+
+    # Arguments:
+    - Delta_R::Array{Complex{T},3}: The Δ coefficients, one row per pair of states.
+    - Xi_R::Matrix{Complex{T}}: The neighbouring molecule's Ξ coefficients, indexed by q and key.
+    - separation::SVector{3,T}: The molecular separation, in Angstroms.
+    - q_grid::Vector{T}: The |q| grid, in inverse Angstroms.
+    - radial_weights::Vector{T}: The radial quadrature weights, including any Ewald kernel.
+
+    # Returns:
+    - Vector{Complex{T}}: One contribution to D per pair of states, in eV.
+    """
+
+    n_pairs, n_q, n_keys = size(Delta_R)
+    l_max = isqrt(n_keys) - 1
+
+    # Gauss-Legendre integrates in cos(θ), so its weights already include sin(θ) dθ.
+    n_theta = 24
+    n_phi = 48
+    legendre = eigen(SymTridiagonal(zeros(T, n_theta),
+        T[i / sqrt(4 * i^2 - 1) for i in 1:(n_theta - 1)]))
+    cos_theta = legendre.values
+    theta_weights = T(2) .* abs2.(legendre.vectors[1, :])
+    phi_weight = T(2 * π / n_phi)
+    Delta_matrix = reshape(Delta_R, n_pairs * n_q, n_keys)
+    contribution = zeros(Complex{T}, n_pairs)
+
+    for theta_idx in 1:n_theta, phi_idx in 1:n_phi
+        phi = T(2 * π * (phi_idx - 1) / n_phi)
+        sin_theta = sqrt(one(T) - cos_theta[theta_idx]^2)
+        direction = SVector{3, T}(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta[theta_idx])
+        harmonics = harmonic_values(direction, l_max)
+        Delta_values = reshape(Delta_matrix * harmonics, n_pairs, n_q)
+        Xi_values = Xi_R * harmonics
+        angular_weight = theta_weights[theta_idx] * phi_weight
+        for q_idx in 1:n_q
+            weight = angular_weight * radial_weights[q_idx] *
+                     cis(q_grid[q_idx] * dot(direction, separation)) * conj(Xi_values[q_idx])
+            for pair in 1:n_pairs
+                contribution[pair] += weight * Delta_values[pair, q_idx]
+            end
+        end
+    end
+
+    prefactor = T(SF.CrystalLattice.ALPHA_EM * SF.CrystalLattice.HBAR_C_EV_ANGSTROM / (2 * π^2))
+    return prefactor .* contribution
+end
+
 @testset "Stage timings" begin
     # Check that a timed stage returns its result and records one valid time.
     timings = Pair{String, Float64}[]
@@ -340,6 +426,20 @@ end
         @test !isapprox(two_state_Delta[2, :, :], two_state_Delta[1, :, :])
         @test !isapprox(two_state_Delta[2, :, :], two_state_Delta[3, :, :])
 
+        # Check that the Δ matrices come out in the right order.
+        selected_mol = deepcopy(mol)
+        X_3 = T(-0.3) .* X_1
+        Y_3 = T(0.8) .* Y_1
+        append!(selected_mol.X_matrices, [X_2, X_3])
+        append!(selected_mol.Y_matrices, [Y_2, Y_3])
+        selected_Delta = RB.build_Delta_matrices(selected_mol, [3, 1])
+        @test selected_Delta[1] ≈ real(DM.build_pair_difference_matrix(
+            X_3, Y_3, X_3, Y_3, mol.mo_coeff_occ, mol.mo_coeff_vir))
+        @test selected_Delta[2] ≈ real(DM.build_pair_difference_matrix(
+            X_3, Y_3, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir))
+        @test selected_Delta[3] ≈ real(DM.build_pair_difference_matrix(
+            X_1, Y_1, X_1, Y_1, mol.mo_coeff_occ, mol.mo_coeff_vir))
+
         # Expanding Z_lm against the harmonics must reproduce the point-charge sum it came from,
         # Σ_I Z_I exp(i q · R_I), which checks the i^l, Bessel and conj(Y) factors together.
         nuclear_R = DF.construct_nuclear_R(
@@ -363,16 +463,46 @@ end
                   ((-1)^(m - l)) .* conj.(nuclear_R[1, :, positive]) atol = 2e-13
         end
     end
+
+    T = Float64
+    l_max = 2
+    q_grid = T[0, 0.3, 0.8]
+    rotation = Quaternionic.rotor(T[cos(0.4), 0, sin(0.4), 0])
+    images = [
+        BH.CrystalImage{T}(2, rotation, -one(T), SVector{3, T}(0, 0, 0)),
+        BH.CrystalImage{T}(1, rotation, one(T), SVector{3, T}(2, 1, -0.5)),
+    ]
+    basis = BH.build_excitation_basis(images, [T[2.1, 2.8], T[2.2, 3.0]])
+    conformer_R = [neutral_test_R(2, q_grid, l_max), T(0.7) .* neutral_test_R(2, q_grid, l_max)]
+    conformer_Delta = [neutral_test_R(3, q_grid, l_max), T(-0.4) .* neutral_test_R(3, q_grid, l_max)]
+    conformer_Xi = [neutral_test_R(1, q_grid, l_max), T(1.2) .* neutral_test_R(1, q_grid, l_max)]
+    rotated_R, rotated_Delta, rotated_Xi = SF.rotate_crystal_R_tensors(
+        conformer_R, conformer_Delta, conformer_Xi, images, basis, l_max)
+    @test size(rotated_Delta) == (6, length(q_grid), (l_max + 1)^2)
+
+    # Check that the rotated coefficients match the expected rotation of the conformer coefficients, including the det(S)^l factor.
+    for (image_idx, image) in enumerate(images)
+        for (conformers, rotated, n_densities) in
+                ((conformer_R, rotated_R, 2), (conformer_Delta, rotated_Delta, 3), (conformer_Xi, rotated_Xi, 1))
+            expected = rotate_test_R(conformers[image.conformer_index], image.rotation, l_max)
+            for l in 0:l_max
+                keys = (l * l + 1):((l + 1)^2)
+                expected[:, :, keys] .*= image.det_rotation^l
+            end
+            rows = ((image_idx - 1) * n_densities + 1):(image_idx * n_densities)
+            @test rotated[rows, :, :] ≈ expected rtol = 2e-13 atol = 2e-13
+        end
+    end
 end
 
-@testset "Hamiltonian diagonal correction" begin
+@testset "Hamiltonian D correction" begin
     T = Float64
     identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
     image = BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(0, 0, 0))
     # Build a fake molecule at the origin with two transitions at 2.1 and 2.8 eV.
     basis = BH.build_excitation_basis([image], [T[2.1, 2.8]])
     # Add a diagonal correction.
-    BH.set_diagonal_corrections!(basis, T[-0.12, 0.07])
+    BH.set_D_couplings!(basis, reshape(T[-0.12, 0, 0, 0.07], 1, 2, 2))
     eigensystem = BH.BlochEigensystem(basis)
     BH.build_bloch_hamiltonian!(eigensystem, basis, SVector{3, T}(0, 0, 0))
     # Check that D is on the diagonal as E + D: 2.1 - 0.12 and 2.8 + 0.07.
@@ -380,12 +510,59 @@ end
 
     # This is the state produced by --no-couplings: no J and D pinned to zero. Evaluated at a
     # general k, not k = 0, so that any surviving k dependence would show up.
-    BH.set_diagonal_corrections!(basis, zeros(T, 2))
+    BH.set_D_couplings!(basis, zeros(T, 1, 2, 2))
     BH.build_bloch_hamiltonian!(eigensystem, basis, SVector{3, T}(0.2, -0.1, 0.3))
     # Check that no diagonal correction was applied.
     @test eigensystem.H ≈ Diagonal(Complex{T}.(basis.energies))
-    # Check that passing a single correction (there are two transitions, so need two), throws an error.
-    @test_throws ErrorException BH.set_diagonal_corrections!(basis, T[1])
+    # Check that passing a block for one transition, when there are two, throws an error.
+    @test_throws ErrorException BH.set_D_couplings!(basis, ones(T, 1, 1, 1))
+
+    for T in (Float32, Float64)
+        identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
+        images = [
+            BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(0, 0, 0)),
+            BH.CrystalImage{T}(2, identity_rotation, one(T), SVector{3, T}(2, -1, 0.5)),
+        ]
+        basis = BH.build_excitation_basis(images, [T[2.1, 2.8], T[2.2, 3.0]])
+        D_blocks = zeros(T, 2, 2, 2)
+        D_blocks[1, :, :] = T[-0.12 0.18; 0.18 0.07]
+        D_blocks[2, :, :] = T[0.03 -0.09; -0.09 -0.04]
+        BH.set_D_couplings!(basis, D_blocks)
+
+        # Each molecule has its own block. The zeros between them enforce δ_{A_i B_j}.
+        expected_D = T[-0.12 0.18 0 0; 0.18 0.07 0 0;
+                       0 0 0.03 -0.09; 0 0 -0.09 -0.04]
+        expected_H = Diagonal(basis.energies) + expected_D
+        @test basis.D_couplings == expected_D
+        eigensystem = BH.BlochEigensystem(basis)
+        tolerance = T == Float32 ? 2e-6 : 2e-13
+
+        # D mixes transitions on the same molecule even with J absent, and has no k dependence.
+        for k in (SVector{3, T}(0, 0, 0), SVector{3, T}(0.2, -0.1, 0.3))
+            BH.solve_bloch_hamiltonian!(eigensystem, basis, k)
+            @test eigensystem.H ≈ expected_H atol = tolerance
+            @test eigensystem.energies ≈ eigvals(Symmetric(expected_H)) atol = tolerance
+            @test expected_H * eigensystem.coefficients ≈
+                  eigensystem.coefficients * Diagonal(eigensystem.energies) atol = tolerance
+        end
+
+        # Invalid blocks must be rejected before replacing the previous D.
+        @test_throws ErrorException BH.set_D_couplings!(basis, zeros(T, 1, 2, 2))
+        for value in (T(NaN), T(Inf))
+            invalid_D = copy(D_blocks)
+            invalid_D[1, 1, 1] = value
+            @test_throws ErrorException BH.set_D_couplings!(basis, invalid_D)
+        end
+        asymmetric_D = copy(D_blocks)
+        asymmetric_D[1, 2, 1] += one(T)
+        @test_throws ErrorException BH.set_D_couplings!(basis, asymmetric_D)
+        @test basis.D_couplings == expected_D
+
+        # Replacing D with zero must clear the off-diagonal entries as well as the shifts.
+        BH.set_D_couplings!(basis, zero(D_blocks))
+        BH.build_bloch_hamiltonian!(eigensystem, basis, SVector{3, T}(0, 0, 0))
+        @test eigensystem.H == Diagonal(Complex{T}.(basis.energies))
+    end
 end
 
 @testset "Shared short-range J and D pass" begin
@@ -407,7 +584,7 @@ end
     # Turn it into the three tensors the crystal path wants, for two molecules. The scalings differ
     # so that D_i←j and D_j←i are not equal, and the reverse-frame branch cannot pass by coincidence.
     transition_R = vcat(base, T(0.7) .* base)
-    difference_R = vcat(T(0.4) .* base, T(-0.25) .* base)
+    Delta_R = vcat(T(0.4) .* base, T(-0.25) .* base)
     Xi_R = vcat(T(0.8) .* base, T(1.1) .* base)
 
     # Two unrotated molecules in one cell, with only the ΔR = 0 cell in the neighbour list. A
@@ -429,15 +606,15 @@ end
         # Folding D into the same pass must leave J exactly as the J-only route computed it.
         old_J = CJ.compute_couplings(
             transition_R, basis, cells, q_grid, l_max, gaunt_path)
-        new_J, diagonal = CJ.compute_crystal_corrections(
-            transition_R, difference_R, Xi_R, basis, cells, q_grid, l_max, gaunt_path)
+        new_J, D_blocks = CJ.compute_crystal_corrections(
+            transition_R, Delta_R, Xi_R, basis, cells, q_grid, l_max, gaunt_path)
         @test new_J.values ≈ old_J.values atol = 1e-13
-        @test all(isfinite, diagonal)
+        @test all(isfinite, D_blocks)
 
         # With no change in the excited-state density, every directed D interaction vanishes.
-        _, zero_diagonal = CJ.compute_crystal_corrections(
-            transition_R, zero(difference_R), Xi_R, basis, cells, q_grid, l_max, gaunt_path)
-        @test all(iszero, zero_diagonal)
+        _, zero_D = CJ.compute_crystal_corrections(
+            transition_R, zero(Delta_R), Xi_R, basis, cells, q_grid, l_max, gaunt_path)
+        @test all(iszero, zero_D)
 
         # A common rotation of both densities and their separation cannot alter a Coulomb integral.
         axis = LinearAlgebra.normalize(SVector{3, T}(0.2, -0.5, 0.7))
@@ -450,13 +627,13 @@ end
             1, identity_rotation, one(T), rotation_matrix * image.translation) for image in images]
         rotated_basis = BH.build_excitation_basis(rotated_images, [T[2.0]])
         rotated_transition = rotate_test_R(transition_R, common_rotation, l_max)
-        rotated_difference = rotate_test_R(difference_R, common_rotation, l_max)
+        rotated_Delta = rotate_test_R(Delta_R, common_rotation, l_max)
         rotated_Xi = rotate_test_R(Xi_R, common_rotation, l_max)
-        rotated_J, rotated_diagonal = CJ.compute_crystal_corrections(
-            rotated_transition, rotated_difference, rotated_Xi, rotated_basis, cells,
+        rotated_J, rotated_D = CJ.compute_crystal_corrections(
+            rotated_transition, rotated_Delta, rotated_Xi, rotated_basis, cells,
             q_grid, l_max, gaunt_path)
         @test rotated_J.values ≈ new_J.values rtol = 2e-12 atol = 2e-12
-        @test rotated_diagonal ≈ diagonal rtol = 2e-12 atol = 2e-12
+        @test rotated_D ≈ D_blocks rtol = 2e-12 atol = 2e-12
 
         # A molecule must feel neighbours on both sides, so one molecule repeated periodically
         # should be shifted twice as much as one with a single neighbour.
@@ -469,10 +646,10 @@ end
         ]
         pair_basis = BH.build_excitation_basis(pair_images, [T[2.0]])
         identical_transition = vcat(base, base)
-        identical_difference = vcat(T(0.4) .* base, T(0.4) .* base)
+        identical_Delta = vcat(T(0.4) .* base, T(0.4) .* base)
         identical_Xi = vcat(T(0.8) .* base, T(0.8) .* base)
         _, directed_pair = CJ.compute_crystal_corrections(
-            identical_transition, identical_difference, identical_Xi, pair_basis, cells,
+            identical_transition, identical_Delta, identical_Xi, pair_basis, cells,
             q_grid, l_max, gaunt_path)
 
         # Two neighbours: the same molecule alone, repeated at ±shift. The zero cell is itself.
@@ -483,7 +660,7 @@ end
         _, repeated_image = CJ.compute_crystal_corrections(
             base, T(0.4) .* base, T(0.8) .* base,
             single_basis, lattice_cells, q_grid, l_max, gaunt_path)
-        # Left and right agree only because ΔN and Ξ share a shape here. For a lopsided pair of
+        # Left and right agree only because Δ and Ξ share a shape here. For a lopsided pair of
         # densities they do not, and the two directions differ even in sign.
         @test only(repeated_image) ≈ 2 * directed_pair[1] rtol = 2e-12 atol = 2e-12
 
@@ -493,9 +670,83 @@ end
             single_basis, cells, q_grid, l_max, gaunt_path)
         @test all(iszero, self_only)
     end
+
+    T = Float64
+    l_max = 2
+    q_grid = collect(range(zero(T), T(6), length = 241))
+    identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
+    images = [
+        BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(-0.7, 0.1, 0.2)),
+        BH.CrystalImage{T}(2, identity_rotation, one(T), SVector{3, T}(1.2, -0.4, 0.8)),
+    ]
+    basis = BH.build_excitation_basis(images, [T[2.1, 2.8], T[2.2, 3.0]])
+    cells = CJ.NeighbourCells{T}([SVector{3, T}(0, 0, 0)], [(0, 0, 0)], [1])
+    pairs = DM.build_transition_pairs(2)
+    Delta_R = neutral_test_R(6, q_grid, l_max)
+    Xi_R = neutral_test_R(2, q_grid, l_max)
+    transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
+    lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
+    parameters = SF.choose_ewald_parameters(lattice, T(1e-8); eta = T(0.4))
+
+    mktempdir() do tmp_dir
+        gaunt_path = joinpath(tmp_dir, "off_diagonal_D_gaunt.h5")
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, gaunt_path, T)
+
+        # Compare both kernels against a direct angular integral. This checks the rotation of the
+        # potential back to Δ, including complex Wigner matrices and the reversed separation.
+        for split in (nothing, parameters)
+            couplings, D_blocks = CJ.compute_crystal_corrections(
+                transition_R, Delta_R, Xi_R, basis, cells, q_grid, l_max, gaunt_path;
+                parameters = split)
+            J_only = CJ.compute_couplings(
+                transition_R, basis, cells, q_grid, l_max, gaunt_path; parameters = split)
+            @test couplings.values == J_only.values
+            @test size(D_blocks) == (2, 2, 2)
+            @test all(abs.(D_blocks[:, 1, 2]) .> 1e-5)
+            @test D_blocks[:, 1, 2] == D_blocks[:, 2, 1]
+
+            radial_weights = CJ.quadrature_weights(q_grid, false)
+            if split !== nothing
+                radial_weights .*= one(T) .- exp.(-(q_grid ./ (2 * split.eta)).^2)
+            end
+            for image in 1:2
+                neighbour = 3 - image
+                rows = ((image - 1) * 3 + 1):(image * 3)
+                separation = images[image].translation - images[neighbour].translation
+                reference = angular_D_reference(
+                    Delta_R[rows, :, :], Xi_R[neighbour, :, :], separation, q_grid, radial_weights)
+                @test maximum(abs, imag(reference)) < 1e-12
+                for (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
+                    @test D_blocks[image, s, t] ≈ real(reference[pair]) rtol = 2e-11 atol = 2e-12
+                end
+            end
+
+            # Rotating every density and the separation together cannot change D.
+            axis = LinearAlgebra.normalize(SVector{3, T}(0.2, -0.5, 0.7))
+            angle = T(0.83)
+            rotation = Quaternionic.rotor(T[cos(angle / 2), (sin(angle / 2) .* axis)...])
+            rotation_matrix = SMatrix{3, 3, T, 9}(Quaternionic.to_rotation_matrix(rotation))
+            rotated_images = [BH.CrystalImage{T}(
+                image.conformer_index, identity_rotation, one(T), rotation_matrix * image.translation)
+                for image in images]
+            rotated_basis = BH.build_excitation_basis(rotated_images, [T[2.1, 2.8], T[2.2, 3.0]])
+            _, rotated_D = CJ.compute_crystal_corrections(
+                rotate_test_R(transition_R, rotation, l_max), rotate_test_R(Delta_R, rotation, l_max),
+                rotate_test_R(Xi_R, rotation, l_max), rotated_basis, cells, q_grid, l_max, gaunt_path;
+                parameters = split)
+            @test rotated_D ≈ D_blocks rtol = 2e-12 atol = 2e-12
+        end
+
+        # With either charge density absent, no element of D may survive.
+        for (Delta, Xi) in ((zero(Delta_R), Xi_R), (Delta_R, zero(Xi_R)))
+            _, zero_D = CJ.compute_crystal_corrections(
+                transition_R, Delta, Xi, basis, cells, q_grid, l_max, gaunt_path)
+            @test all(iszero, zero_D)
+        end
+    end
 end
 
-@testset "Ewald diagonal correction" begin
+@testset "Ewald D correction" begin
     T = Float64
     l_max = 1
     q_grid = collect(range(zero(T), T(6), length = 241))
@@ -506,21 +757,21 @@ end
         # mixing the Ewald implementation test with the separate dipole-boundary convention.
         density[1, q_idx, 1] = T(0.8) * q * q * exp(-q * q / 2)
     end
-    transition_R = copy(density)
-    difference_R = T(0.6) .* density
+    transition_R = vcat(density, T(0.7) .* density)
+    Delta_R = vcat(T(0.6) .* density, T(-0.35) .* density, T(0.2) .* density)
     Xi_R = T(-0.9) .* density
 
     # The dipole of the Q = 0 term is read off a single small q.
     q_bc = T(1e-4)
     density_bc = zeros(Complex{T}, 1, 1, 4)
     density_bc[1, 1, 1] = T(0.8) * q_bc * q_bc * exp(-q_bc * q_bc / 2)
-    transition_R_bc = copy(density_bc)
-    difference_R_bc = T(0.6) .* density_bc
+    transition_R_bc = vcat(density_bc, T(0.7) .* density_bc)
+    Delta_R_bc = vcat(T(0.6) .* density_bc, T(-0.35) .* density_bc, T(0.2) .* density_bc)
     Xi_R_bc = T(-0.9) .* density_bc
 
     identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
     image = BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(0, 0, 0))
-    basis = BH.build_excitation_basis([image], [T[2.0]])
+    basis = BH.build_excitation_basis([image], [T[2.0, 2.5]])
     lattice = SF.CrystalLattice.build_crystal_lattice(T[4 0 0; 0 4 0; 0 0 4], T)
 
     mktempdir() do tmp_dir
@@ -531,33 +782,142 @@ end
         # A large spherical direct sum provides the reference boundary condition.
         direct_cells = CJ.enumerate_neighbour_cells(lattice, T(12))
         _, direct_D = CJ.compute_crystal_corrections(
-            transition_R, difference_R, Xi_R, basis, direct_cells,
+            transition_R, Delta_R, Xi_R, basis, direct_cells,
             q_grid, l_max, gaunt_path)
 
+        @test size(direct_D) == (1, 2, 2)
+        @test abs(direct_D[1, 1, 2]) > 1e-6
+
         # η splits the sum between the two halves and must cancel out of the total.
-        ewald_values = T[]
+        ewald_values = Array{T, 3}[]
         for eta in T[0.4, 0.5]
             parameters = SF.Ewald.choose_ewald_parameters(
                 lattice, T(1e-8); eta = eta)
             short_cells = CJ.enumerate_neighbour_cells(lattice, parameters.R_max)
             long_range = SF.Ewald.build_ewald_long_range(
-                transition_R, transition_R_bc, [image.translation], basis.image_of, lattice,
+                transition_R, transition_R_bc, [image.translation, image.translation], basis.image_of, lattice,
                 q_grid, q_bc, l_max, parameters)
             _, short_D = CJ.compute_crystal_corrections(
-                transition_R, difference_R, Xi_R, basis, short_cells,
+                transition_R, Delta_R, Xi_R, basis, short_cells,
                 q_grid, l_max, gaunt_path; parameters = parameters)
-            long_D = SF.Ewald.compute_ewald_diagonal(
-                difference_R, Xi_R, difference_R_bc, Xi_R_bc,
-                q_grid, q_bc, l_max, long_range)
-            push!(ewald_values, only(short_D .+ long_D))
+            long_D = SF.Ewald.compute_ewald_D(
+                Delta_R, Xi_R, Delta_R_bc, Xi_R_bc,
+                q_grid, q_bc, basis.n_transitions, l_max, long_range)
+            push!(ewald_values, short_D .+ long_D)
+            @test size(long_D) == (1, 2, 2)
+            @test long_D[1, 1, 2] == long_D[1, 2, 1]
         end
 
         # Loose tolerances because of the reference, not the split. The pair interaction is dead by
         # 8 Å, but each pair carries a numerical floor of order 1e-5, so summing more cells adds
         # noise faster than signal. 12 Å is about as good as the direct sum gets.
         @test ewald_values[1] ≈ ewald_values[2] rtol = 1.5e-2 atol = 2e-5
-        @test ewald_values[1] ≈ only(direct_D) rtol = 1.5e-2 atol = 2e-5
+        @test ewald_values[1] ≈ direct_D rtol = 1.5e-2 atol = 2e-5
     end
+
+    T = Float64
+    l_max = 2
+    q_grid = collect(range(zero(T), T(6), length = 241))
+    q_bc = T(1e-4)
+    identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
+    images = [
+        BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(-0.7, 0.1, 0.2)),
+        BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(1.2, -0.4, 0.8)),
+    ]
+    basis = BH.build_excitation_basis(images, [T[2.1, 2.8]])
+    Delta_R = neutral_test_R(6, q_grid, l_max)
+    Xi_R = neutral_test_R(2, q_grid, l_max)
+    Delta_bc = neutral_test_R(6, T[q_bc], l_max)
+    Xi_bc = neutral_test_R(2, T[q_bc], l_max)
+    transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
+    transition_bc = vcat(Delta_bc[1:2, :, :], Delta_bc[4:5, :, :])
+    tau_of_lambda = [images[image].translation for image in basis.image_of]
+    lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
+    parameters = SF.choose_ewald_parameters(lattice, T(1e-8); eta = T(0.4))
+    pairs = DM.build_transition_pairs(2)
+
+    vacuum = SF.build_ewald_long_range(
+        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        q_grid, q_bc, l_max, parameters; epsilon_b = one(T))
+    conductor = SF.build_ewald_long_range(
+        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        q_grid, q_bc, l_max, parameters; epsilon_b = T(Inf))
+    dielectric = SF.build_ewald_long_range(
+        transition_R, transition_bc, tau_of_lambda, basis.image_of, lattice,
+        q_grid, q_bc, l_max, parameters; epsilon_b = T(4))
+    D_vacuum = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+    D_conductor = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, conductor)
+    D_dielectric = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, dielectric)
+
+    # The boundary term is the scalar product of the Δ and total Ξ dipoles, including s != t.
+    boundary = zeros(T, 2, 2, 2)
+    for image in 1:2, (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
+        row = (image - 1) * 3 + pair
+        dipole_product = real(sum(Delta_bc[row, 1, key] * conj(sum(Xi_bc[:, 1, key]))
+                                 for key in 2:4)) / q_bc^2
+        boundary[image, s, t] = vacuum.prefactor * dipole_product / (4 * π)
+        boundary[image, t, s] = boundary[image, s, t]
+    end
+    @test all(abs.(boundary[:, 1, 2]) .> 1e-5)
+    @test D_vacuum - D_conductor ≈ boundary rtol = 1e-11 atol = 1e-12
+    @test D_dielectric - D_conductor ≈ boundary / 3 rtol = 1e-11 atol = 1e-12
+
+    # Use the analytic test densities at G directly, so the reference does not reuse the Hermite
+    # tables. The tolerance allows for interpolation on the finite q grid.
+    reciprocal = zeros(Complex{T}, 2, 2, 2)
+    for G in vacuum.G_vectors
+        G_norm = norm(G)
+        (G_norm < 1e-10 || G_norm > parameters.G_max) && continue
+        harmonics = harmonic_values(G / G_norm, l_max)
+        Delta_at_G = neutral_test_R(6, T[G_norm], l_max)
+        Xi_at_G = neutral_test_R(2, T[G_norm], l_max)
+        total_Xi = sum(cis(dot(G, images[image].translation)) *
+                       sum(Xi_at_G[image, 1, :] .* harmonics) for image in 1:2)
+        weight = vacuum.prefactor * exp(-(G_norm / (2 * parameters.eta))^2) / G_norm^2
+        for image in 1:2, (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
+            row = (image - 1) * 3 + pair
+            value = weight * cis(dot(G, images[image].translation)) *
+                    sum(Delta_at_G[row, 1, :] .* harmonics) * conj(total_Xi)
+            reciprocal[image, s, t] += value
+            s == t && continue
+            reciprocal[image, t, s] += conj(value)
+        end
+    end
+    @test maximum(abs, imag(reciprocal)) < 1e-12
+
+    # At zero separation the angular integral reduces to an inner product. Only the Ξ on the
+    # same molecule is removed, rather than the whole unit-cell charge density.
+    q_step = q_grid[2] - q_grid[1]
+    self_weights = q_step .* exp.(-(q_grid ./ (2 * parameters.eta)).^2)
+    self_weights[1] /= 2
+    self_weights[end] /= 2
+    self_D = zeros(T, 2, 2, 2)
+    self_prefactor = T(SF.CrystalLattice.ALPHA_EM * SF.CrystalLattice.HBAR_C_EV_ANGSTROM / (2 * π^2))
+    for image in 1:2, (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
+        row = (image - 1) * 3 + pair
+        value = self_prefactor * real(sum(self_weights[q_idx] * Delta_R[row, q_idx, key] *
+            conj(Xi_R[image, q_idx, key]) for q_idx in eachindex(q_grid), key in 1:(l_max + 1)^2))
+        self_D[image, s, t] = value
+        self_D[image, t, s] = value
+    end
+    @test D_conductor + self_D ≈ real(reciprocal) rtol = 2e-5 atol = 2e-7
+
+    # Removing the reciprocal vectors with conducting boundaries leaves exactly -D_self.
+    empty!(conductor.G_vectors)
+    self_only = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, conductor)
+    @test self_only ≈ -self_D rtol = 2e-12 atol = 2e-12
+
+    # Malformed pair and boundary tensors must fail before the contraction starts.
+    @test_throws ErrorException SF.compute_ewald_D(Delta_R[1:4, :, :], Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+    @test_throws ErrorException SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc[1:4, :, :], Xi_bc,
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+    @test_throws ErrorException SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
+        q_grid, q_bc, 1, l_max, vacuum)
 end
 
 @testset "Structure function energy axis" begin
@@ -831,6 +1191,15 @@ end
     operations = SF.derive_symmetry_operations(images, lattice)
     n_lambda = length(basis.energies)
 
+    # The environment mixes transitions differently for the two conformers, but symmetry-related
+    # images of the same conformer must carry the same D block.
+    D_blocks = zeros(T, length(images), 2, 2)
+    for (image_idx, image) in enumerate(images)
+        D_blocks[image_idx, :, :] = image.conformer_index == 1 ?
+            T[-0.12 0.08; 0.08 0.03] : T[0.04 -0.06; -0.06 -0.09]
+    end
+    BH.set_D_couplings!(basis, D_blocks)
+
     # Invent some reference dipoles, one for each transition of each conformer.
     reference_dipoles = [
         SVector{3, T}[SVector{3, T}(0.9, 0.2, -0.3), SVector{3, T}(-0.1, 0.7, 0.5)],
@@ -919,6 +1288,27 @@ end
 
     basis = BH.build_excitation_basis(images, [T[4.10, 4.65]])
     n_lambda = length(basis.energies)
+
+    # Build D from rotated densities, so the symmetry check includes its pair contractions as
+    # well as its placement in H. Only molecules in this cell contribute to this finite reference.
+    l_max = 2
+    q_grid = collect(range(zero(T), T(6), length = 121))
+    rotated_R, rotated_Delta, rotated_Xi = SF.rotate_crystal_R_tensors(
+        [neutral_test_R(2, q_grid, l_max)], [neutral_test_R(3, q_grid, l_max)],
+        [neutral_test_R(1, q_grid, l_max)], images, basis, l_max)
+    cells = CJ.NeighbourCells{T}([SVector{3, T}(0, 0, 0)], [(0, 0, 0)], [1])
+    mktempdir() do tmp_dir
+        gaunt_path = joinpath(tmp_dir, "fourfold_D_gaunt.h5")
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, l_max, 2 * l_max, gaunt_path, T)
+        _, D_blocks = CJ.compute_crystal_corrections(
+            rotated_R, rotated_Delta, rotated_Xi, basis, cells, q_grid, l_max, gaunt_path)
+        @test abs(D_blocks[1, 1, 2]) > 1e-6
+        for image_idx in 2:length(images)
+            @test D_blocks[image_idx, :, :] ≈ D_blocks[1, :, :] rtol = 2e-12 atol = 2e-12
+        end
+        BH.set_D_couplings!(basis, D_blocks)
+    end
+
     couplings = dipole_couplings(basis, images, lattice,
         [SVector{3, T}[SVector{3, T}(0.9, 0.2, -0.3), SVector{3, T}(-0.1, 0.7, 0.5)]])
 

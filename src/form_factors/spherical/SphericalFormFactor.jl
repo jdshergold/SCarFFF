@@ -42,10 +42,10 @@ using .ContractSphericalGrid: contract_spherical_grid
 using .ConstructCrystalTensor: construct_crystal_f_lm_tensors
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
 using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
-              compute_ewald_diagonal, supercell_radius,
+              compute_ewald_D, supercell_radius,
               check_dipole_against_oscillator_strength
 using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis,
-                         set_diagonal_corrections!
+                         set_D_couplings!
 using .ProjectFLM: project_f_lm, default_angular_grid
 using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings,
                   compute_crystal_corrections, subtract_self_term!,
@@ -65,7 +65,7 @@ using ..StageTimings: print_stage_timings, time_stage!
 export compute_spherical_form_factor, compute_spherical_form_factor_with_densities,
        compute_rates, compute_rates_by_orientation, construct_crystal_f_lm_tensors, combine_crystal_rate_grids,
        build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis,
-       set_diagonal_corrections!, compute_crystal_corrections,
+       set_D_couplings!, compute_crystal_corrections,
        rotate_R_tensors, rotate_crystal_R_tensors,
        compute_coherent_crystal_form_factor, compute_coherent_crystal_f_lm,
        compute_incoherent_crystal_f_lm, project_f_lm,
@@ -73,7 +73,7 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        incoherent_structure_factor, integrate_energy, trim_energy_axis, describe_energy_grid,
        kernel_shape, apply_structure_function_prefactor!,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
-       compute_ewald_diagonal, subtract_self_term!,
+       compute_ewald_D, subtract_self_term!,
        check_dipole_against_oscillator_strength,
        image_translation_span, supercell_radius
 
@@ -381,7 +381,7 @@ end
 
 function compute_spherical_form_factor_with_densities(args...; kwargs...)
     """
-    Compute the spherical form factor together with the ΔN and Ξ tensors used by a crystal.
+    Compute the spherical form factor together with the Δ and Ξ tensors used by a crystal.
 
     # Arguments:
     - args: Positional arguments accepted by _compute_spherical_form_factor.

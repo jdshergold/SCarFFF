@@ -13,7 +13,7 @@ using ..ReadBasisSet: build_transition_pairs
 
 export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
-       compute_ewald_diagonal, self_term_matrix, check_dipole_against_oscillator_strength
+       compute_ewald_D, self_term_matrix, check_dipole_against_oscillator_strength
 
 # Coefficients below this fraction of the largest one over the long-range q range are treated as
 # absent, which sets the max ℓ in the long-range sum. With this set to 1e-4, the error is around
@@ -686,84 +686,76 @@ function self_term_matrix(
     return self_term
 end
 
-function compute_ewald_diagonal(
-        rotated_difference::Array{Complex{T}, 3},
+function compute_ewald_D(
+        rotated_Delta::Array{Complex{T}, 3},
         rotated_Xi::Array{Complex{T}, 3},
-        rotated_difference_bc::Array{Complex{T}, 3},
+        rotated_Delta_bc::Array{Complex{T}, 3},
         rotated_Xi_bc::Array{Complex{T}, 3},
         q_grid_invA::Vector{T},
         q_bc_invA::T,
+        n_transitions::Int,
         l_max::Int,
         data::EwaldLongRangeData{T},
-    )::Vector{T} where {T<:AbstractFloat}
+    )::Array{T, 3} where {T<:AbstractFloat}
     """
-    Compute the long-range diagonal correction
+    Compute the long-range part of D
 
         D_LR = D_reciprocal + D_boundary - D_self.
 
-    Xi is summed over the unit cell once for each G before it is contracted with every difference
-    density.
+    Xi is summed over the unit cell once for each G before it is contracted with every Δ. D only
+    couples excitations on the same molecule, so what comes back is one block per image.
 
     # Arguments:
-    - rotated_difference::Array{Complex{T},3}: Delta N for every local excitation.
+    - rotated_Delta::Array{Complex{T},3}: Δ, one row per image and pair of states.
     - rotated_Xi::Array{Complex{T},3}: Xi for every molecular image.
-    - rotated_difference_bc::Array{Complex{T},3}: Delta N at q_bc alone, for the boundary term.
+    - rotated_Delta_bc::Array{Complex{T},3}: Δ at q_bc alone, for the boundary term.
     - rotated_Xi_bc::Array{Complex{T},3}: Xi at q_bc alone, for the boundary term.
     - q_grid_invA::Vector{T}: Uniform q grid starting at zero, in inverse Angstroms.
     - q_bc_invA::T: The |q| at which the boundary term's dipoles are read off, in inverse Angstroms.
+    - n_transitions::Int: The number of transitions per image, which fixes the block size.
     - l_max::Int: The largest angular mode.
     - data::EwaldLongRangeData{T}: The Ewald parameters, reciprocal vectors and image positions.
 
     # Returns:
-    - Vector{T}: The real long-range correction for every lambda, in eV.
+    - Array{T,3}: The real long-range D, with dimensions (n_images, n_transitions, n_transitions), in eV.
     """
 
     # Get the dimensions, and check the tensors match them.
     n_lambda = length(data.image_of)
     n_images = length(data.translations)
     n_keys = (l_max + 1)^2
-    # λ is image-major with the transitions running fastest, so this recovers how many there are.
-    n_transitions = div(n_lambda, n_images)
+    n_lambda == n_images * n_transitions || error(
+        "There are $(n_lambda) excitations for $(n_images) images of $(n_transitions) transitions.")
     pairs = build_transition_pairs(n_transitions)
     n_pairs = length(pairs.transitions_of_pair)
     n_Delta_rows = n_images * n_pairs
-    size(rotated_difference, 1) == n_Delta_rows || error(
-        "There are $(size(rotated_difference, 1)) Δ densities for $(n_Delta_rows) image and pair combinations.")
-    size(rotated_difference, 2) == length(q_grid_invA) && size(rotated_difference, 3) == n_keys || error(
-        "The Δ tensor has size $(size(rotated_difference)), expected $((n_Delta_rows, length(q_grid_invA), n_keys)).")
+    size(rotated_Delta, 1) == n_Delta_rows || error(
+        "There are $(size(rotated_Delta, 1)) Δ densities for $(n_Delta_rows) image and pair combinations.")
+    size(rotated_Delta, 2) == length(q_grid_invA) && size(rotated_Delta, 3) == n_keys || error(
+        "The Δ tensor has size $(size(rotated_Delta)), expected $((n_Delta_rows, length(q_grid_invA), n_keys)).")
     size(rotated_Xi, 1) == n_images || error(
         "There are $(size(rotated_Xi, 1)) Ξ tensors for $(n_images) images.")
     size(rotated_Xi, 2) == length(q_grid_invA) && size(rotated_Xi, 3) == n_keys || error(
         "The Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, length(q_grid_invA), n_keys)).")
     # The boundary tensors cover the same rows and images, but only the one q point they sit on.
-    size(rotated_difference_bc) == (n_Delta_rows, 1, n_keys) || error(
-        "The boundary Δ tensor has size $(size(rotated_difference_bc)), expected $((n_Delta_rows, 1, n_keys)).")
+    size(rotated_Delta_bc) == (n_Delta_rows, 1, n_keys) || error(
+        "The boundary Δ tensor has size $(size(rotated_Delta_bc)), expected $((n_Delta_rows, 1, n_keys)).")
     size(rotated_Xi_bc) == (n_images, 1, n_keys) || error(
         "The boundary Ξ tensor has size $(size(rotated_Xi_bc)), expected $((n_images, 1, n_keys)).")
 
-    # The Δ row each λ reads, which for now is its s = t pair, so D stays diagonal until the
-    # off-diagonal blocks are wired up.
-    diagonal_row_of_lambda = Vector{Int}(undef, n_lambda)
-    for lambda in 1:n_lambda
-        image = data.image_of[lambda]
-        transition = lambda - (image - 1) * n_transitions
-        diagonal_row_of_lambda[lambda] =
-            Delta_row(image, pairs.pair_of_transitions[transition, transition], n_pairs)
-    end
-
     # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
-    difference_table, difference_tangent, q_step, difference_l_max =
-        build_coefficient_table(rotated_difference, q_grid_invA, l_max, data.G_max)
+    Delta_table, Delta_tangent, q_step, Delta_l_max =
+        build_coefficient_table(rotated_Delta, q_grid_invA, l_max, data.G_max)
     Xi_table, Xi_tangent, Xi_q_step, Xi_l_max =
         build_coefficient_table(rotated_Xi, q_grid_invA, l_max, data.G_max)
     abs(q_step - Xi_q_step) <= eps(T) * max(q_step, one(T)) || error(
-        "The ΔN and Ξ interpolation grids do not match.")
+        "The Δ and Ξ interpolation grids do not match.")
 
     # The two densities may keep different l ceilings, so the harmonics must cover the larger.
-    l_ceiling = max(difference_l_max, Xi_l_max)
+    l_ceiling = max(Delta_l_max, Xi_l_max)
     harmonics = Vector{Complex{T}}(undef, (l_ceiling + 1)^2)
     Ylm_cache = SphericalHarmonics.cache(l_ceiling, SphericalHarmonics.FullRange)
-    diagonal = zeros(Complex{T}, n_lambda)
+    D_blocks = zeros(Complex{T}, n_images, n_transitions, n_transitions)
 
     @inbounds for G in data.G_vectors
         # Here k = 0, so Q = G. Skip anything beyond the cutoff, and G = 0, which the boundary
@@ -789,9 +781,9 @@ function compute_ewald_diagonal(
 
         # Cubic Hermite stencil for |G| on the uniform q grid.
         position = G_norm / q_step
-        difference_node = min(Int(floor(position)) + 1, size(difference_table, 3) - 1)
+        Delta_node = min(Int(floor(position)) + 1, size(Delta_table, 3) - 1)
         Xi_node = min(Int(floor(position)) + 1, size(Xi_table, 3) - 1)
-        s = position - (difference_node - 1)
+        s = position - (Delta_node - 1)
         s2 = s * s
         s3 = s2 * s
         h00 = 2 * s3 - 3 * s2 + one(T)
@@ -799,7 +791,7 @@ function compute_ewald_diagonal(
         h01 = -2 * s3 + 3 * s2
         h11 = s3 - s2
 
-        # Sum the Ξ over all B_j once for this G, then use it for every λ.
+        # Sum the Ξ over all C_k once for this G, then use it for every Δ pair.
         total_Xi = zero(Complex{T})
         for image in 1:n_images
             amplitude = zero(Complex{T})
@@ -812,19 +804,26 @@ function compute_ewald_diagonal(
             total_Xi += cis(dot(G, data.translations[image])) * amplitude
         end
 
-        # Contract ΔN with the shared Ξ sum, phased onto each molecule's position in the cell.
+        # Contract Δ with the shared Ξ sum, phased onto each molecule's position in the cell. Both
+        # excitations of a block sit on the same molecule, so there is one phase for the whole block.
         weight = data.prefactor * exp(-(G_norm / (2 * data.eta))^2) / (G_norm * G_norm)
-        for lambda in 1:n_lambda
-            row = diagonal_row_of_lambda[lambda]
-            amplitude = zero(Complex{T})
-            @simd for key in 1:size(difference_table, 1)
-                amplitude += (h00 * difference_table[key, row, difference_node] +
-                              h10 * difference_tangent[key, row, difference_node] +
-                              h01 * difference_table[key, row, difference_node + 1] +
-                              h11 * difference_tangent[key, row, difference_node + 1]) * harmonics[key]
+        for image in 1:n_images
+            phase = cis(dot(G, data.translations[image]))
+            for pair in 1:n_pairs
+                row = Delta_row(image, pair, n_pairs)
+                amplitude = zero(Complex{T})
+                @simd for key in 1:size(Delta_table, 1)
+                    amplitude += (h00 * Delta_table[key, row, Delta_node] +
+                                  h10 * Delta_tangent[key, row, Delta_node] +
+                                  h01 * Delta_table[key, row, Delta_node + 1] +
+                                  h11 * Delta_tangent[key, row, Delta_node + 1]) * harmonics[key]
+                end
+                (s, t) = pairs.transitions_of_pair[pair]
+                value = weight * phase * amplitude * conj(total_Xi)
+                D_blocks[image, s, t] += value
+                s == t && continue
+                D_blocks[image, t, s] += conj(value)
             end
-            phase = cis(dot(G, data.translations[data.image_of[lambda]]))
-            diagonal[lambda] += weight * phase * amplitude * conj(total_Xi)
         end
     end
 
@@ -833,16 +832,20 @@ function compute_ewald_diagonal(
     boundary_weight = data.prefactor * T(3) / (T(4 * π) * (2 * data.epsilon_b + one(T)))
     # At ε_b = Inf the weight is exactly zero, which is the conducting boundary condition.
     if !iszero(boundary_weight)
-        difference_slopes = dipole_slope_matrix(rotated_difference_bc, q_bc_invA, l_max)
-        Xi_slopes = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
-        total_Xi_slopes = vec(sum(Xi_slopes, dims = 1))
-        @inbounds for lambda in 1:n_lambda
+        Delta_dipoles = dipole_slope_matrix(rotated_Delta_bc, q_bc_invA, l_max)
+        Xi_dipoles = dipole_slope_matrix(rotated_Xi_bc, q_bc_invA, l_max)
+        total_Xi_dipoles = vec(sum(Xi_dipoles, dims = 1))
+        @inbounds for image in 1:n_images, pair in 1:n_pairs
+            row = Delta_row(image, pair, n_pairs)
             total = zero(Complex{T})
             for component in 1:3
-                total += difference_slopes[diagonal_row_of_lambda[lambda], component] *
-                         conj(total_Xi_slopes[component])
+                total += Delta_dipoles[row, component] * conj(total_Xi_dipoles[component])
             end
-            diagonal[lambda] += boundary_weight * total
+            (s, t) = pairs.transitions_of_pair[pair]
+            value = boundary_weight * total
+            D_blocks[image, s, t] += value
+            s == t && continue
+            D_blocks[image, t, s] += conj(value)
         end
     end
 
@@ -860,26 +863,29 @@ function compute_ewald_diagonal(
     end
     # At d = 0 orthonormality collapses the angular integral to an inner product over keys.
     self_prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
-    @inbounds for lambda in 1:n_lambda
-        image = data.image_of[lambda]
-        row = diagonal_row_of_lambda[lambda]
+    @inbounds for image in 1:n_images, pair in 1:n_pairs
+        row = Delta_row(image, pair, n_pairs)
         self = zero(Complex{T})
         for key in 1:n_keys, q_idx in 1:n_q
-            self += radial_weights[q_idx] * rotated_difference[row, q_idx, key] *
+            self += radial_weights[q_idx] * rotated_Delta[row, q_idx, key] *
                     conj(rotated_Xi[image, q_idx, key])
         end
-        diagonal[lambda] -= self_prefactor * self
+        (s, t) = pairs.transitions_of_pair[pair]
+        value = self_prefactor * self
+        D_blocks[image, s, t] -= value
+        s == t && continue
+        D_blocks[image, t, s] -= conj(value)
     end
 
-    # D is real, being a diagonal element of a Hermitian H, so the imaginary part is round-off.
-    # Check that before discarding it.
-    scale = max(maximum(abs, real(diagonal)), one(T))
-    imaginary_residual = maximum(abs, imag(diagonal))
+    # Δ K Ξ* is real for the real densities RKS gives us, so the imaginary part is round-off. Check
+    # that before discarding it.
+    scale = max(maximum(abs, real(D_blocks)), one(T))
+    imaginary_residual = maximum(abs, imag(D_blocks))
     tolerance = T(1000) * eps(T) * scale
     imaginary_residual <= tolerance || error(
-        "The Ewald diagonal correction has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
+        "The Ewald long-range D has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
 
-    return real(diagonal)
+    return real(D_blocks)
 end
 
 @inline function add_long_range!(

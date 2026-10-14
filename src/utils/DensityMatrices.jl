@@ -62,14 +62,14 @@ function build_pair_difference_matrix(
         mo_coeff_vir::AbstractMatrix,
     )
     """
-    Build the AO basis difference density matrix, Δ_{st}, that contributes to the D term of the Hamiltonian.,
+    Build the AO basis difference density matrix, Δ_{st}, that contributes to the D term of the Hamiltonian,
 
         Δ_{st} ↔ C_v B^(ts) C_v† − C_o A^(ts) C_o†,
         A^(ts) = X^(s)* X^(t)ᵀ + Y^(t) Y^(s)†,
         B^(ts) = X^(t)ᵀ X^(s)* + Y^(s)† Y^(t).
 
-    This is T^(ts), the transition density matrix from excited state t to excited state s, with the
-    ground state density subtracted.
+    This is T^(ts), the transition density matrix from excited state t to excited state s, with
+    δ_{st} times the ground state density subtracted.
 
     # Arguments:
     - X_s::AbstractMatrix: The excitation amplitudes of the row state, with shape (n_occupied, n_virtual).
@@ -92,7 +92,8 @@ struct TransitionPairs
     """
     The (s, t) transition pairs that Δ_{st} is built for, and the map back to a single pair index.
 
-    Δ_{st} = Δ_{ts}, so we only need to store s <= t, and we use the key:
+    For real MO coefficients, amplitudes and AOs, Δ_{st} and Δ_{ts} give the same density, so we
+    only need to store s <= t. We use the key:
 
         pair(s, t) = div(t * (t - 1), 2) + s.
 

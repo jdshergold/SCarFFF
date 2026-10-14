@@ -23,10 +23,10 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
-                                  compute_ewald_diagonal, subtract_self_term!,
+                                  compute_ewald_D, subtract_self_term!,
                                   check_dipole_against_oscillator_strength,
                                   image_translation_span, supercell_radius,
-                                  set_diagonal_corrections!,
+                                  set_D_couplings!,
                                   derive_symmetry_operations, build_stars,
                                   star_reduction_factor, choose_compatible_phi_count
 using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
@@ -861,7 +861,7 @@ function main()
                         error("No conformer TD-DFT results found at $(td_h5).")
                     end
 
-                    # The coherent correction also needs ΔN and Ξ. They go through the same R
+                    # The coherent correction also needs Δ and Ξ. They go through the same R
                     # contraction, but remain internal rather than changing the molecular output.
                     need_Delta_and_Xi = crystal_order == "coherent" && !no_couplings
                     Delta_and_Xi = nothing
@@ -1192,9 +1192,9 @@ function main()
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
-                            crystal_couplings, diagonal_corrections = correction_timing.value
-                            set_diagonal_corrections!(basis, diagonal_corrections)
-                            push!(stage_times, "couplings J and diagonal D" => correction_timing.time)
+                            crystal_couplings, D_blocks = correction_timing.value
+                            set_D_couplings!(basis, D_blocks)
+                            push!(stage_times, "couplings J and D" => correction_timing.time)
                         else
                             tau_of_lambda = [basis.images[basis.image_of[lambda]].translation
                                              for lambda in 1:length(basis.energies)]
@@ -1222,18 +1222,18 @@ function main()
                                 rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
                                 parameters = ewald_parameters)
-                            crystal_couplings, diagonal_short_range = correction_timing.value
+                            crystal_couplings, D_blocks_short_range = correction_timing.value
                             push!(stage_times, "short-range J and D(ΔR)" => correction_timing.time)
                             subtract_self_term!(crystal_couplings, cells, crystal_long_range.self_term)
 
-                            diagonal_timing = @timed compute_ewald_diagonal(
+                            D_long_range_timing = @timed compute_ewald_D(
                                 rotated_Delta, rotated_Xi,
                                 rotated_Delta_bc, rotated_Xi_bc,
-                                q_grid_invA, q_bc_invA, l_max,
+                                q_grid_invA, q_bc_invA, basis.n_transitions, l_max,
                                 crystal_long_range)
-                            set_diagonal_corrections!(
-                                basis, diagonal_short_range .+ diagonal_timing.value)
-                            push!(stage_times, "Ewald long-range D" => diagonal_timing.time)
+                            set_D_couplings!(
+                                basis, D_blocks_short_range .+ D_long_range_timing.value)
+                            push!(stage_times, "Ewald long-range D" => D_long_range_timing.time)
                         end
                     end
 
@@ -1407,7 +1407,8 @@ function main()
                         # environment shifts belong only to the coherent Frenkel Hamiltonian.
                         write(io, "localised_energies_eV", coherent_basis.energies)
                         if crystal_results.order == "coherent"
-                            write(io, "diagonal_corrections_eV", coherent_basis.diagonal_corrections)
+                            # D_{λλ'}, zero unless λ and λ' sit on the same molecule.
+                            write(io, "D_eV", coherent_basis.D_couplings)
                         end
 
                         # Save the lattice vectors and image translations.
@@ -1415,11 +1416,13 @@ function main()
                         write(io, "image_translations_A",
                               reduce(hcat, [image.translation for image in coherent_basis.images]))
                         write(io, "image_of", coherent_basis.image_of)
+                        # Needed alongside image_of to read D's blocks back.
+                        write(io, "transition_of", coherent_basis.transition_of)
 
                         # Save everything needed to rebuild H(k), and hence E_Ψ(k) and C(k), at any k
                         # later:
                         #
-                        #     H(k) = diag(E + D) + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
+                        #     H(k) = diag(E) + D + Σ_ΔR J^SR(ΔR) exp(i k . ΔR) + 𝒥^LR(k).
                         if crystal_results.couplings !== nothing
                             couplings_group = create_group(io, "couplings")
                             write(couplings_group, "method", coupling_method)

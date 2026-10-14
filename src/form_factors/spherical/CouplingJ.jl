@@ -255,63 +255,67 @@ function fill_pair_kernel_table!(
     return nothing
 end
 
-function add_diagonal_pair!(
-        diagonal::Vector{Complex{T}},
-        lambdas::Vector{Int},
-        difference_source::Array{Complex{T}, 3},
+function add_D_pair!(
+        D_blocks::Array{Complex{T}, 3},
+        image_idx::Int,
+        transitions_of_pair::Vector{NTuple{2, Int}},
+        Delta_source::Array{Complex{T}, 3},
         Xi_source::Matrix{Complex{T}},
         blocks::Vector{Matrix{Complex{T}}},
         kernel::PairFrameKernel{T},
         kernel_table::Matrix{Complex{T}},
-        difference_pair::Array{Complex{T}, 3},
         Xi_pair::Matrix{Complex{T}},
         Xi_potential::Matrix{Complex{T}},
+        potential_crystal::Matrix{Complex{T}},
         overlap::Vector{Complex{T}},
         prefactor::Complex{T},
         l_max::Int,
     ) where {T<:AbstractFloat}
     """
-    Add the pair contribution ΔN K Ξ* to a task-local diagonal vector.
+    Add the pair contribution Δ K Ξ* to a task-local block of D.
 
-    K is applied once to Ξ rather than once to every ΔN_s, as it is independent of the transition.
+    K is applied once to Ξ rather than once to every Δ_{st}, as it does not know which pair of
+    states it is working on. The potential that comes out is then rotated back into the crystal
+    frame, so that every Δ can be contracted where it already sits:
 
-        V_a(q) = Σ_b K_ab(q) Ξ_b*(q),
-        D_s = Σ_a ΔN_s,a(q) V_a(q).
+        V_a(q)  = Σ_b K_ab(q) Ξ_b*(q)                 in the pair frame,
+        W_m(q)  = Σ_μ D^(l)_μm V_μ(q)                 back in the crystal frame,
+        D_{st}  = Σ_m Δ_{st,m}(q) W_m(q).
+
+    Rotating the one potential backwards rather than every Δ forwards is the same arithmetic, and it saves holding
+    a pair-frame copy of Δ for every pair of states.
 
     # Arguments:
-    - diagonal::Vector{Complex{T}}: Task-local D vector to accumulate into.
-    - lambdas::Vector{Int}: Excitation indices carried by the first image.
-    - difference_source::Array{Complex{T},3}: ΔN coefficients of the first image.
+    - D_blocks::Array{Complex{T},3}: Task-local D, with dimensions (n_images, n_transitions, n_transitions).
+    - image_idx::Int: The image whose block this contribution belongs to.
+    - transitions_of_pair::Vector{NTuple{2,Int}}: The (s, t) carried by each pair index.
+    - Delta_source::Array{Complex{T},3}: Δ coefficients of this image, one row per pair.
     - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the second image.
     - blocks::Vector{Matrix{Complex{T}}}: Wigner matrices for this pair frame.
     - kernel::PairFrameKernel{T}: The grouped Gaunt part of K^∥.
     - kernel_table::Matrix{Complex{T}}: K^∥(q) for this separation.
-    - difference_pair::Array{Complex{T},3}: Buffer for pair-frame ΔN.
     - Xi_pair::Matrix{Complex{T}}: Buffer for pair-frame Ξ*.
-    - Xi_potential::Matrix{Complex{T}}: Buffer for K Ξ*.
-    - overlap::Vector{Complex{T}}: Buffer for all transition overlaps.
+    - Xi_potential::Matrix{Complex{T}}: Buffer for K Ξ* in the pair frame.
+    - potential_crystal::Matrix{Complex{T}}: Buffer for the same potential rotated back.
+    - overlap::Vector{Complex{T}}: Buffer for one overlap per pair of states.
     - prefactor::Complex{T}: The Coulomb prefactor in eV Angstrom.
     - l_max::Int: The largest angular mode.
 
     # Returns:
-    - Nothing. diagonal is accumulated in place.
+    - Nothing. D_blocks is accumulated in place.
     """
 
-    n_transitions, n_q, n_keys = size(difference_pair)
+    n_pairs, n_q, n_keys = size(Delta_source)
 
+    # Ξ is stored conjugated, so its coefficient rotation uses D*.
     @inbounds for l in 0:l_max
         block = (l * l + 1):((l + 1) * (l + 1))
-        width = 2 * l + 1
         D = blocks[l + 1]
-        mul!(reshape(view(difference_pair, :, :, block), n_transitions * n_q, width),
-             reshape(view(difference_source, :, :, block), n_transitions * n_q, width),
-             transpose(D))
-        # Ξ is stored conjugated, so its coefficient rotation uses D*.
         mul!(view(Xi_pair, :, block), view(Xi_source, :, block), adjoint(D))
     end
 
     # Applying K to the single Xi object avoids repeating the expensive Gaunt contraction for
-    # every transition.
+    # every pair of states.
     fill!(Xi_potential, zero(Complex{T}))
     @inbounds for triple in eachindex(kernel.triples)
         (l, l_prime, mu) = kernel.triples[triple]
@@ -323,11 +327,22 @@ function add_diagonal_pair!(
         end
     end
 
-    # Perform the multiplication ΔN K Ξ*, and accumulate into the diagonal.
-    mul!(overlap, reshape(difference_pair, n_transitions, n_q * n_keys),
-         reshape(Xi_potential, n_q * n_keys))
-    @inbounds for transition in 1:n_transitions
-        diagonal[lambdas[transition]] += prefactor * overlap[transition]
+    # Rotate the potential back out of the pair frame, so Δ can stay where it is.
+    @inbounds for l in 0:l_max
+        block = (l * l + 1):((l + 1) * (l + 1))
+        D = blocks[l + 1]
+        mul!(view(potential_crystal, :, block), view(Xi_potential, :, block), D)
+    end
+
+    # Perform the multiplication Δ K Ξ*, and place each pair in its block of D.
+    mul!(overlap, reshape(Delta_source, n_pairs, n_q * n_keys),
+         reshape(potential_crystal, n_q * n_keys))
+    @inbounds for pair in 1:n_pairs
+        (s, t) = transitions_of_pair[pair]
+        value = prefactor * overlap[pair]
+        D_blocks[image_idx, s, t] += value
+        s == t && continue
+        D_blocks[image_idx, t, s] += conj(value)
     end
 
     return nothing
@@ -341,11 +356,11 @@ function _compute_crystal_corrections(
         l_max::Int,
         gaunt_path::String;
         parameters::Union{Nothing, EwaldParameters{T}} = nothing,
-        rotated_difference::Union{Nothing, Array{Complex{T}, 3}} = nothing,
+        rotated_Delta::Union{Nothing, Array{Complex{T}, 3}} = nothing,
         rotated_Xi::Union{Nothing, Array{Complex{T}, 3}} = nothing,
     ) where {T<:AbstractFloat}
     """
-    Compute the short-range Frenkel couplings and, when supplied, the diagonal correction in each pair frame.
+    Compute the short-range Frenkel couplings and, when supplied, the same-molecule D blocks in each pair frame.
 
         J^SR_{A_i s, B_j t}(ΔR) = (2 α_EM / π) Σ_{ℓ,ℓ'} Σ_μ ∫dq κ(q)
                                       f̄^{(A_i,s)}_{ℓμ,αβ}(q) K^{∥,A_iB_j}_{ℓℓ',μ}(q) f̄^{(B_j,t)*}_{ℓ'μ,αβ}(q),
@@ -367,11 +382,11 @@ function _compute_crystal_corrections(
     - gaunt_path::String: Path to the coupling-shape Gaunt coefficients.
     - parameters::Union{Nothing, EwaldParameters{T}}: The Ewald split to use, or nothing for the bare
       Coulomb kernel and hence the full, only conditionally convergent, lattice sum.
-    - rotated_difference: The rotated ΔN coefficients, or nothing for a J-only calculation.
+    - rotated_Delta: The rotated Δ coefficients, or nothing for a J-only calculation.
     - rotated_Xi: The rotated neutral ground-charge coefficients, or nothing for a J-only calculation.
 
     # Returns:
-    - Tuple: The couplings and short-range diagonal correction, both in eV.
+    - Tuple: The couplings and the short-range D blocks, both in eV.
     """
 
     # Get the dimensions.
@@ -380,9 +395,9 @@ function _compute_crystal_corrections(
     n_cells = length(cells.vectors)
     n_keys = (l_max + 1)^2
     L_max = 2 * l_max
-    have_dN_and_Xi = rotated_difference !== nothing || rotated_Xi !== nothing
-    (rotated_difference === nothing) == (rotated_Xi === nothing) || error(
-        "Both the difference and Ξ tensors are required to compute D.")
+    have_Delta_and_Xi = rotated_Delta !== nothing || rotated_Xi !== nothing
+    (rotated_Delta === nothing) == (rotated_Xi === nothing) || error(
+        "Both the Δ and Ξ tensors are required to compute D.")
 
     # Check that the rotated coefficients have the right dimensions.
     (l_max + 1)^2 == size(rotated_R, 3) ||
@@ -410,9 +425,9 @@ function _compute_crystal_corrections(
     # Δ carries one row per (s, t) pair of each image, rather than one per λ.
     pairs = build_transition_pairs(n_transitions)
     n_pairs = length(pairs.transitions_of_pair)
-    if have_dN_and_Xi
-        size(rotated_difference) == (n_images * n_pairs, n_q, n_keys) || error(
-            "The rotated Δ tensor has size $(size(rotated_difference)), expected $((n_images * n_pairs, n_q, n_keys)).")
+    if have_Delta_and_Xi
+        size(rotated_Delta) == (n_images * n_pairs, n_q, n_keys) || error(
+            "The rotated Δ tensor has size $(size(rotated_Delta)), expected $((n_images * n_pairs, n_q, n_keys)).")
         size(rotated_Xi) == (n_images, n_q, n_keys) || error(
             "The rotated Ξ tensor has size $(size(rotated_Xi)), expected $((n_images, n_q, n_keys)).")
     end
@@ -432,20 +447,17 @@ function _compute_crystal_corrections(
         end
     end
 
-    # Do the same as above for the difference and Ξ coefficients, difference = first, Xi = second.
-    difference_coefficients = have_dN_and_Xi ?
-        [Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) for _ in 1:n_images] : nothing
-    Xi_coefficients = have_dN_and_Xi ?
+    # Do the same as above for the Δ and Ξ coefficients, Δ = first, Xi = second. Δ keeps one row per
+    # pair of states, and stays in the crystal frame, since the potential is rotated back to meet it.
+    Delta_coefficients = have_Delta_and_Xi ?
+        [Array{Complex{T}, 3}(undef, n_pairs, n_q, n_keys) for _ in 1:n_images] : nothing
+    Xi_coefficients = have_Delta_and_Xi ?
         [Matrix{Complex{T}}(undef, n_q, n_keys) for _ in 1:n_images] : nothing
-    if have_dN_and_Xi
+    if have_Delta_and_Xi
         for image_idx in 1:n_images
-            # Only the s = t pairs are used so far, so D stays diagonal until the off-diagonal
-            # blocks are wired up.
-            @inbounds for slot in 1:n_transitions,
-                          key in 1:n_keys, q_idx in 1:n_q
-                row = Delta_row(image_idx, pairs.pair_of_transitions[slot, slot], n_pairs)
-                difference_coefficients[image_idx][slot, q_idx, key] =
-                    rotated_difference[row, q_idx, key]
+            @inbounds for pair in 1:n_pairs, key in 1:n_keys, q_idx in 1:n_q
+                Delta_coefficients[image_idx][pair, q_idx, key] =
+                    rotated_Delta[Delta_row(image_idx, pair, n_pairs), q_idx, key]
             end
             @inbounds for key in 1:n_keys, q_idx in 1:n_q
                 Xi_coefficients[image_idx][q_idx, key] = conj(rotated_Xi[image_idx, q_idx, key])
@@ -474,7 +486,8 @@ function _compute_crystal_corrections(
 
     couplings = zeros(Complex{T}, n_cells, n_lambda, n_lambda)
     n_chunks = min(nthreads(), max(length(jobs), 1))
-    diagonal_chunks = have_dN_and_Xi ? [zeros(Complex{T}, n_lambda) for _ in 1:n_chunks] : nothing
+    D_chunks = have_Delta_and_Xi ?
+        [zeros(Complex{T}, n_images, n_transitions, n_transitions) for _ in 1:n_chunks] : nothing
 
     # Avoid BLAS oversubscription.
     blas_threads = BLAS.get_num_threads()
@@ -495,13 +508,13 @@ function _compute_crystal_corrections(
                 second_matrix = reshape(second, n_q * n_keys, n_transitions)
                 overlaps = Matrix{Complex{T}}(undef, n_transitions, n_transitions)
 
-                # The diagonal correction has n_transitions objects on the left and one Ξ on the right.
-                difference_pair = have_dN_and_Xi ?
-                    Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) : nothing
-                Xi_pair = have_dN_and_Xi ? Matrix{Complex{T}}(undef, n_q, n_keys) : nothing
-                Xi_potential = have_dN_and_Xi ? similar(Xi_pair) : nothing
-                diagonal_overlap = have_dN_and_Xi ? Vector{Complex{T}}(undef, n_transitions) : nothing
-                local_diagonal = have_dN_and_Xi ? diagonal_chunks[chunk] : nothing
+                # D has one Δ per pair of states on the left and one Ξ on the right. Only the Ξ side
+                # needs pair-frame buffers, since the potential is rotated back to meet Δ.
+                Xi_pair = have_Delta_and_Xi ? Matrix{Complex{T}}(undef, n_q, n_keys) : nothing
+                Xi_potential = have_Delta_and_Xi ? similar(Xi_pair) : nothing
+                potential_crystal = have_Delta_and_Xi ? similar(Xi_pair) : nothing
+                Delta_overlap = have_Delta_and_Xi ? Vector{Complex{T}}(undef, n_pairs) : nothing
+                local_D = have_Delta_and_Xi ? D_chunks[chunk] : nothing
 
                 for job_idx in chunk:n_chunks:length(jobs)
                     # Get the indices for the current job.
@@ -572,22 +585,24 @@ function _compute_crystal_corrections(
                         couplings[cells.negative_of[cell_idx], lambda_prime, lambda] = conj(value)
                     end
 
-                    if have_dN_and_Xi
-                        # D_i += ΔN_i K Ξ_j*, in the pair frame already built for J_ij.
-                        add_diagonal_pair!(
-                            local_diagonal, lambdas_i, difference_coefficients[image_i],
+                    if have_Delta_and_Xi
+                        # D_i += Δ_i K Ξ_j*, in the pair frame already built for J_ij.
+                        add_D_pair!(
+                            local_D, image_i, pairs.transitions_of_pair,
+                            Delta_coefficients[image_i],
                             Xi_coefficients[image_j], blocks, kernel, kernel_table,
-                            difference_pair, Xi_pair, Xi_potential, diagonal_overlap,
+                            Xi_pair, Xi_potential, potential_crystal, Delta_overlap,
                             prefactor, l_max)
 
-                        # D_j += ΔN_j K Ξ_i*, at separation -d. Needs to be computed separately.
+                        # D_j += Δ_j K Ξ_i*, at separation -d. Needs to be computed separately.
                         if image_i != image_j
                             reverse_S_inverse = rotation_to_pair_frame(-separation / distance)
                             reverse_blocks = wigner_d_blocks!(wigner_buffers, reverse_S_inverse)
-                            add_diagonal_pair!(
-                                local_diagonal, lambdas_j, difference_coefficients[image_j],
+                            add_D_pair!(
+                                local_D, image_j, pairs.transitions_of_pair,
+                                Delta_coefficients[image_j],
                                 Xi_coefficients[image_i], reverse_blocks, kernel, kernel_table,
-                                difference_pair, Xi_pair, Xi_potential, diagonal_overlap,
+                                Xi_pair, Xi_potential, potential_crystal, Delta_overlap,
                                 prefactor, l_max)
                         end
                     end
@@ -599,22 +614,22 @@ function _compute_crystal_corrections(
         BLAS.set_num_threads(blas_threads)
     end
 
-    # Sum the per-task D accumulators. It should be real, so check and then force it at the end.
-    diagonal = zeros(T, n_lambda)
-    if have_dN_and_Xi
-        total = zeros(Complex{T}, n_lambda)
-        for chunk_values in diagonal_chunks
+    # Sum the per-task D accumulators. Δ K Ξ* comes out real, so check that and then force it.
+    D_blocks = zeros(T, n_images, n_transitions, n_transitions)
+    if have_Delta_and_Xi
+        total = zeros(Complex{T}, n_images, n_transitions, n_transitions)
+        for chunk_values in D_chunks
             total .+= chunk_values
         end
         scale = max(maximum(abs, real(total)), one(T))
         imaginary_residual = maximum(abs, imag(total))
         tolerance = T(1000) * eps(T) * scale
         imaginary_residual <= tolerance || error(
-            "The short-range diagonal correction has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
-        diagonal .= real(total)
+            "The short-range D has imaginary residual $(imaginary_residual), tolerance $(tolerance).")
+        D_blocks .= real(total)
     end
 
-    return CrystalCouplings{T}(couplings, cells.vectors), diagonal
+    return CrystalCouplings{T}(couplings, cells.vectors), D_blocks
 end
 
 function compute_couplings(
@@ -652,7 +667,7 @@ end
 
 function compute_crystal_corrections(
         rotated_R::Array{Complex{T}, 3},
-        rotated_difference::Array{Complex{T}, 3},
+        rotated_Delta::Array{Complex{T}, 3},
         rotated_Xi::Array{Complex{T}, 3},
         basis::CrystalExcitationBasis{T},
         cells::NeighbourCells{T},
@@ -662,16 +677,16 @@ function compute_crystal_corrections(
         parameters::Union{Nothing, EwaldParameters{T}} = nothing,
     ) where {T<:AbstractFloat}
     """
-    Compute J and the short-range diagonal correction D in one pair pass.
+    Compute J and the short-range D in one pair pass.
 
-        J: R K R*,             D_SR: Delta N K Xi*.
+        J: R K R*,             D_SR: Delta K Xi*.
 
     The separation, Bessel table, pair kernel and pair-frame rotations are shared. For D, K is
-    applied once to Ξ and the resulting potential is dotted with every difference density.
+    applied once to Ξ and the resulting potential is dotted with every Δ.
 
     # Arguments:
     - rotated_R::Array{Complex{T},3}: Rotated transition coefficients for every lambda.
-    - rotated_difference::Array{Complex{T},3}: Rotated ΔN for every lambda.
+    - rotated_Delta::Array{Complex{T},3}: Rotated Δ, one row per image and pair of states.
     - rotated_Xi::Array{Complex{T},3}: Rotated Ξ for every molecular image.
     - basis::CrystalExcitationBasis{T}: The local excitation basis.
     - cells::NeighbourCells{T}: Lattice cells included in the real-space sum.
@@ -681,12 +696,13 @@ function compute_crystal_corrections(
     - parameters::Union{Nothing,EwaldParameters{T}}: The Ewald split, or nothing for direct sums.
 
     # Returns:
-    - Tuple: CrystalCouplings J and the short-range diagonal vector D, both in eV.
+    - Tuple: CrystalCouplings J and the short-range D blocks, with dimensions
+      (n_images, n_transitions, n_transitions), both in eV.
     """
 
     return _compute_crystal_corrections(
         rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path;
-        parameters = parameters, rotated_difference = rotated_difference, rotated_Xi = rotated_Xi)
+        parameters = parameters, rotated_Delta = rotated_Delta, rotated_Xi = rotated_Xi)
 end
 
 function subtract_self_term!(

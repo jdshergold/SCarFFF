@@ -310,7 +310,7 @@ function construct_R_tensor(
     - l_max::Int: Maximum ℓ to include in the expansion.
     - gaunt_array_path::String: Path to the precomputed sparse Gaunt coefficients.
     - density_matrices::Vector{Matrix{T}}: The AO density-like matrices used to construct R. These
-      may be transition matrices or diagonal-correction matrices and are not assumed symmetric.
+      may be transition, ground-state or Δ matrices and are not assumed symmetric.
     - cartesian_term_to_orbital::Vector{Int}: Mapping from Cartesian-term index to AO index.
 
     # Returns:
