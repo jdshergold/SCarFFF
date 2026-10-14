@@ -426,10 +426,34 @@ elif [ "$METHOD" = "cartesian" ] && [ "$CARTESIAN_COMPUTE_MODE_LC" = "v_only" ];
 else
     cd "$SCRIPT_DIR"
 
+    # Select transitions from the directory being plotted.
+    select_plot_transitions() {
+        local results_dir="$1"
+        local dir tidx
+        TRANSITIONS_TO_PLOT=()
+        if [ "$TRANSITION_INDICES_LC" = "all" ]; then
+            for dir in "$results_dir"/*; do
+                [ -d "$dir" ] || continue
+                tidx=$(basename "$dir")
+                if [[ "$tidx" =~ ^[0-9]+$ ]]; then
+                    TRANSITIONS_TO_PLOT+=("$tidx")
+                elif [[ "$tidx" =~ ^transition_([0-9]+)$ ]]; then
+                    TRANSITIONS_TO_PLOT+=("${BASH_REMATCH[1]}")
+                fi
+            done
+        else
+            IFS=',' read -ra TRANSITIONS_TO_PLOT <<< "$TRANSITION_INDICES"
+        fi
+        if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
+            FIRST_TRANSITION="${TRANSITIONS_TO_PLOT[0]}"
+        fi
+    }
+
     run_slice_plots() {
         local mol_num="$1"
         local results_rel_dir="$2"
         local include_rates="$3"
+        select_plot_transitions "$RUN_DIR/$mol_num/$results_rel_dir"
         local plot_cmd="$PYTHON_BIN plot_slices.py --run-name \"$RUN_NAME\" --molecule-number $mol_num --method $METHOD --results-dir \"$results_rel_dir\""
 
         if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
@@ -483,6 +507,7 @@ else
     run_3d_plots() {
         local mol_num="$1"
         local results_rel_dir="$2"
+        select_plot_transitions "$RUN_DIR/$mol_num/$results_rel_dir"
 
         for MODE in "${PLOT_3D_MODES[@]}"; do
             local plot_3d_cmd="$PYTHON_BIN plot_3d.py --run-name \"$RUN_NAME\" --molecule-number $mol_num --method $METHOD --results-dir \"$results_rel_dir\""
@@ -547,25 +572,6 @@ else
             echo "  No form factor results found for molecule $MOL_NUM, skipping."
             echo ""
             continue
-        fi
-
-        # Determine which transitions to plot.
-        TRANSITIONS_TO_PLOT=()
-        if [ "$TRANSITION_INDICES_LC" = "all" ]; then
-            for dir in "$RESULTS_DIR"/*; do
-                [ -d "$dir" ] || continue
-                tidx=$(basename "$dir")
-                if [[ "$tidx" =~ ^[0-9]+$ ]]; then
-                    TRANSITIONS_TO_PLOT+=("$tidx")
-                elif [[ "$tidx" =~ ^transition_([0-9]+)$ ]]; then
-                    TRANSITIONS_TO_PLOT+=("${BASH_REMATCH[1]}")
-                fi
-            done
-        else
-            IFS=',' read -ra TRANSITIONS_TO_PLOT <<< "$TRANSITION_INDICES"
-        fi
-        if [ ${#TRANSITIONS_TO_PLOT[@]} -gt 0 ]; then
-            FIRST_TRANSITION="${TRANSITIONS_TO_PLOT[0]}"
         fi
 
         # Generate 2D slice plots.
