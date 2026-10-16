@@ -802,7 +802,7 @@ def run_td_dft_analysis_from_coordinates(
 
 def saved_td_dft_states_match(run_directory, nstates, precision):
     """
-    Check the saved state count and that TD-DFT computed three extra states.
+    Check the saved state counts, skipping molecules marked as failed.
 
     # Arguments:
     - run_directory::str: The run directory.
@@ -810,7 +810,7 @@ def saved_td_dft_states_match(run_directory, nstates, precision):
     - precision::str: The saved floating point precision.
 
     # Returns:
-    - bool: Whether every molecule and conformer has the required saved states.
+    - bool: Whether every successful molecule and conformer has the required saved states.
     """
     precision_suffix = "_f32" if precision == "float32" else "_f64"
     try:
@@ -821,7 +821,7 @@ def saved_td_dft_states_match(run_directory, nstates, precision):
         for entry in entries:
             molecule_directory = os.path.join(run_directory, entry["folder"])
             if os.path.isfile(os.path.join(molecule_directory, ".tddft_failed")):
-                return False
+                continue
             crystal_metadata = os.path.join(molecule_directory, "crystal_metadata.json")
             if os.path.isfile(crystal_metadata):
                 with open(crystal_metadata) as crystal_file:

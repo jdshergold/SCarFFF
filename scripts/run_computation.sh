@@ -8,13 +8,13 @@ set -e  # Exit if anything breaks.
 # ========================================
 
 # Run configuration.
-RUN_NAME="benzene_same_mol_mix"     # Name for this run.
+RUN_NAME="velocity_mols" #"benzene_12_states"     # Name for this run.
 
 # Input specification. Specify exactly one of the following four options.
 # CIF_FILE and CIF_DIR are for crystal mode only, and require METHOD="spherical".
-CSV_FILE=""                 # Batch molecule mode. Path to a CSV file of SMILES strings.
-SMILES=""        # Single molecule mode. SMILES string for the molecule.
-CIF_FILE="examples/benzene_1423904.cif" #"examples/our_favourite_molecules/ZZZMTW02.cif"                 # Single crystal mode. Path to a CIF file.
+CSV_FILE="examples/velocity_mols.csv"                 # Batch molecule mode. Path to a CSV file of SMILES strings.
+SMILES="" #"C1=CC=CC=C1"        # Single molecule mode. SMILES string for the molecule.
+CIF_FILE="" #"examples/benzene_1423904.cif" #"examples/our_favourite_molecules/ZZZMTW02.cif"                 # Single crystal mode. Path to a CIF file.
 CIF_DIR="" #"examples/our_favourite_molecules"                  # Batch crystal mode. Path to a directory of CIF files.
 
 # ==== Crystal parameters (crystal mode only). ====
@@ -35,10 +35,9 @@ EPSILON_B=Inf               # Permittivity of the medium around the sample, whic
 
 
 # ==== TD-DFT parameters. ====
-BASIS="def2-SVP"             # Basis set to use. See README for supported basis sets and aliases.
+BASIS="def2-TZVPD"             # Basis set to use. See README for supported basis sets and aliases.
 XC_FUNCTIONAL="wB97X-D4"        # Exchange-correlation functional for PySCF (e.g. b3lyp, wB97X-V).
-NSTATES=12                  # Number of excited states to compute.
-NTRANS=12                   # Number of transitions to analyse.
+NSTATES=12                  # Number of states for the form factors. TD-DFT computes three extra states.
 RING_FLATTEN="--no-ring-flatten"            # Set to "--no-ring-flatten" to flatten based on whole molecule, or leave as "" for ring-based flattening.
 DFT_OPTIMISATION=false    # Set to true to perform a DFT geometry optimisation after RDKit. Can be very slow on the CPU for large molecules.
 PLOT_MOLECULE_3D=false    # Set to true to generate interactive 3D molecule plot from TD-DFT.
@@ -58,7 +57,7 @@ N_PHI=0                    # Number of phi (azimuthal angle) grid points, or 0 t
 
 # Spherical harmonic expansion parameters.
 L_MAX=24                   # Maximum angular mode, l, to include in spherical harmonic expansion.
-COMPUTE_MODES=("form_factor" "f_sq_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_sq_lm_tensor.
+COMPUTE_MODES=("f_sq_lm_tensor")  # What to compute/save for the spherical method. Options: form_factor, R_tensor, f_sq_lm_tensor.
 
 # ==== Rate computation parameters (spherical method only). ====
 COMPUTE_RATES=false        # Set to true to compute DM scattering rates after the spherical form factor. Not supported for coherent crystals.
@@ -160,6 +159,20 @@ CARTESIAN_COMPUTE_MODE_LC="$(lowercase "$CARTESIAN_COMPUTE_MODE")"
 TRANSITION_INDICES_LC="$(lowercase "$TRANSITION_INDICES")"
 CRYSTAL_ORDER_LC="$(lowercase "$CRYSTAL_ORDER")"
 
+if ! [[ "$NSTATES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: NSTATES must be a positive integer." >&2
+    exit 1
+fi
+if [ "$TRANSITION_INDICES_LC" != "all" ]; then
+    IFS=',' read -ra selected_transitions <<< "$TRANSITION_INDICES"
+    for transition in "${selected_transitions[@]}"; do
+        if ! [[ "$transition" =~ ^[1-9][0-9]*$ ]] || [ "$transition" -gt "$NSTATES" ]; then
+            echo "Error: transition indices must be between 1 and NSTATES ($NSTATES)." >&2
+            exit 1
+        fi
+    done
+fi
+
 CRYSTAL_MODE=false
 if [ -n "$CIF_FILE" ] || [ -n "$CIF_DIR" ]; then
     CRYSTAL_MODE=true
@@ -218,20 +231,35 @@ fi
 
 # Check if we should skip the computation.
 RUN_DIR="$PROJECT_ROOT/runs/$RUN_NAME"
+TDDFT_RESULTS_MATCH=false
+TDDFT_RECOMPUTED=false
 if [ "$SKIP_TDDFT" = true ] && [ -f "$RUN_DIR/metadata.csv" ]; then
+    if "$PYTHON_BIN" - "$SCRIPT_DIR" "$RUN_DIR" "$NSTATES" "$PRECISION" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from td_dft import saved_td_dft_states_match
+sys.exit(0 if saved_td_dft_states_match(sys.argv[2], int(sys.argv[3]), sys.argv[4]) else 1)
+PY
+    then
+        TDDFT_RESULTS_MATCH=true
+    else
+        echo "  Cached TD-DFT results do not match $NSTATES saved states with three extra states computed; recomputing."
+    fi
+fi
+if [ "$SKIP_TDDFT" = true ] && [ "$TDDFT_RESULTS_MATCH" = true ]; then
     echo "  Skipping TD-DFT calculation and using existing results."
     echo ""
 else
     echo "  Basis: $BASIS"
     echo "  XC functional: $XC_FUNCTIONAL"
-    echo "  Number of states: $NSTATES"
-    echo "  Number of transitions: $NTRANS"
+    echo "  Number of form factor states: $NSTATES"
+    echo "  Number of TD-DFT states: $((NSTATES + 3)) (including three buffer states)"
     echo ""
 
     cd "$SCRIPT_DIR"
 
     # Build the td_dft command.
-    TD_DFT_CMD="$PYTHON_BIN td_dft.py --basis \"$BASIS\" --xc \"$XC_FUNCTIONAL\" --nstates $NSTATES --ntrans $NTRANS --precision $PRECISION --output-dir \"$RUN_DIR\""
+    TD_DFT_CMD="$PYTHON_BIN td_dft.py --basis \"$BASIS\" --xc \"$XC_FUNCTIONAL\" --nstates $NSTATES --precision $PRECISION --output-dir \"$RUN_DIR\""
 
     # Add the input to the command.
     if [ "$CRYSTAL_MODE" = true ] && [ -n "$CIF_DIR" ]; then
@@ -258,6 +286,7 @@ else
     fi
 
     eval $TD_DFT_CMD
+    TDDFT_RECOMPUTED=true
 
     # Read the computation time from the file written by Python.
     TDDFT_TIME_FILE="$RUN_DIR/.tddft_time"
@@ -294,7 +323,7 @@ elif [ -d "$RUN_DIR/1/$METHOD" ]; then
     FORM_FACTOR_EXISTS=true
 fi
 
-if [ "$SKIP_FORM_FACTOR" = true ] && [ "$FORM_FACTOR_EXISTS" = true ]; then
+if [ "$SKIP_FORM_FACTOR" = true ] && [ "$FORM_FACTOR_EXISTS" = true ] && [ "$TDDFT_RECOMPUTED" = false ]; then
     echo "  Skipping form factor computation and using existing results."
     echo ""
 else
@@ -436,9 +465,14 @@ else
                 [ -d "$dir" ] || continue
                 tidx=$(basename "$dir")
                 if [[ "$tidx" =~ ^[0-9]+$ ]]; then
-                    TRANSITIONS_TO_PLOT+=("$tidx")
+                    if [ "$tidx" -ge 1 ] && [ "$tidx" -le "$NSTATES" ]; then
+                        TRANSITIONS_TO_PLOT+=("$tidx")
+                    fi
                 elif [[ "$tidx" =~ ^transition_([0-9]+)$ ]]; then
-                    TRANSITIONS_TO_PLOT+=("${BASH_REMATCH[1]}")
+                    tidx="${BASH_REMATCH[1]}"
+                    if [ "$tidx" -ge 1 ] && [ "$tidx" -le "$NSTATES" ]; then
+                        TRANSITIONS_TO_PLOT+=("$tidx")
+                    fi
                 fi
             done
         else
