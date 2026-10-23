@@ -257,28 +257,27 @@ function fill_weighted_pair_P!(
     return nothing
 end
 
-function add_D_pair!(
-        D_blocks::Array{Complex{T}, 3},
+function add_D_potential!(
+        potential::Array{Complex{T}, 3},
         image_idx::Int,
-        transitions_of_pair::Vector{NTuple{2, Int}},
-        Delta_source::Array{Complex{T}, 3},
         Xi_source::Matrix{Complex{T}},
         blocks::Vector{Matrix{Complex{T}}},
         P_pair::PairFrameP{T},
         weighted_P_pair::Matrix{Complex{T}},
         Xi_pair::Matrix{Complex{T}},
         Xi_potential::Matrix{Complex{T}},
-        potential_crystal::Matrix{Complex{T}},
-        overlap::Vector{Complex{T}},
-        prefactor::Complex{T},
         l_max::Int,
     ) where {T<:AbstractFloat}
     """
-    Add the pair contribution Δ P̄ Ξ* to a task-local block of D.
+    Add the Coulomb potential of one neighbouring molecule's charge density, P̄ Ξ*, in the crystal
+    frame.
 
-    P̄ is applied once to Ξ rather than once to every Δ_{st}, as it does not know which pair of
-    states it is working on. The potential that comes out is then rotated back into the crystal
-    frame, so that every Δ can be contracted where it already sits:
+    Ξ holds the ground-state charge density of the neighbour and P̄ is the Coulomb kernel, so P̄ Ξ*
+    is the electrostatic potential that density sets up across the molecule we are working on. Its
+    transition density Δ then sits in that potential, which is what D measures.
+
+    P̄ is applied once to Ξ rather than once to every Δ_{st}, as the potential does not depend on
+    the pair of states. It is then rotated back into the crystal frame.
 
         V_a(q)  = Σ_b P̄_ab(q) Ξ_b*(q)                 in the pair frame,
         W_m(q)  = Σ_μ D^(l)_μm V_μ(q)                 back in the crystal frame,
@@ -288,26 +287,21 @@ function add_D_pair!(
     a pair-frame copy of Δ for every pair of states.
 
     # Arguments:
-    - D_blocks::Array{Complex{T},3}: Task-local D, with dimensions (n_images, n_transitions, n_transitions).
-    - image_idx::Int: The image whose block this contribution belongs to.
-    - transitions_of_pair::Vector{NTuple{2,Int}}: The (s, t) carried by each pair index.
-    - Delta_source::Array{Complex{T},3}: Δ coefficients of this image, one row per pair.
-    - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the second image.
+    - potential::Array{Complex{T},3}: Task-local W, with dimensions (n_q, n_keys, n_images).
+    - image_idx::Int: The molecule the potential is evaluated at.
+    - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the neighbouring image.
     - blocks::Vector{Matrix{Complex{T}}}: Wigner matrices for this pair frame.
     - P_pair::PairFrameP{T}: The grouped Gaunt part of P̄.
     - weighted_P_pair::Matrix{Complex{T}}: P̄(q) for this separation.
     - Xi_pair::Matrix{Complex{T}}: Buffer for pair-frame Ξ*.
     - Xi_potential::Matrix{Complex{T}}: Buffer for P̄ Ξ* in the pair frame.
-    - potential_crystal::Matrix{Complex{T}}: Buffer for the same potential rotated back.
-    - overlap::Vector{Complex{T}}: Buffer for one overlap per pair of states.
-    - prefactor::Complex{T}: The Coulomb prefactor in eV Angstrom.
     - l_max::Int: The largest angular mode.
 
     # Returns:
-    - Nothing. D_blocks is accumulated in place.
+    - Nothing. potential is accumulated in place.
     """
 
-    n_pairs, n_q, n_keys = size(Delta_source)
+    n_q = size(Xi_source, 1)
 
     # Ξ is stored conjugated, so its coefficient rotation uses D*.
     @inbounds for l in 0:l_max
@@ -329,22 +323,66 @@ function add_D_pair!(
         end
     end
 
-    # Rotate the potential back out of the pair frame, so Δ can stay where it is.
+    # Rotate the potential back out of the pair frame and add it to the total this molecule sits in,
+    # so Δ can stay where it is and be contracted once at the end. The image sits last so that a
+    # single molecule's slice is one contiguous matrix, which the multiply can accumulate into.
     @inbounds for l in 0:l_max
         block = (l * l + 1):((l + 1) * (l + 1))
         D = blocks[l + 1]
-        mul!(view(potential_crystal, :, block), view(Xi_potential, :, block), D)
+        mul!(view(potential, :, block, image_idx), view(Xi_potential, :, block), D,
+             one(Complex{T}), one(Complex{T}))
     end
 
-    # Perform the multiplication Δ P̄ Ξ*, and place each pair in its block of D.
-    mul!(overlap, reshape(Delta_source, n_pairs, n_q * n_keys),
-         reshape(potential_crystal, n_q * n_keys))
-    @inbounds for pair in 1:n_pairs
-        (s, t) = transitions_of_pair[pair]
-        value = prefactor * overlap[pair]
-        D_blocks[image_idx, s, t] += value
-        s == t && continue
-        D_blocks[image_idx, t, s] += conj(value)
+    return nothing
+end
+
+function contract_D_potential!(
+        D_blocks::Array{Complex{T}, 3},
+        potential::Array{Complex{T}, 3},
+        rotated_Delta::Array{Complex{T}, 3},
+        transitions_of_pair::Vector{NTuple{2, Int}},
+        overlap::Vector{Complex{T}},
+        prefactor::Complex{T},
+    ) where {T<:AbstractFloat}
+    """
+    Contract the total potential each molecule sits in with its Δ, and place the result in D.
+
+    add_D_potential! has already added the contributions of every neighbour, and Δ is the same
+    whichever neighbour produced the potential, so the whole sum over neighbours needs this
+    contraction only once per molecule.
+
+    # Arguments:
+    - D_blocks::Array{Complex{T},3}: D, with dimensions (n_images, n_transitions, n_transitions).
+    - potential::Array{Complex{T},3}: The summed W, with dimensions (n_q, n_keys, n_images).
+    - rotated_Delta::Array{Complex{T},3}: Δ for every image, one row per (image, pair).
+    - transitions_of_pair::Vector{NTuple{2,Int}}: The (s, t) carried by each pair index.
+    - overlap::Vector{Complex{T}}: Buffer for one overlap per pair of states.
+    - prefactor::Complex{T}: The Coulomb prefactor in eV Angstrom.
+
+    # Returns:
+    - Nothing. D_blocks is filled in place.
+    """
+
+    n_keys, n_images = size(potential, 2), size(potential, 3)
+    n_pairs = length(transitions_of_pair)
+
+    for image_idx in 1:n_images
+        # The rows of one image sit together, so Δ can be read straight out of the rotated tensor
+        # one spherical harmonic at a time, with no copy.
+        rows = ((image_idx - 1) * n_pairs + 1):(image_idx * n_pairs)
+        fill!(overlap, zero(Complex{T}))
+        for key in 1:n_keys
+            mul!(overlap, view(rotated_Delta, rows, :, key),
+                 view(potential, :, key, image_idx), one(Complex{T}), one(Complex{T}))
+        end
+
+        @inbounds for pair in 1:n_pairs
+            (s, t) = transitions_of_pair[pair]
+            value = prefactor * overlap[pair]
+            D_blocks[image_idx, s, t] += value
+            s == t && continue
+            D_blocks[image_idx, t, s] += conj(value)
+        end
     end
 
     return nothing
@@ -449,18 +487,12 @@ function _compute_crystal_corrections(
         end
     end
 
-    # Do the same as above for the Δ and Ξ coefficients, Δ = first, Xi = second. Δ keeps one row per
-    # pair of states, and stays in the crystal frame, since the potential is rotated back to meet it.
-    Delta_coefficients = have_Delta_and_Xi ?
-        [Array{Complex{T}, 3}(undef, n_pairs, n_q, n_keys) for _ in 1:n_images] : nothing
+    # Ξ is conjugated once here, since it always appears that way. Δ needs no copy at all: it stays
+    # in the crystal frame, where the potential is rotated back to meet it.
     Xi_coefficients = have_Delta_and_Xi ?
         [Matrix{Complex{T}}(undef, n_q, n_keys) for _ in 1:n_images] : nothing
     if have_Delta_and_Xi
         for image_idx in 1:n_images
-            @inbounds for pair in 1:n_pairs, key in 1:n_keys, q_idx in 1:n_q
-                Delta_coefficients[image_idx][pair, q_idx, key] =
-                    rotated_Delta[Delta_row(image_idx, pair, n_pairs), q_idx, key]
-            end
             @inbounds for key in 1:n_keys, q_idx in 1:n_q
                 Xi_coefficients[image_idx][q_idx, key] = conj(rotated_Xi[image_idx, q_idx, key])
             end
@@ -488,8 +520,8 @@ function _compute_crystal_corrections(
 
     couplings = zeros(Complex{T}, n_neighbour_cells, n_lambda_i, n_lambda_i)
     n_chunks = min(nthreads(), max(length(jobs), 1))
-    D_chunks = have_Delta_and_Xi ?
-        [zeros(Complex{T}, n_images, n_transitions, n_transitions) for _ in 1:n_chunks] : nothing
+    potential_chunks = have_Delta_and_Xi ?
+        [zeros(Complex{T}, n_q, n_keys, n_images) for _ in 1:n_chunks] : nothing
 
     # Avoid BLAS oversubscription.
     blas_threads = BLAS.get_num_threads()
@@ -514,9 +546,7 @@ function _compute_crystal_corrections(
                 # needs pair-frame buffers, since the potential is rotated back to meet Δ.
                 Xi_pair = have_Delta_and_Xi ? Matrix{Complex{T}}(undef, n_q, n_keys) : nothing
                 Xi_potential = have_Delta_and_Xi ? similar(Xi_pair) : nothing
-                potential_crystal = have_Delta_and_Xi ? similar(Xi_pair) : nothing
-                Delta_overlap = have_Delta_and_Xi ? Vector{Complex{T}}(undef, n_pairs) : nothing
-                local_D = have_Delta_and_Xi ? D_chunks[chunk] : nothing
+                local_potential = have_Delta_and_Xi ? potential_chunks[chunk] : nothing
 
                 for job_idx in chunk:n_chunks:length(jobs)
                     # Get the indices for the current job.
@@ -588,24 +618,22 @@ function _compute_crystal_corrections(
                     end
 
                     if have_Delta_and_Xi
-                        # D_i += Δ_i P̄ Ξ_j*, in the pair frame already built for J_ij.
-                        add_D_pair!(
-                            local_D, image_i, pairs.transitions_of_pair,
-                            Delta_coefficients[image_i],
+                        # The potential of molecule j's charge density across molecule i, in the
+                        # pair frame already built for J_ij.
+                        add_D_potential!(
+                            local_potential, image_i,
                             Xi_coefficients[image_j], blocks, P_pair, weighted_P_pair,
-                            Xi_pair, Xi_potential, potential_crystal, Delta_overlap,
-                            prefactor, l_max)
+                            Xi_pair, Xi_potential, l_max)
 
-                        # D_j += Δ_j P̄ Ξ_i*, at separation -d. Needs to be computed separately.
+                        # The same the other way round, molecule i across molecule j, at separation
+                        # -d. The pair frame is different, so it needs its own rotation.
                         if image_i != image_j
                             reverse_S_inverse = rotation_to_pair_frame(-separation / distance)
                             reverse_blocks = wigner_d_blocks!(wigner_buffers, reverse_S_inverse)
-                            add_D_pair!(
-                                local_D, image_j, pairs.transitions_of_pair,
-                                Delta_coefficients[image_j],
+                            add_D_potential!(
+                                local_potential, image_j,
                                 Xi_coefficients[image_i], reverse_blocks, P_pair, weighted_P_pair,
-                                Xi_pair, Xi_potential, potential_crystal, Delta_overlap,
-                                prefactor, l_max)
+                                Xi_pair, Xi_potential, l_max)
                         end
                     end
                 end
@@ -616,13 +644,17 @@ function _compute_crystal_corrections(
         BLAS.set_num_threads(blas_threads)
     end
 
-    # Sum the per-task D accumulators. Δ P̄ Ξ* comes out real, so check that and then force it.
+    # Sum the per-task potentials, then contract each image's total with its Δ just once.
+    # Δ P̄ Ξ* comes out real, so check that and then force it.
     D_blocks = zeros(T, n_images, n_transitions, n_transitions)
     if have_Delta_and_Xi
-        total = zeros(Complex{T}, n_images, n_transitions, n_transitions)
-        for chunk_values in D_chunks
-            total .+= chunk_values
+        summed_potential = potential_chunks[1]
+        for chunk in 2:n_chunks
+            summed_potential .+= potential_chunks[chunk]
         end
+        total = zeros(Complex{T}, n_images, n_transitions, n_transitions)
+        contract_D_potential!(total, summed_potential, rotated_Delta, pairs.transitions_of_pair,
+                              Vector{Complex{T}}(undef, n_pairs), prefactor)
         scale = max(maximum(abs, real(total)), one(T))
         imaginary_residual = maximum(abs, imag(total))
         tolerance = T(1000) * eps(T) * scale
