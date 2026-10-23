@@ -1,0 +1,19 @@
+mode: fourier
+output: ../runs/benzene_fourier
+input:
+  smiles: C1=CC=CC=C1
+nstates: 12
+stages:
+  tddft: run
+  form_factors: run
+tddft:
+  basis: def2-TZVPD
+  xc: wB97X-D4
+fourier:
+  q_max: [15, 15, 15]
+  dq: [0.075, 0.075, 0.075]
+  check_parseval: false
+execution:
+  precision: float32
+  gpu: false
+  threads: auto

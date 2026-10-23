@@ -1,0 +1,20 @@
+mode: spherical
+output: ../runs/benzene_spherical
+input:
+  smiles: C1=CC=CC=C1
+nstates: 12
+stages:
+  tddft: run
+  form_factors: run
+tddft:
+  basis: 6-31g*
+  xc: b3lyp
+spherical:
+  q_max: 20
+  n_q: 101
+  l_max: 24
+  save: [f_s, f_sq_lm]
+execution:
+  precision: float32
+  gpu: false
+  threads: auto

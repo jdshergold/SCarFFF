@@ -1,0 +1,52 @@
+file_type: [png, pdf]
+width: [full, half, third]
+shape: [square, rectangular]
+
+style:
+  text_width_pt: 510
+  gap_pt: 18
+  caption_pt: 9
+
+grouping:
+  energy_tolerance_eV: 0.01
+
+# These sizes are used only for angular moments on Cartesian or Fourier grids.
+angular_sampling:
+  n_q: 251
+  n_theta: 97
+  n_phi: 97
+
+molecules: all
+
+# Figures inherit the widths and shapes above. Specify either here to override it.
+figures:
+  - type: overview
+
+  - type: intensity
+    states: [3]
+    planes: [xy, xz, yz]
+  - type: real
+    states: [12]
+    planes: [yz]
+  - type: imag
+    states: [3]
+    planes: [yz]
+  - type: f_sq_lm
+    states: [3]
+    modes: dominant
+  - type: transition_density
+    states: [3]
+    planes: [xy, xz, yz]
+  - type: angular_mean
+    states: dominant
+  - type: angular_std
+    states: dominant
+  - type: structure_mode
+    modes: [[0, 0], [2, 2]]
+  - type: structure_modes
+    modes: dominant
+  - type: structure_integral
+  - type: structure_mode_integrals
+    modes: dominant
+  - type: structure_sum_rule
+    modes: [[0, 0], [2, 2]]

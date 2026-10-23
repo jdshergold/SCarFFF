@@ -19,12 +19,12 @@ include("form_factors/fft/FFTFormFactor.jl")
 include("form_factors/cartesian/CartesianFormFactor.jl")
 
 # Import the functions to compute the form factors from each module.
-using .SphericalFormFactor: compute_spherical_form_factor, compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids
+using .SphericalFormFactor: compute_spherical_form_factor
 using .FFTFormFactor: compute_fft_form_factor
 using .CartesianFormFactor: compute_cartesian_form_factor
 
 # And export them for other modules to use.
-export compute_spherical_form_factor, compute_fft_form_factor, compute_cartesian_form_factor, compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids
+export compute_spherical_form_factor, compute_fft_form_factor, compute_cartesian_form_factor
 
 function write_mock_molecular_data_file(file_path::String, ::Type{T}) where {T<:AbstractFloat}
     """

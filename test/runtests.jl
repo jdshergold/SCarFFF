@@ -189,9 +189,9 @@ function build_small_R_case(::Type{T}, tmp_dir::String) where {T<:AbstractFloat}
     b_A, b_B, b_C = SF.ConstructbCoefficients.construct_b_coefficients(mol, R_ij)
     D_ij = SF.ConstructDTensor.construct_D_tensor(mol, M_ij, sigma_ij, b_A, b_B, b_C)
 
-    # Use the package A tensor and generate the matching small Gaunt tensor for this test.
-    data_dir = joinpath(dirname(pathof(SCarFFF)), "data")
-    A_path = joinpath(data_dir, "A_tensors", T == Float32 ? "A_tensor_n2_f32.h5" : "A_tensor_n2_f64.h5")
+    # Generate the small angular tensors in the test directory.
+    A_path = joinpath(tmp_dir, "A_$(T).h5")
+    SF.PrecomputeATensor.precompute_A_tensor(2, A_path, T)
     gaunt_path = joinpath(tmp_dir, "gaunt_$(T).h5")
     SF.PrecomputeGaunt.precompute_gaunt_coefficients(2, 4, 2, gaunt_path, T)
     W_ij = SF.ConstructWTensor.construct_W_tensor(D_ij, A_path; threshold = zero(T))
@@ -1400,13 +1400,17 @@ end
     end
 end
 
-@testset "Intensity rate projection" begin
-    # Constant radial intensity must retain its two state values in every tophat bin.
-    f_sq_lm = zeros(Float64, 2, 3, 1)
-    f_sq_lm[1, :, 1] .= 2.0
-    f_sq_lm[2, :, 1] .= 5.0
-    projected = SF.ComputeRates.to_tophat(f_sq_lm)
-    @test size(projected) == (2, 2, 1)
-    @test sum(abs2, projected[1, :, 1]) ≈ 4.0 / 3
-    @test sum(abs2, projected[2, :, 1]) ≈ 25.0 / 3
+@testset "Fourier Parseval check with transition views" begin
+    fft = SCarFFF.FFTFormFactor.PerformFFT
+    density = reshape(collect(1.0:125.0), 1, 5, 5, 5)
+    limits = [1.0, 2.0, 3.0]
+    counts = [5, 5, 5]
+    amplitude = fft.perform_fft(density, limits, counts)
+    @test sum(abs2, amplitude) / prod(counts) ≈ sum(abs2, density) * prod(2 .* limits ./ counts)^2
+    mktemp() do _, output
+        redirect_stdout(output) do
+            @test fft.check_parseval_theorem(view(density, 1, :, :, :),
+                view(amplitude, 1, :, :, :), limits, counts) === nothing
+        end
+    end
 end

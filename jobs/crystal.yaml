@@ -1,0 +1,24 @@
+mode: crystal
+output: ../runs/benzene_crystal
+input:
+  cif: ../examples/benzene.cif
+nstates: 12
+stages:
+  tddft: run
+  form_factors: run
+tddft:
+  basis: def2-SVP
+  xc: wB97X-D4
+spherical:
+  q_max: 20
+  n_q: 501
+  l_max: 24
+  #save: []
+crystal:
+  order: coherent
+  epsilon_b: .inf
+  energy_step: 0.01
+execution:
+  precision: float64
+  gpu: false
+  threads: auto

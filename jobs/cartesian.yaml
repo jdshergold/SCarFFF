@@ -1,0 +1,21 @@
+mode: cartesian
+output: ../runs/benzene_cartesian
+input:
+  smiles: C1=CC=CC=C1
+nstates: 12
+stages:
+  tddft: run
+  form_factors: run
+tddft:
+  basis: def2-TZVPD
+  xc: wB97X-D4
+cartesian:
+  q_x: [-15, 15, 101]
+  q_y: [-15, 15, 101]
+  q_z: [-15, 15, 101]
+  threshold: 1.0e-6
+  save: [f_s]
+execution:
+  precision: float32
+  gpu: false
+  threads: auto

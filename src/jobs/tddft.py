@@ -1,7 +1,3 @@
-import argparse
-import csv
-import json
-import time
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDistGeom
@@ -16,7 +12,6 @@ import psutil
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
 
-from crystal_utils import build_coordinate_list, build_crystal_metadata, get_crystal_data
 
 # Atomic numbers for elements up to Mo, used for weighting when flattening molecule.
 ATOMIC_NUMBERS = {
@@ -619,6 +614,7 @@ def run_td_dft_analysis(
     dft_optimisation=False,
     precision="float64",
     plot_molecule_3d=False,
+    filename="td_dft.h5",
 ):
     """Perform the TD-DFT analysis for a given molecule and save the results to an HDF5 file.
 
@@ -633,6 +629,7 @@ def run_td_dft_analysis(
         use_gpu::bool: Whether to run the DFT and TD-DFT calculations on a GPU (default: False).
         precision::str: Floating point precision to use when saving results ('float32' or 'float64').
         plot_molecule_3d::bool: Whether to generate the interactive 3D molecule plot (default: False).
+        filename::str: The TD-DFT output filename.
 
     Returns:
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
@@ -671,6 +668,7 @@ def run_td_dft_analysis(
         use_gpu=use_gpu,
         precision=precision,
         plot_molecule_3d=False,
+        filename=filename,
     )
 
 
@@ -684,6 +682,7 @@ def run_td_dft_analysis_from_coordinates(
     use_gpu=False,
     precision="float64",
     plot_molecule_3d=False,
+    filename="td_dft.h5",
 ):
     """Perform the TD-DFT analysis for a specified geometry and save the results to an HDF5 file.
 
@@ -697,6 +696,7 @@ def run_td_dft_analysis_from_coordinates(
         use_gpu::bool: Whether to run the DFT and TD-DFT calculations on a GPU (default: False).
         precision::str: Floating point precision to use when saving results ('float32' or 'float64').
         plot_molecule_3d::bool: Whether to generate the interactive 3D molecule plot (default: False).
+        filename::str: The TD-DFT output filename.
 
     Returns:
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
@@ -742,13 +742,13 @@ def run_td_dft_analysis_from_coordinates(
     orbv = mf.mo_coeff[:, ~occ_mask]
 
     # Prepare data for saving to file.
-    # PySCF holds mol._atom in Bohr, so these coordinates are in Bohr, not Angstroms.
+    # PySCF stores mol._atom in Bohr, so these coordinates are in Bohr, not Angstroms.
     geometry = [[atom[0], atom[1][0], atom[1][1], atom[1][2]] for atom in mol._atom]
     ao_labels = [str(label) for label in mol.ao_labels()]
     # Save energies only for the states used in the form factors.
     energies = [float(energy * 27.211396) for energy in td.e[:nstates]]  # Convert Hartree to eV.
 
-    # Extract oscillator strengths.
+    # Extract the oscillator strengths.
     oscillator_strengths = np.array(
         td.oscillator_strength()[:nstates], dtype=float
     )
@@ -759,11 +759,11 @@ def run_td_dft_analysis_from_coordinates(
         raise ValueError(f"Unsupported precision {precision} specified. Suppported types are float32 and float64.")
     float_dtype = np.float32 if precision == "float32" else np.float64
     complex_dtype = np.complex64 if precision == "float32" else np.complex128
-    precision_suffix = "_f32" if precision == "float32" else "_f64"
 
-    # Save to HDF5 file with the correct precision suffix.
-    output_file = f"{output_directory}/td_dft_results{precision_suffix}.h5"
-    with h5py.File(output_file, "w") as f:
+    # Replace the saved calculation only after the whole file has been written.
+    output_file = os.path.join(output_directory, filename)
+    temporary_file = output_file + ".tmp"
+    with h5py.File(temporary_file, "w") as f:
         # Store the molecule metadata as attributes.
         f.attrs["species"] = species
         f.attrs["basis"] = basis
@@ -777,13 +777,13 @@ def run_td_dft_analysis_from_coordinates(
         # Save the atom symbols and coordinates.
         dt = h5py.string_dtype(encoding="utf-8")
         f.create_dataset("atom_symbols", data=atom_symbols, dtype=dt)
-        f.create_dataset("atom_coordinates", data=atom_coords)  # Bohr. SCarFFF converts to Angstroms.
+        f.create_dataset("atom_coordinates", data=atom_coords).attrs["units"] = "bohr"
 
         # Store the AO labels.
         f.create_dataset("ao_labels", data=ao_labels, dtype=dt)
 
         # Store the transition energies in eV, and the oscillator strengths.
-        f.create_dataset("Delta_E_eV", data=np.array(energies, dtype=float_dtype))
+        f.create_dataset("Delta_E_eV", data=np.array(energies, dtype=float_dtype)).attrs["units"] = "eV"
         f.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
 
         # Store the occupied and virtual MO coefficients, shared across all transitions.
@@ -795,337 +795,8 @@ def run_td_dft_analysis_from_coordinates(
             f.create_dataset(f"X_state_{i+1}", data=np.asarray(X, dtype=complex_dtype))
             f.create_dataset(f"Y_state_{i+1}", data=np.asarray(Y, dtype=complex_dtype))
 
+    os.replace(temporary_file, output_file)
     print(f"\nResults saved to {output_file}")
 
     return coordinates, mol, mf, td, mxXY
 
-
-def saved_td_dft_states_match(run_directory, nstates, precision):
-    """
-    Check the saved state counts, skipping molecules marked as failed.
-
-    # Arguments:
-    - run_directory::str: The run directory.
-    - nstates::int: The number of states for the form factors.
-    - precision::str: The saved floating point precision.
-
-    # Returns:
-    - bool: Whether every successful molecule and conformer has the required saved states.
-    """
-    precision_suffix = "_f32" if precision == "float32" else "_f64"
-    try:
-        with open(os.path.join(run_directory, "metadata.csv"), newline="") as metadata:
-            entries = list(csv.DictReader(metadata))
-        if not entries:
-            return False
-        for entry in entries:
-            molecule_directory = os.path.join(run_directory, entry["folder"])
-            if os.path.isfile(os.path.join(molecule_directory, ".tddft_failed")):
-                continue
-            crystal_metadata = os.path.join(molecule_directory, "crystal_metadata.json")
-            if os.path.isfile(crystal_metadata):
-                with open(crystal_metadata) as crystal_file:
-                    conformer_labels = json.load(crystal_file)["conformer_labels"]
-                if not conformer_labels:
-                    return False
-                state_directories = [os.path.join(molecule_directory, "conformers", label)
-                                     for label in conformer_labels]
-            else:
-                state_directories = [molecule_directory]
-            for state_directory in state_directories:
-                filename = os.path.join(state_directory, f"td_dft_results{precision_suffix}.h5")
-                with h5py.File(filename, "r") as results:
-                    if results["Delta_E_eV"].shape != (nstates,) or results["f_osc"].shape != (nstates,):
-                        return False
-                    if results.attrs.get("nstates_td_dft", 0) < nstates + 3:
-                        return False
-                    for s in range(1, nstates + 1):
-                        if f"X_state_{s}" not in results or f"Y_state_{s}" not in results:
-                            return False
-                    if f"X_state_{nstates + 1}" in results or f"Y_state_{nstates + 1}" in results:
-                        return False
-    except (OSError, KeyError, ValueError):
-        return False
-    return True
-
-
-def parse_cli_arguments():
-    parser = argparse.ArgumentParser(
-        description="Run TD-DFT analysis and write results to HDF5."
-    )
-    parser.add_argument(
-        "--smiles",
-        default=None,
-        help="SMILES string for a single molecule (ignored if --csv-file is provided).",
-    )
-    parser.add_argument(
-        "--csv-file",
-        dest="csv_file",
-        default=None,
-        help="Path to CSV file containing SMILES strings (one per line, with 'smiles' header).",
-    )
-    parser.add_argument(
-        "--cif-file",
-        dest="cif_file",
-        default=None,
-        help="Path to a CIF file describing a crystal to process.",
-    )
-    parser.add_argument(
-        "--cif-dir",
-        dest="cif_dir",
-        default=None,
-        help="Path to a directory containing CIF files to process.",
-    )
-    parser.add_argument(
-        "--basis",
-        default="6-31g*",
-        help="Basis set label to use for PySCF.",
-    )
-    parser.add_argument(
-        "--xc",
-        default="b3lyp",
-        help="Exchange-correlation functional to use for PySCF (default: b3lyp).",
-    )
-    parser.add_argument(
-        "--nstates",
-        type=int,
-        default=5,
-        help="Number of states for the form factors. TD-DFT computes three additional buffer states.",
-    )
-    parser.add_argument(
-        "--no-ring-flatten",
-        dest="ring_flatten",
-        action="store_false",
-        help="Disable ring-only flattening (use entire molecule instead).",
-    )
-    parser.add_argument(
-        "--use-gpu",
-        dest="use_gpu",
-        action="store_true",
-        help="Enable GPU acceleration for DFT and TD-DFT calculations.",
-    )
-    parser.add_argument(
-        "--precision",
-        choices=["float64", "float32"],
-        default="float64",
-        help="Floating point precision to use when saving TD-DFT results.",
-    )
-    parser.add_argument(
-        "--dft-optimisation",
-        dest="dft_optimisation",
-        action="store_true",
-        help="Perform a DFT geometry optimisation after RDKit.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        dest="output_dir",
-        default=None,
-        help="Output directory for this run (e.g., ../runs/run_name). Molecule subdirectories (1, 2, 3...) will be created inside this. If not specified, defaults to ../runs/{smiles} for single molecule or ../runs/batch_run for CSV.",
-    )
-    parser.add_argument(
-        "--plot-molecule-3d",
-        dest="plot_molecule_3d",
-        action="store_true",
-        help="Generate interactive 3D molecule plot.",
-    )
-    parser.set_defaults(ring_flatten=True, use_gpu=False, dft_optimisation=False, plot_molecule_3d=False)
-    args = parser.parse_args()
-    if args.nstates < 1:
-        parser.error("--nstates must be a positive integer.")
-    return args
-
-
-def main():
-    args = parse_cli_arguments()
-
-    # Read the list of molecules or crystals from the specified input mode.
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-
-    input_modes = [
-        args.smiles is not None,
-        args.csv_file is not None,
-        args.cif_file is not None,
-        args.cif_dir is not None,
-    ]
-
-    if sum(input_modes) != 1:
-        raise ValueError("Specify exactly one of --smiles, --csv-file, --cif-file, or --cif-dir.")
-
-    # This will store the kind of each system to run, "molecule" or "crystal", along with its name and what should be used as input.
-    entries = []
-
-    # Multiple molecule mode, from CSV.
-    if args.csv_file is not None:
-        # Construct the path to the CSV file.
-        csv_path = os.path.join(project_root, args.csv_file)
-
-        with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                entries.append({
-                    "kind": "molecule",
-                    "display_name": row["smiles"],
-                    "input_value": row["smiles"],
-                })
-        print(f"Found {len(entries)} molecules to process.\n")
-    elif args.smiles is not None:
-        # Single molecule mode.
-        entries = [{
-            "kind": "molecule",
-            "display_name": args.smiles,
-            "input_value": args.smiles,
-        }]
-        print(f"Processing single molecule with SMILES {args.smiles}\n")
-    elif args.cif_dir is not None:
-        # Batch crystal mode.
-        cif_directory = os.path.join(project_root, args.cif_dir)
-        # Find all CIF files in the directory.
-        cif_paths = sorted([
-            os.path.join(cif_directory, filename)
-            for filename in os.listdir(cif_directory)
-            if filename.lower().endswith(".cif")
-        ])
-
-        if cif_paths == []:
-            raise ValueError(f"No CIF files found in directory {cif_directory}")
-
-        # Append each CIF file to the list of entries.
-        entries = [{
-            "kind": "crystal",
-            "display_name": os.path.splitext(os.path.basename(cif_path))[0],
-            "input_value": cif_path,
-        } for cif_path in cif_paths]
-        print(f"Found {len(entries)} CIF files to process.\n")
-
-    elif args.cif_file is not None:
-        # Single crystal mode.
-        cif_path = os.path.join(project_root, args.cif_file)
-        entries = [{
-            "kind": "crystal",
-            "display_name": os.path.splitext(os.path.basename(cif_path))[0],
-            "input_value": cif_path,
-        }]
-        print(f"Processing single crystal from CIF {args.cif_file}\n")
-    else:
-        raise ValueError("Please specify exactly one of --smiles, --csv-file, --cif-file, or --cif-dir.")
-
-    # Determine the output directory.
-    if args.output_dir is not None:
-        run_directory = args.output_dir
-    elif args.csv_file is not None or args.cif_dir is not None:
-        run_directory = os.path.join("../runs", "batch_run")
-    elif args.smiles is not None:
-        run_directory = os.path.join("../runs", args.smiles)
-    else:
-        run_directory = os.path.join("../runs", entries[0]["display_name"])
-
-    os.makedirs(run_directory, exist_ok=True)
-
-    # Create the metadata file.
-    metadata_file = os.path.join(run_directory, "metadata.csv")
-    with open(metadata_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['folder', 'smiles', 'basis', 'xc'])
-
-    # Start timing the computation.
-    computation_start = time.perf_counter()
-
-    # Process each molecule or crystal.
-    for mol_idx, entry in enumerate(entries):
-        mol_num = mol_idx + 1  # 1-based numbering for the output directories.
-        mol_output_dir = os.path.join(run_directory, str(mol_num))
-        os.makedirs(mol_output_dir, exist_ok=True)
-
-        print(f"{'='*50}")
-        print(f"Processing {entry['kind']} {mol_num} of {len(entries)}: {entry['display_name']}")
-        print(f"{'='*50}\n")
-
-        # Append to metadata.
-        with open(metadata_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([mol_num, entry["display_name"], args.basis, args.xc])
-
-        # Run the TD-DFT analysis for this molecule or crystal.
-        try:
-            if entry["kind"] == "molecule":
-                run_td_dft_analysis(
-                    smiles=entry["input_value"],
-                    basis=args.basis,
-                    xc=args.xc,
-                    nstates=args.nstates,
-                    output_directory=mol_output_dir,
-                    ring_flatten=args.ring_flatten,
-                    use_gpu=args.use_gpu,
-                    dft_optimisation=args.dft_optimisation,
-                    precision=args.precision,
-                    plot_molecule_3d=args.plot_molecule_3d,
-                )
-            else:
-                if args.ring_flatten is not True:
-                    print("Ignoring --no-ring-flatten in crystal mode.")
-                if args.dft_optimisation:
-                    print("Ignoring --dft-optimisation in crystal mode.")
-                if args.plot_molecule_3d:
-                    print("Ignoring --plot-molecule-3d in crystal mode.")
-
-                crystal_data = get_crystal_data(entry["input_value"])
-                crystal_metadata = build_crystal_metadata(crystal_data)
-                metadata_path = os.path.join(mol_output_dir, "crystal_metadata.json")
-                with open(metadata_path, "w") as f:
-                    json.dump(crystal_metadata, f, indent=2)
-
-                conformers_root = os.path.join(mol_output_dir, "conformers")
-                os.makedirs(conformers_root, exist_ok=True)
-
-                for conformer_label in crystal_data["conformer_labels"]:
-                    conformer_dir = os.path.join(conformers_root, conformer_label)
-                    os.makedirs(conformer_dir, exist_ok=True)
-
-                    conformer_data = crystal_data["conformers"][conformer_label]
-                    conformer_coordinates = build_coordinate_list(
-                        conformer_data["atom_symbols"],
-                        conformer_data["atom_coordinates"],
-                    )
-
-                    run_td_dft_analysis_from_coordinates(
-                        coordinates=conformer_coordinates,
-                        species=f"{entry['display_name']}_{conformer_label}",
-                        basis=args.basis,
-                        xc=args.xc,
-                        nstates=args.nstates,
-                        output_directory=conformer_dir,
-                        use_gpu=args.use_gpu,
-                        precision=args.precision,
-                        plot_molecule_3d=False,
-                    )
-        except Exception as e:
-            # Write a failure marker with the error message for downstream scripts and user diagnostics.
-            failed_file = os.path.join(mol_output_dir, ".tddft_failed")
-            with open(failed_file, 'w') as f:
-                f.write(f"entry: {entry['display_name']}\n")
-                f.write(f"error: {e}\n")
-
-            print(f"\nTD-DFT calculation failed for {entry['kind']} {mol_num} ({entry['display_name']}): {e}")
-            print(f"Failure recorded in {failed_file}. Skipping molecule {mol_num} and continuing.\n")
-            continue
-
-        failed_file = os.path.join(mol_output_dir, ".tddft_failed")
-        if os.path.isfile(failed_file):
-            os.remove(failed_file)
-        print(f"\n{entry['kind'].capitalize()} {mol_num} complete!\n")
-
-    # End timing and save to file for bash to read.
-    computation_time = time.perf_counter() - computation_start
-    timing_file = os.path.join(run_directory, ".tddft_time")
-    with open(timing_file, 'w') as f:
-        f.write(f"{computation_time:.3f}\n")
-
-    print(f"{'='*50}")
-    print(f"All TD-DFT calculations complete!")
-    print(f"Results saved to: {run_directory}")
-    print(f"{'='*50}")
-
-
-if __name__ == "__main__":
-    main()

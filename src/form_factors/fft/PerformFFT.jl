@@ -84,8 +84,8 @@ function perform_fft(
 end
 
 function check_parseval_theorem(
-        transition_density::Array{T, 3},
-        form_factor::Array{Complex{T}, 3},
+        transition_density::AbstractArray{T, 3},
+        form_factor::AbstractArray{Complex{T}, 3},
         r_lim::Vector{U},
         N_grid::Vector{Int}
     )::Nothing where {T<:AbstractFloat, U<:AbstractFloat}
@@ -97,8 +97,8 @@ function check_parseval_theorem(
     holds where ρ(r) is the transition density and f_s(q) is the form factor.
 
     # Arguments:
-    - transition_density::Array{T, 3}: The transition density.
-    - form_factor::Array{Complex{T}, 3}: The form factor.
+    - transition_density::AbstractArray{T, 3}: The transition density.
+    - form_factor::AbstractArray{Complex{T}, 3}: The form factor.
     - r_lim::Vector{U}: The limits of the grid in real space, in Angstroms.
     - N_grid::Vector{Int}: The number of grid points in each dimension.
 

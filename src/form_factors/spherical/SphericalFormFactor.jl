@@ -15,7 +15,6 @@ include("ContractSphericalGrid.jl")
 include("ConstructRTensorGPU.jl")
 include("ContractSphericalGridGPU.jl")
 include("ConstructFSquaredTensor.jl")
-include("ConstructCrystalTensor.jl")
 include("CrystalLattice.jl")
 include("Ewald.jl")
 include("BlochHamiltonian.jl")
@@ -25,7 +24,6 @@ include("CouplingJ.jl")
 include("CrystalSymmetry.jl")
 include("StructureFactor.jl")
 include("CoherentCrystalFormFactor.jl")
-include("ComputeRates.jl")
 
 using CUDA
 using .ReadBasisSet: get_molecular_data, MoleculeData, build_Delta_T_matrices,
@@ -39,7 +37,6 @@ using .ConstructWTensor: construct_W_tensor
 using .ConstructRTensor: construct_R_tensor
 using .DensityFormFactors: split_density_R_tensors
 using .ContractSphericalGrid: contract_spherical_grid
-using .ConstructCrystalTensor: construct_unit_cell_f_sq_lm_tensors
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
 using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
               compute_ewald_D, supercell_radius,
@@ -59,11 +56,9 @@ using .CoherentCrystalFormFactor: rotate_R_tensors, rotate_crystal_R_tensors,
                                   compute_coherent_unit_cell_form_factor, compute_coherent_unit_cell_f_sq_lm,
                                   compute_incoherent_unit_cell_f_sq_lm
 
-using .ComputeRates: compute_rates, compute_rates_by_orientation, combine_crystal_rate_grids
 using ..StageTimings: print_stage_timings, time_stage!
 
 export compute_spherical_form_factor, compute_spherical_form_factor_with_densities,
-       compute_rates, compute_rates_by_orientation, construct_unit_cell_f_sq_lm_tensors, combine_crystal_rate_grids,
        build_crystal_lattice, fold_to_bz, CrystalImage, build_excitation_basis,
        set_D_couplings!, compute_crystal_corrections,
        rotate_R_tensors, rotate_crystal_R_tensors,

@@ -298,7 +298,7 @@ def get_crystal_data(cif_path):
 def build_crystal_metadata(crystal_data):
     """
     Build the minimal crystal metadata required to reconstruct the crystal later.
-    Coordinates will be saved in the td-dft output, so no need to save them here.
+    Coordinates will be saved in the TD-DFT output, so no need to save them here.
 
     # Arguments:
     - crystal_data::dict: Crystal data returned by get_crystal_data.
