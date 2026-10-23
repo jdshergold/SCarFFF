@@ -389,13 +389,22 @@ function build_coefficient_table(
     end
 
     # Also store the tangents for the Hermite interpolation. Premultiply by dx (i.e. don't divide by it) to save multiplying later.
-    # Endpoints use one directional difference, interior points use central difference, hence the 1/2 for them.
+    # The cubic spline is accurate to dx^4, so a use a five point derivative stencil to match.
     tangent = similar(table)
     @inbounds for object in 1:n_objects, key in 1:n_keys_lr
         tangent[key, object, 1] = table[key, object, 2] - table[key, object, 1]
-        for q_idx in 2:(n_q_lr - 1)
+        if n_q_lr >= 3
+            tangent[key, object, 2] =
+                (table[key, object, 3] - table[key, object, 1]) / 2
+        end
+        for q_idx in 3:(n_q_lr - 2)
             tangent[key, object, q_idx] =
-                (table[key, object, q_idx + 1] - table[key, object, q_idx - 1]) / 2
+                (-table[key, object, q_idx + 2] + 8 * table[key, object, q_idx + 1]
+                 - 8 * table[key, object, q_idx - 1] + table[key, object, q_idx - 2]) / 12
+        end
+        if n_q_lr >= 3
+            tangent[key, object, n_q_lr - 1] =
+                (table[key, object, n_q_lr] - table[key, object, n_q_lr - 2]) / 2
         end
         tangent[key, object, n_q_lr] =
             table[key, object, n_q_lr] - table[key, object, n_q_lr - 1]
