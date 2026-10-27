@@ -70,7 +70,8 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        compute_ewald_D, subtract_self_term!,
        check_dipole_against_oscillator_strength,
-       image_translation_span, supercell_radius
+       image_translation_span, supercell_radius,
+       choose_short_range_grid, short_range_scales, short_range_coefficients
 
 @inline function combine_gpu_R_tensor(R_pos, R_neg, l_max::Int)
     """
@@ -135,6 +136,7 @@ function _compute_spherical_form_factor(
         need_R::Bool = true,
         need_f_sq_lm::Bool = true,
         need_Delta_and_Xi::Bool = false,
+        need_short_range::Bool = false,
     ) where {T<:AbstractFloat}
     """
     Compute the spherical form factor f_s(q, θ, ϕ) on a spherical grid up to some angular mode ℓ_max.
@@ -153,15 +155,18 @@ function _compute_spherical_form_factor(
     - need_R::Bool: Whether to save the R tensor (default: true).
     - need_f_sq_lm::Bool: Whether to compute the f_sq_lm tensor (default: true).
     - need_Delta_and_Xi::Bool: Whether to also construct Δ and Ξ for the crystal correction.
+    - need_short_range::Bool: Whether to retain W, the pair geometry and density matrices for an independent SR grid (default: false).
 
     # Returns:
     - R_tensor::Union{Array{Complex{T}, 3}, Nothing}: The prefactored R tensor keyed by ℓ^2 + (ℓ + m) + 1, or nothing if not requested for saving.
     - f_s::Union{Array{Complex{T}, 4}, Nothing}: The form factor on the (q, θ, ϕ) grid with shape (n_transitions, n_q, n_θ, n_ϕ), or nothing if not requested.
     - f_sq_lm::Union{Array{T, 3}, Nothing}: The real harmonic coefficients of |f_s|², with shape (n_transitions, n_q, n_keys), or nothing if not requested.
     - Delta_E_eV::Vector{T}: The transition energies in eV for the requested transitions.
-    - Delta_and_Xi: The Δ and neutral ground-charge R tensors, or nothing.
+    - Delta_and_Xi: The Δ and neutral ground-charge R tensors, or nothing. If need_short_range is
+      true, also includes short_range_data: the retained molecular quantities and Gaussian envelope.
     """
 
+    need_short_range && !need_Delta_and_Xi && error("The SR grid needs the transition, Δ and Ξ densities.")
     stage_times = Pair{String, Float64}[]
 
     # Construct MoleculeData structure.
@@ -350,6 +355,17 @@ function _compute_spherical_form_factor(
         
     end
 
+    if need_short_range
+        # Group the density-weighted |W| terms into A^F_{σn}, used to estimate the SR qmax.
+        envelope = time_stage!(stage_times, "SR Gaussian envelope") do
+            short_range_envelope(W_ij, sigma_ij, mol, density_matrices, n_transitions)
+        end
+        # Keep these quantities so extra SR samples can reuse W and the same density matrices.
+        short_range_data = (; mol, W_ij, sigma_ij, R_ij_mod, R_ij_hat, density_matrices,
+                            gaunt_path, use_gpu, threshold = threshold_T, envelope)
+        Delta_and_Xi = merge(Delta_and_Xi, (; short_range_data))
+    end
+
     # Extract the transition energies for the requested transitions.
     Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
@@ -387,5 +403,7 @@ function compute_spherical_form_factor_with_densities(args...; kwargs...)
     """
     return _compute_spherical_form_factor(args...; kwargs..., need_Delta_and_Xi = true)
 end
+
+include("ShortRangeGrid.jl")
 
 end

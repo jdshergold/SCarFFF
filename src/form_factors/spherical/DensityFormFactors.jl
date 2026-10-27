@@ -124,7 +124,7 @@ function split_density_R_tensors(
 
         Ξ_lm(q) = N_lm^(g)(q) - Z_lm(q).
 
-    The neutral q = 0 monopoles are checked before being set exactly to zero.
+    When the grid includes q = 0, its neutral monopoles are checked before being set exactly to zero.
 
     # Arguments:
     - all_R::Array{Complex{T},3}: The complete batched R tensor.
@@ -144,7 +144,6 @@ function split_density_R_tensors(
     expected = n_transitions + 1 + n_pairs
     size(all_R, 1) == expected || error(
         "The density batch has $(size(all_R, 1)) matrices, expected $(expected).")
-    abs(q_grid[1]) <= eps(T) || error("The D correction needs a q grid starting at zero.")
 
     # Split into transition, GS, and Δ R tensors.
     transition_R = all_R[1:n_transitions, :, :]
@@ -155,20 +154,23 @@ function split_density_R_tensors(
     nuclear_R = construct_nuclear_R(atom_coordinates, nuclear_charges, q_grid, l_max)
     Xi_R = ground_R .- nuclear_R
 
-    # Both objects are neutral. Validate before pinning the q = 0 values exactly, since even a tiny
-    # numerical monopole would be amplified by the 1/G² Ewald kernel.
-    charge_scale = max(T(sum(nuclear_charges)), one(T))
-    tolerance = T(100) * max(eps(T), abs(threshold)) * charge_scale
-    Delta_residual = maximum(abs, @view Delta_R[:, 1, 1])
-    Xi_residual = abs(Xi_R[1, 1, 1])
-    Delta_residual <= tolerance || error(
-        "A Δ density is not neutral at q = 0: residual $(Delta_residual), tolerance $(tolerance).")
-    Xi_residual <= tolerance || error(
-        "The ground-state charge form factor is not neutral at q = 0: residual $(Xi_residual), tolerance $(tolerance).")
+    # Check neutrality only for a batch containing the origin.
+    if abs(q_grid[1]) <= eps(T)
+        # Both objects are neutral. Validate before pinning the q = 0 values exactly, since even a tiny
+        # numerical monopole would be amplified by the 1/G² Ewald kernel.
+        charge_scale = max(T(sum(nuclear_charges)), one(T))
+        tolerance = T(100) * max(eps(T), abs(threshold)) * charge_scale
+        Delta_residual = maximum(abs, @view Delta_R[:, 1, 1])
+        Xi_residual = abs(Xi_R[1, 1, 1])
+        Delta_residual <= tolerance || error(
+            "A Δ density is not neutral at q = 0: residual $(Delta_residual), tolerance $(tolerance).")
+        Xi_residual <= tolerance || error(
+            "The ground-state charge form factor is not neutral at q = 0: residual $(Xi_residual), tolerance $(tolerance).")
 
-    # The above checks that the origin is approximately neutral, so we don't lose anything. This now hard enforces it for stability.
-    @views fill!(Delta_R[:, 1, 1], zero(Complex{T}))
-    Xi_R[1, 1, 1] = zero(Complex{T})
+        # The above checks that the origin is approximately neutral, so we don't lose anything. This now hard enforces it for stability.
+        @views fill!(Delta_R[:, 1, 1], zero(Complex{T}))
+        Xi_R[1, 1, 1] = zero(Complex{T})
+    end
 
     return transition_R, Delta_R, Xi_R
 end

@@ -23,6 +23,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   check_dipole_against_oscillator_strength,
                                   image_translation_span, supercell_radius,
                                   set_D_couplings!,
+                                  choose_short_range_grid, short_range_scales, short_range_coefficients,
                                   derive_symmetry_operations, build_stars,
                                   star_reduction_factor, choose_compatible_phi_count
 using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
@@ -399,7 +400,8 @@ function run_crystals(job)
                                 use_gpu=use_gpu,
                                 need_grid=need_grid,
                                 need_R=need_R,
-                                need_f_sq_lm=true
+                                need_f_sq_lm=true,
+                                need_short_range=need_q_bc
                             )
                     else
                         R_tensor, f_s, f_sq_lm, Delta_E_eV = compute_spherical_form_factor(
@@ -623,6 +625,7 @@ function run_crystals(job)
                         band_summary = nothing,
                         couplings = nothing,
                         cells = nothing,
+                        q_short_range = nothing,
                         ewald_parameters = nothing,
                         long_range = nothing,
                     )
@@ -633,6 +636,7 @@ function run_crystals(job)
                     ewald_parameters = nothing
                     crystal_long_range = nothing
                     cells = nothing
+                    q_sr = nothing
                     if no_couplings
                         println("Intermolecular corrections J and D are switched off, so the bands will be flat at the monomer energies.")
                     else
@@ -698,6 +702,41 @@ function run_crystals(job)
                                 rotated_Delta_bc, rotated_Xi_bc,
                                 q_grid_invA, q_bc_invA, basis.n_transitions, l_max,
                                 crystal_long_range)
+                            # Use the available grid D and total J(k) to convert the relative SR tolerance to eV.
+                            D_scale, J_scale = short_range_scales(
+                                crystal_couplings, D_blocks_short_range .+ D_long_range_timing.value,
+                                basis, lattice, crystal_long_range)
+                            sr_data = [conformer_results[label].Delta_and_Xi.short_range_data
+                                       for label in conformer_labels]
+                            # Choose one SR grid for all FF families, marking nodes already present in q_grid.
+                            q_sr, saved_indices = choose_short_range_grid(
+                                q_grid, sr_data, basis, cells, ewald_parameters, D_scale, J_scale)
+                            missing_points = count(iszero, saved_indices)
+                            println("SR radial grid: $(length(q_sr)) points through $(round(q_sr[end], digits = 2)) keV, " *
+                                    "Δq = $(round(q_sr[2] - q_sr[1], digits = 5)) keV, " *
+                                    "$(missing_points) new FF samples per conformer (estimated ε = $(epsilon_tot)).")
+                            # If the original grid suffices, keep the SR J and D already computed above.
+                            if q_sr != q_grid
+                                sr_timing = @timed begin
+                                    # Evaluate only missing q nodes, sharing S_ij between f_s, ΔN and Ξ.
+                                    coefficients = [short_range_coefficients(
+                                        sr_data[index], q_sr, saved_indices, conformer_R_tensors[index],
+                                        conformer_Delta[index], conformer_Xi[index], l_max)
+                                        for index in eachindex(conformer_labels)]
+                                    # Rotate the new molecular coefficients into the same crystal images.
+                                    sr_R, sr_Delta, sr_Xi = rotate_crystal_R_tensors(
+                                        [item[1] for item in coefficients], [item[2] for item in coefficients],
+                                        [item[3] for item in coefficients], images, basis, l_max)
+                                    compute_crystal_corrections(sr_R, sr_Delta, sr_Xi, basis, cells,
+                                        T(KEV_TO_INV_ANGSTROM) .* q_sr, l_max, coupling_gaunt_path;
+                                        parameters = ewald_parameters)
+                                end
+                                crystal_couplings, D_blocks_short_range = sr_timing.value
+                                # The refined couplings replace the earlier SR result, so subtract their self term once.
+                                subtract_self_term!(crystal_couplings, cells, crystal_long_range.J_self)
+                                push!(stage_times, "SR grid and J/D refinement" => sr_timing.time)
+                            end
+                            # Add the LR D from the original FF table to the final SR D blocks.
                             set_D_couplings!(
                                 basis, D_blocks_short_range .+ D_long_range_timing.value)
                             push!(stage_times, "Ewald long-range D" => D_long_range_timing.time)
@@ -819,6 +858,7 @@ function run_crystals(job)
                         energy_grid = crystal_energy_grid,
                         couplings = crystal_couplings,
                         cells = cells,
+                        q_short_range = q_sr,
                         ewald_parameters = ewald_parameters,
                         long_range = crystal_long_range,
                     )

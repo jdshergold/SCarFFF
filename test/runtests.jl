@@ -1414,3 +1414,83 @@ end
         end
     end
 end
+
+@testset "Independent short-range q grid" begin
+    for T in (Float32, Float64)
+        # A sufficient saved grid needs no new form factors.
+        saved_q = collect(range(zero(T), T(4); length = 21))
+        q, indices = SF.reuse_short_range_grid(saved_q, T(0.4), T(3))
+        @test q === saved_q
+        @test indices == collect(eachindex(saved_q))
+
+        # Extending a commensurate grid keeps every coincident sample.
+        saved_q = T[0, 0.2, 0.4, 0.6, 0.8]
+        q, indices = SF.reuse_short_range_grid(saved_q, T(0.4), T(1.6))
+        @test q ≈ T[0, 0.4, 0.8, 1.2, 1.6]
+        @test indices == [1, 3, 5, 0, 0]
+        @test q[end] >= T(1.6)
+        @test q[2] - q[1] <= T(0.4)
+
+        # A long grid with insufficient resolution still needs new nodes.
+        coarse_q = T[0, 1, 2, 3]
+        q, indices = SF.reuse_short_range_grid(coarse_q, T(0.4), T(2))
+        @test any(iszero, indices)
+        @test q[2] - q[1] <= T(0.4)
+        @test q[end] >= T(2)
+        for index in findall(!iszero, indices)
+            @test isapprox(q[index], coarse_q[indices[index]]; atol = 8 * eps(T))
+        end
+
+        mktempdir() do tmp_dir
+            small_case = build_small_R_case(T, tmp_dir)
+            W, sigma_ij, R_ij_mod, R_ij_hat, _, l_max, gaunt_path, _, _ = small_case.inputs
+            mol = small_case.mol
+            densities = Matrix{T}[mol.T_gs[1], mol.T_gg]
+            append!(densities, RB.build_Delta_T_matrices(mol, [1]))
+            envelope = SF.short_range_envelope(W, sigma_ij, mol, densities, 1)
+            data = (; mol, W_ij = W, sigma_ij, R_ij_mod, R_ij_hat, density_matrices = densities,
+                    gaunt_path, use_gpu = false, threshold = zero(T), envelope)
+            saved_q = T[0, 0.4, 0.8]
+            all_R = RT.construct_R_tensor(W, sigma_ij, R_ij_mod, R_ij_hat,
+                saved_q, l_max, gaunt_path, densities, mol.cartesian_term_to_orbital)
+            saved = DF.split_density_R_tensors(all_R, 1, mol.atom_coordinates,
+                mol.nuclear_charges, saved_q, l_max)
+            q, indices = SF.reuse_short_range_grid(saved_q, T(0.4), T(1.6))
+            refined = SF.short_range_coefficients(data, q, indices, saved..., l_max)
+
+            # The merged densities agree with evaluating the entire grid afresh.
+            full_R = RT.construct_R_tensor(W, sigma_ij, R_ij_mod, R_ij_hat,
+                q, l_max, gaunt_path, densities, mol.cartesian_term_to_orbital)
+            reference = DF.split_density_R_tensors(full_R, 1, mol.atom_coordinates,
+                mol.nuclear_charges, q, l_max)
+            for family in 1:3
+                @test refined[family] ≈ reference[family] rtol = 20 * eps(T) atol = 20 * eps(T)
+                @test refined[family][:, 1:3, :] == saved[family]
+            end
+            @test all(iszero, refined[2][:, 1, 1])
+            @test iszero(refined[3][1, 1, 1])
+
+            # Removing W proves that a complete cache can be used without evaluating any FFs.
+            cached_data = merge(data, (W_ij = nothing,))
+            cached = SF.short_range_coefficients(cached_data, saved_q, [1, 2, 3], saved..., l_max)
+            @test all(cached[family] == saved[family] for family in 1:3)
+
+            rotation = Quaternionic.rotor(T[1, 0, 0, 0])
+            image = SF.CrystalImage{T}(1, rotation, one(T), SVector{3, T}(0, 0, 0))
+            basis = SF.build_excitation_basis([image], [T[2]])
+            lattice = SF.build_crystal_lattice(T[4 0 0; 0 4 0; 0 0 4], T)
+            cells = CJ.enumerate_neighbour_cells(lattice, T(5))
+            parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(5), T(3), T(1e-3))
+            q_loose, _ = SF.choose_short_range_grid(saved_q, [data], basis, cells, parameters, T(0.1), T(0.1))
+            parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(5), T(3), T(1e-6))
+            q_tight, _ = SF.choose_short_range_grid(saved_q, [data], basis, cells, parameters, T(0.1), T(0.1))
+            @test q_tight[end] >= q_loose[end]
+            @test q_tight[2] - q_tight[1] <= q_loose[2] - q_loose[1]
+
+            zero_envelope = merge(envelope, (A = zeros(T, size(envelope.A)),))
+            zero_data = merge(data, (envelope = zero_envelope,))
+            q_zero, _ = SF.choose_short_range_grid(saved_q, [zero_data], basis, cells, parameters, zero(T), zero(T))
+            @test q_zero === saved_q
+        end
+    end
+end

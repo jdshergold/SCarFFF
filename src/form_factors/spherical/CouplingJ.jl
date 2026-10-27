@@ -412,6 +412,8 @@ function _compute_crystal_corrections(
         f̄^{(A_i,s)}_{ℓμ,αβ}(q)  = Σ_ν D_{μν}(S^{-1}_{αβ}) f^{(A_i,s)}_{ℓν}(q).
 
     The short-range Ewald factor is 1 - exp(-q²/4η²), with η the Ewald parameter.
+    To ensure that the SR integral converges to the require precision, its q grid can differ
+    from that of the structure function.
 
     # Arguments:
     - rotated_R::Array{Complex{T}, 3}: The image coefficients f, with dimensions (n_lambda_i, n_q, n_keys).
@@ -447,7 +449,14 @@ function _compute_crystal_corrections(
     P_pair = build_pair_frame_P(gaunt_path, T)
     n_triples = length(P_pair.triples)
 
-    radial_weights = quadrature_weights(q_grid_invA, false)
+    if parameters === nothing
+        radial_weights = quadrature_weights(q_grid_invA, false)
+    else
+        # Use Δq at interior nodes and Δq/2 at the endpoints, as assumed by the SR spacing estimate.
+        radial_weights = fill(q_grid_invA[2] - q_grid_invA[1], n_q)
+        radial_weights[1] /= 2
+        radial_weights[end] /= 2
+    end
     # Multiply by the short-range P_pair if using Ewald.
     parameters !== nothing && (radial_weights .*= short_range_kernel(q_grid_invA, parameters.eta))
     prefactor = Complex{T}(2 * ALPHA_EM / π * HBAR_C_EV_ANGSTROM)
