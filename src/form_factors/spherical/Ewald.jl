@@ -392,22 +392,40 @@ function build_coefficient_table(
     # The cubic spline is accurate to dx^4, so a use a five point derivative stencil to match.
     tangent = similar(table)
     @inbounds for object in 1:n_objects, key in 1:n_keys_lr
-        tangent[key, object, 1] = table[key, object, 2] - table[key, object, 1]
-        if n_q_lr >= 3
-            tangent[key, object, 2] =
-                (table[key, object, 3] - table[key, object, 1]) / 2
-        end
         for q_idx in 3:(n_q_lr - 2)
             tangent[key, object, q_idx] =
                 (-table[key, object, q_idx + 2] + 8 * table[key, object, q_idx + 1]
                  - 8 * table[key, object, q_idx - 1] + table[key, object, q_idx - 2]) / 12
         end
-        if n_q_lr >= 3
+        if n_q_lr >= 5
+            # The two nodes at each end have no central stencil, so use the one-sided five point
+            # ones instead of a plain difference.
+            tangent[key, object, 1] =
+                (-25 * table[key, object, 1] + 48 * table[key, object, 2]
+                 - 36 * table[key, object, 3] + 16 * table[key, object, 4]
+                 - 3 * table[key, object, 5]) / 12
+            tangent[key, object, 2] =
+                (-3 * table[key, object, 1] - 10 * table[key, object, 2]
+                 + 18 * table[key, object, 3] - 6 * table[key, object, 4]
+                 + table[key, object, 5]) / 12
+            tangent[key, object, n_q_lr - 1] =
+                (3 * table[key, object, n_q_lr] + 10 * table[key, object, n_q_lr - 1]
+                 - 18 * table[key, object, n_q_lr - 2] + 6 * table[key, object, n_q_lr - 3]
+                 - table[key, object, n_q_lr - 4]) / 12
+            tangent[key, object, n_q_lr] =
+                (25 * table[key, object, n_q_lr] - 48 * table[key, object, n_q_lr - 1]
+                 + 36 * table[key, object, n_q_lr - 2] - 16 * table[key, object, n_q_lr - 3]
+                 + 3 * table[key, object, n_q_lr - 4]) / 12
+        else
+            # Fewer than five nodes, so there is nothing to build the one-sided stencils from.
+            tangent[key, object, 1] = table[key, object, 2] - table[key, object, 1]
+            tangent[key, object, 2] =
+                (table[key, object, 3] - table[key, object, 1]) / 2
             tangent[key, object, n_q_lr - 1] =
                 (table[key, object, n_q_lr] - table[key, object, n_q_lr - 2]) / 2
+            tangent[key, object, n_q_lr] =
+                table[key, object, n_q_lr] - table[key, object, n_q_lr - 1]
         end
-        tangent[key, object, n_q_lr] =
-            table[key, object, n_q_lr] - table[key, object, n_q_lr - 1]
     end
 
     return table, tangent, q_step, l_max_lr
