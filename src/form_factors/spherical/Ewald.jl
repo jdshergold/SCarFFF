@@ -11,7 +11,8 @@ using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGS
 using ..DensityFormFactors: Delta_row
 using ..ReadBasisSet: build_transition_pairs
 
-export EwaldParameters, choose_ewald_parameters, short_range_kernel, supercell_radius,
+export EwaldParameters, EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
+       choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
        compute_ewald_D, J_self_matrix, check_dipole_against_oscillator_strength
 
@@ -25,21 +26,55 @@ const COEFFICIENT_THRESHOLD = 1.0e-4
 const Q_ZERO_TOLERANCE = 1.0e-10
 
 
+struct EwaldTruncation
+    """
+    Stores the measured constants that determine the truncation error of the Ewald splits.
+
+        δ_R ≃ A_R exp[-η²(R_max - R_0)²],      R_0 = k_R (V_cell/Z_mol)^{1/3},
+        δ_G ≃ A_G exp[-G_max²/4η_eff²],        1/η_eff² = 1/η² + 1/σ_0².
+
+    R_0 accounts for the fact that elements of charge can be closer than the molecular centres,
+    whilst σ_0 accounts for the natural decay of the form factor with q.
+
+    # Fields:
+    - A_R::Float64: The real-space prefactor.
+    - A_G::Float64: The reciprocal-space prefactor.
+    - sigma_0::Float64: The form factor's own reciprocal decay width σ_0, in Å^{-1}, or infinite for
+      a density whose transform does not decay.
+    - k_R::Float64: The real-space offset R_0 in units of the volume per molecule, (V_cell/Z_mol)^{1/3}.
+    """
+    A_R::Float64
+    A_G::Float64
+    sigma_0::Float64
+    k_R::Float64
+end
+
+# Fitted parameters for the truncation errors.
+const D_TRUNCATION = EwaldTruncation(2.0, 15.0, Inf, 1.5)
+const J_TRUNCATION = EwaldTruncation(0.01, 0.4, 2.5, 1.5)
+
+# How many passes the work minimisation is allowed before giving up.
+const WORK_PASSES = 50
+
+# The biggest truncation error that can be requested. Anything below this is pinned to this value.
+const MAX_EPSILON_TOT = 0.01
+
+# The tightest truncation error the constants above were measured against, so warn if the user asks for smaller.
+const TESTED_EPSILON_TOT = 1.0e-6
+
 struct EwaldParameters{T<:AbstractFloat}
     """
     The Ewald splitting parameter and the two cutoffs it implies.
 
     The cutoffs are pinned to a common estimated error ε_tot/√2 on both ends, so that neither dominates:
 
-        ε_R = ε_G = ε_tot/√2 ≃ exp(-η² R_max²) ≃ exp(-G_max²/4η²).
+        δ_R = δ_G = ε_tot/√2.
 
-    G_max and R_max are then chosen such that the amount of work done is minimised. To be revisited with
-    cost measuring of both sums, and to make sure a requested ε is what we actually get.
+    G_max and R_max are then chosen such that the amount of work done is minimised.
 
     # Fields:
     - eta::T: The splitting parameter η, in Å^{-1}.
-    - R_max::T: The real-space cutoff for the short-range sum, in Å. Widened to the 3x3x3 supercell
-      radius when ε alone would ask for less, which only improves the truncation.
+    - R_max::T: The real-space cutoff for the short-range sum, in Å.
     - G_max::T: The reciprocal-space cutoff for the long-range sum, in Å^{-1}. The sum runs over
       reciprocal lattice vectors G, but the term dropped at the cutoff is the one at Q = k + G, so
       this bounds |Q| rather than |G|. See add_long_range!.
@@ -53,26 +88,36 @@ end
 
 function choose_ewald_parameters(
         lattice::CrystalLatticeData{T},
-        epsilon_tot::Real;
+        Z_mol::Integer,
+        epsilon_tot::Real,
+        truncation::EwaldTruncation;
         eta::Real = 0,
         cost_ratio::Real = 1,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
-    Choose η and the two cutoffs for a requested total error, ε_tot.
+    Choose η and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
 
-    The two cutoffs are related by G_max R_max = -2 ln(ε_tot/√2), and the total work
+    Pinning both truncation errors to ε_tot/√2 leaves one free parameter, which is fixed by
+    minimising the total work
 
-        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π²,
+        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π².
 
-    is minimised at
+    Taking G_max as the free one, the error on the reciprocal sum fixes η and the error on the real
+    space sum then fixes R_max,
 
-        R_max ≃ √(-2 ln(ε_tot/√2)) (V_cell² c_G / 8π³ c_R)^{1/6},
+        1/η² = 4 L_G/G_max² - 1/σ_0²,    R_max = R_0 + √L_R / η,    L_{R/G} = ln(√2 A_{R/G}/ε_tot),
 
-    and η then satisfies η² = G_max / 2R_max. We currently assume a cost ratio of 1.
+    and dW/dG_max = 0 leaves
+
+        G_max⁵ = (32π³ L_R L_G / V_cell²) R_max²/(R_max - R_0) (3c_R + R_max c_R')/(3c_G + G_max c_G'),
+
+    with c_R' = dc_R/dR_max. Constant costs make the last factor c_R/c_G, which is what we use.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice, for the cell volume and reciprocal spacings.
+    - Z_mol::Integer: The number of molecules in the unit cell, which sets the volume per molecule.
     - epsilon_tot::Real: The requested truncation error, in (0, 1).
+    - truncation::EwaldTruncation: The convergence constants of the coupling being split.
     - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
     - cost_ratio::Real: c_G / c_R, the cost of one reciprocal lattice vector relative to one real one.
 
@@ -80,38 +125,86 @@ function choose_ewald_parameters(
     - EwaldParameters{T}: The splitting parameter and both cutoffs.
     """
 
-    # Check that both an error ∈ [0,1] and a cost ratio > 0 are given.
+    # Check that an error ∈ [0,1], a cost ratio > 0 and at least one molecule are given.
     zero(epsilon_tot) < epsilon_tot < one(epsilon_tot) ||
         error("The Ewald truncation error must lie in (0, 1), got $(epsilon_tot).")
     cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(cost_ratio).")
+    Z_mol >= 1 || error("The unit cell must hold at least one molecule, got $(Z_mol).")
+    min(truncation.A_R, truncation.A_G) > 0 || error(
+        "The Ewald truncation prefactors must be positive, got A_R = $(truncation.A_R), " *
+        "A_G = $(truncation.A_G).")
 
-    # Extra factor of √2 since total error is √(ε_Q^2 + ε_R^2) = √2 ε.
-    log_epsilon = -log(T(epsilon_tot) / sqrt(T(2)))
+    # Asking for 50% was never meant literally, so tighten such a request rather than refuse it.
+    epsilon = min(T(epsilon_tot), T(MAX_EPSILON_TOT))
+    epsilon < T(epsilon_tot) && @warn(
+        "The requested Ewald truncation error is too big, so it " *
+        "has been tightened.", requested = epsilon_tot, used = epsilon)
+    # The laws are fits, so a request tighter than they were measured over is an extrapolation.
+    # Said once a session, since it is about the constants rather than about any one crystal.
+    epsilon < T(TESTED_EPSILON_TOT) && @warn(
+        "The requested Ewald truncation error is tighter than the truncation laws were fitted " *
+        "to, so the true truncation error may differ significantly from what is being requested.",
+        requested = epsilon, tested_down_to = TESTED_EPSILON_TOT, maxlog = 1)
+
+    # Extra factor of √2 since total error is √(δ_G^2 + δ_R^2) = √2 δ.
+    L_R = log(sqrt(T(2)) * T(truncation.A_R) / epsilon)
+    L_G = log(sqrt(T(2)) * T(truncation.A_G) / epsilon)
+    # Only reachable by changing the table above, since MAX_EPSILON_TOT sits inside every law there.
+    min(L_R, L_G) > 0 || error(
+        "A_R = $(truncation.A_R) and A_G = $(truncation.A_G) cannot express an error of " *
+        "$(epsilon), so no cutoff is implied. Lower MAX_EPSILON_TOT below √2 times the smaller.")
+
+    # The offset, R_0, and the form factor decay width, 1/σ_0^2.
+    R_0 = T(truncation.k_R) * (lattice.V_cell / T(Z_mol))^(one(T) / 3)
+    inverse_sigma_squared = inv(T(truncation.sigma_0)^2)
+    inverse_cost = inv(T(cost_ratio))
+
+    # Find the η and R_max that give the requested error.
+    split_at(G) = begin
+        inverse_eta_squared = 4 * L_G / G^2 - inverse_sigma_squared
+        inverse_eta_squared > 0 || error(
+            "The reciprocal cutoff $(G) Å^{-1} is wider than the form factor's own decay allows " *
+            "(σ_0 = $(truncation.sigma_0) Å^{-1}), so no η delivers the requested error.")
+        eta_value = inv(sqrt(inverse_eta_squared))
+        return eta_value, R_0 + sqrt(L_R) / eta_value
+    end
 
     if eta > 0
         eta_value = T(eta)
-    else
-        # The work-minimising real-space cutoff.
-        optimal_R = sqrt(2 * log_epsilon) * (lattice.V_cell^2 * T(cost_ratio) / (8 * T(π)^3))^(one(T) / 6)
-        eta_value = sqrt(log_epsilon) / optimal_R
+        # The same two errors, but with η taken as given rather than derived.
+        eta_eff = inv(sqrt(inv(eta_value^2) + inverse_sigma_squared))
+        return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value,
+                                  2 * eta_eff * sqrt(L_G), epsilon)
     end
 
-    # Get the reciprocal-space cutoff using η.
-    R_max = sqrt(log_epsilon) / eta_value
-    G_max = 2 * eta_value * sqrt(log_epsilon)
+    # Start with a simple estimate for G_max, based on R_0 = 0, then iterate to find the true solution.
+    G_max = 2 * sqrt(T(π)) * (inverse_cost / lattice.V_cell^2)^(one(T) / 6) * (L_R * L_G)^(one(T) / 4)
+    work_scale = 32 * T(π)^3 * inverse_cost * L_R * L_G / lattice.V_cell^2
+    converged = false
+    for _ in 1:WORK_PASSES
+        previous = G_max
+        _, R_max = split_at(G_max)
+        G_max = (work_scale * R_max^2 / (R_max - R_0))^(one(T) / 5)
+        if abs(G_max - previous) <= sqrt(eps(T)) * G_max
+            converged = true
+            break
+        end
+    end
+    converged || error(
+        "The Ewald work minimisation did not settle on a reciprocal cutoff in $(WORK_PASSES) passes.")
 
-    # Now ensure that the real space cutoff includes at least the 3x3x3 supercell.
-    R_max = max(R_max, supercell_radius(lattice))
+    # Take the η and R_max corresponding to G_max.
+    eta_value, R_max = split_at(G_max)
 
-    return EwaldParameters{T}(eta_value, R_max, G_max, T(epsilon_tot))
+    return EwaldParameters{T}(eta_value, R_max, G_max, epsilon)
 end
 
 function supercell_radius(lattice::CrystalLatticeData{T})::T where {T<:AbstractFloat}
     """
     The distance to the furthest corner of the 3x3x3 supercell, which is the largest |ΔR| among the
-    lattice vectors with all three indices in {-1, 0, 1}. This does not necessarily include all molecules in the 
-    3x3x3 supercell in the short-range sum, and may include some outside, but instead pins the cutoff
-    to a reasonable minimum.
+    lattice vectors with all three indices in {-1, 0, 1}. This does not necessarily include all molecules in the
+    3x3x3 supercell in the short-range sum, and may include some outside. Reported alongside R_max,
+    as a familiar length to compare the chosen cutoff against.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice.
@@ -723,6 +816,7 @@ function compute_ewald_D(
         n_transitions::Int,
         l_max::Int,
         data::EwaldLongRangeData{T},
+        parameters::EwaldParameters{T},
     )::Array{T, 3} where {T<:AbstractFloat}
     """
     Compute the long-range part of D
@@ -741,7 +835,8 @@ function compute_ewald_D(
     - q_bc_invA::T: The |q| at which the boundary term's dipoles are read off, in inverse Angstroms.
     - n_transitions::Int: The number of transitions per image, which fixes the block size.
     - l_max::Int: The largest angular mode.
-    - data::EwaldLongRangeData{T}: The Ewald parameters, reciprocal vectors and image positions.
+    - data::EwaldLongRangeData{T}: The cell, the image positions and the boundary permittivity.
+    - parameters::EwaldParameters{T}: D's own Ewald split.
 
     # Returns:
     - Array{T,3}: The real long-range D, with dimensions (n_images, n_transitions, n_transitions), in eV.
@@ -772,9 +867,9 @@ function compute_ewald_D(
 
     # Build the compact tables for both densities. They share a q grid, so their spacings must agree.
     Delta_table, Delta_tangent, q_step, Delta_l_max =
-        build_coefficient_table(rotated_Delta, q_grid_invA, l_max, data.G_max)
+        build_coefficient_table(rotated_Delta, q_grid_invA, l_max, parameters.G_max)
     Xi_table, Xi_tangent, Xi_q_step, Xi_l_max =
-        build_coefficient_table(rotated_Xi, q_grid_invA, l_max, data.G_max)
+        build_coefficient_table(rotated_Xi, q_grid_invA, l_max, parameters.G_max)
     abs(q_step - Xi_q_step) <= eps(T) * max(q_step, one(T)) || error(
         "The Δ and Ξ interpolation grids do not match.")
 
@@ -784,11 +879,8 @@ function compute_ewald_D(
     Ylm_cache = SphericalHarmonics.cache(l_ceiling, SphericalHarmonics.FullRange)
     D_blocks = zeros(Complex{T}, n_images, n_transitions, n_transitions)
 
-    @inbounds for G in data.G_vectors
-        # Here k = 0, so Q = G. Skip anything beyond the cutoff, and G = 0, which the boundary
-        # term below replaces.
-        G_norm = norm(G)
-        G_norm <= data.G_max || continue
+    @inbounds for G in enumerate_reciprocal_vectors(data.lattice, parameters.G_max)
+        # Here k = 0, so Q = G. Skip G = 0, which is handled by the boundary term.
         G_norm < T(Q_ZERO_TOLERANCE) && continue
 
         # Compute the spherical harmonics for this G.
@@ -833,7 +925,7 @@ function compute_ewald_D(
 
         # Contract Δ with the shared Ξ sum, phased onto each molecule's position in the cell. Both
         # excitations of a block sit on the same molecule, so there is one phase for the whole block.
-        weight = data.prefactor * exp(-(G_norm / (2 * data.eta))^2) / (G_norm * G_norm)
+        weight = data.prefactor * exp(-(G_norm / (2 * parameters.eta))^2) / (G_norm * G_norm)
         for image in 1:n_images
             phase = cis(dot(G, data.tau[image]))
             for pair in 1:n_pairs
@@ -886,7 +978,7 @@ function compute_ewald_D(
                (q_grid_invA[q_idx + 1] - q_grid_invA[q_idx - 1]) / 2
         # Endpoint and interior weights are different from interior.
         radial_weights[q_idx] = (q_idx == 1 || q_idx == n_q ? step / 2 : step) *
-                                exp(-(q_grid_invA[q_idx] / (2 * data.eta))^2)
+                                exp(-(q_grid_invA[q_idx] / (2 * parameters.eta))^2)
     end
     # At d = 0 orthonormality collapses the angular integral to an inner product over keys.
     self_prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))

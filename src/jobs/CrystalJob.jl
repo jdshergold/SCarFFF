@@ -19,6 +19,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
+                                  D_TRUNCATION, J_TRUNCATION,
                                   compute_ewald_D, subtract_self_term!,
                                   check_dipole_against_oscillator_strength,
                                   image_translation_span, supercell_radius,
@@ -633,7 +634,8 @@ function run_crystals(job)
 
                     # Build the intermolecular couplings, unless they have been switched off.
                     crystal_couplings = nothing
-                    ewald_parameters = nothing
+                    J_parameters = nothing
+                    D_parameters = nothing
                     crystal_long_range = nothing
                     cells = nothing
                     q_sr = nothing
@@ -641,10 +643,16 @@ function run_crystals(job)
                         println("Intermolecular corrections J and D are switched off, so the bands will be flat at the monomer energies.")
                     else
                         if coupling_method == "ewald"
-                            ewald_parameters = choose_ewald_parameters(
-                                lattice, epsilon_tot; eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                            # J and D converge at different rates, so each gets its own cutoffs to save wasted computation.
+                            J_parameters = choose_ewald_parameters(
+                                lattice, length(basis.images), epsilon_tot, J_TRUNCATION;
+                                eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                            D_parameters = choose_ewald_parameters(
+                                lattice, length(basis.images), epsilon_tot, D_TRUNCATION;
+                                eta = ewald_eta, cost_ratio = ewald_cost_ratio)
                             # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
-                            real_cutoff = ewald_parameters.R_max + image_translation_span(basis)
+                            real_cutoff = max(J_parameters.R_max, D_parameters.R_max) +
+                                          image_translation_span(basis)
                         else
                             real_cutoff = T(coupling_cutoff)
                         end
@@ -658,7 +666,7 @@ function run_crystals(job)
                             precompute_gaunt_coefficients(l_max, 2 * l_max, l_max, coupling_gaunt_path, T)
                         end
 
-                        if ewald_parameters === nothing
+                        if J_parameters === nothing
                             println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.Delta_R)) cells).")
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
@@ -672,27 +680,29 @@ function run_crystals(job)
                             long_range_timing = @timed build_ewald_long_range(
                                 rotated_R, rotated_R_bc, tau_of_lambda_i, basis.image_of, lattice,
                                 q_grid_invA, q_bc_invA, l_max,
-                                ewald_parameters; epsilon_b = epsilon_b)
+                                J_parameters; epsilon_b = epsilon_b)
                             crystal_long_range = long_range_timing.value
                             push!(stage_times, "Ewald long-range setup" => long_range_timing.time)
 
-                            # Print a summary of the Ewald parameters.
-                            expected_G = lattice.V_cell * ewald_parameters.G_max^3 / (6 * π^2)
-                            supercell = supercell_radius(lattice)
-                            widened = ewald_parameters.R_max <= supercell * (1 + 1e-12) ?
-                                " (widened to the 3x3x3 supercell)" : ""
-                            println("Ewald split at ε_tot = $(ewald_parameters.epsilon_tot): " *
-                                    "η = $(round(ewald_parameters.eta, digits = 4)) Å^-1, " *
-                                    "R_max = $(round(ewald_parameters.R_max, digits = 2)) Å$(widened) " *
-                                    "($(length(cells.Delta_R)) cells searched, padded by the cell span), " *
-                                    "G_max = $(round(ewald_parameters.G_max, digits = 4)) Å^-1 " *
-                                    "(N_G ≈ $(round(Int, expected_G)), $(length(crystal_long_range.G_vectors)) candidates), " *
-                                    "ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
+                            # Print a summary of both Ewald splits, against the 3x3x3 supercell as a
+                            # familiar length to read the real-space cutoffs against.
+                            println("Ewald split at ε_tot = $(epsilon_tot), one per coupling " *
+                                    "($(length(cells.Delta_R)) cells searched, padded by the cell span, " *
+                                    "3x3x3 supercell radius $(round(supercell_radius(lattice), digits = 2)) Å):")
+                            for (name, split) in (("J", J_parameters), ("D", D_parameters))
+                                expected_G = lattice.V_cell * split.G_max^3 / (6 * π^2)
+                                println("  $(name): η = $(round(split.eta, digits = 4)) Å^-1, " *
+                                        "R_max = $(round(split.R_max, digits = 2)) Å, " *
+                                        "G_max = $(round(split.G_max, digits = 4)) Å^-1 " *
+                                        "(N_G ≈ $(round(Int, expected_G))).")
+                            end
+                            println("  J long-range table: $(length(crystal_long_range.G_vectors)) " *
+                                    "candidate G, ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
 
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path;
-                                parameters = ewald_parameters)
+                                J_parameters = J_parameters, D_parameters = D_parameters)
                             crystal_couplings, D_blocks_short_range = correction_timing.value
                             push!(stage_times, "short-range J and D(ΔR)" => correction_timing.time)
                             subtract_self_term!(crystal_couplings, cells, crystal_long_range.J_self)
@@ -701,7 +711,7 @@ function run_crystals(job)
                                 rotated_Delta, rotated_Xi,
                                 rotated_Delta_bc, rotated_Xi_bc,
                                 q_grid_invA, q_bc_invA, basis.n_transitions, l_max,
-                                crystal_long_range)
+                                crystal_long_range, D_parameters)
                             # Use the available grid D and total J(k) to convert the relative SR tolerance to eV.
                             D_scale, J_scale = short_range_scales(
                                 crystal_couplings, D_blocks_short_range .+ D_long_range_timing.value,
@@ -710,7 +720,8 @@ function run_crystals(job)
                                        for label in conformer_labels]
                             # Choose one SR grid for all FF families, marking nodes already present in q_grid.
                             q_sr, saved_indices = choose_short_range_grid(
-                                q_grid, sr_data, basis, cells, ewald_parameters, D_scale, J_scale)
+                                q_grid, sr_data, basis, cells, J_parameters, D_parameters,
+                                D_scale, J_scale)
                             missing_points = count(iszero, saved_indices)
                             println("SR radial grid: $(length(q_sr)) points through $(round(q_sr[end], digits = 2)) keV, " *
                                     "Δq = $(round(q_sr[2] - q_sr[1], digits = 5)) keV, " *
@@ -729,7 +740,7 @@ function run_crystals(job)
                                         [item[3] for item in coefficients], images, basis, l_max)
                                     compute_crystal_corrections(sr_R, sr_Delta, sr_Xi, basis, cells,
                                         T(KEV_TO_INV_ANGSTROM) .* q_sr, l_max, coupling_gaunt_path;
-                                        parameters = ewald_parameters)
+                                        J_parameters = J_parameters, D_parameters = D_parameters)
                                 end
                                 crystal_couplings, D_blocks_short_range = sr_timing.value
                                 # The refined couplings replace the earlier SR result, so subtract their self term once.
@@ -859,7 +870,8 @@ function run_crystals(job)
                         couplings = crystal_couplings,
                         cells = cells,
                         q_short_range = q_sr,
-                        ewald_parameters = ewald_parameters,
+                        ewald_parameters = J_parameters === nothing ? nothing :
+                            (J = J_parameters, D = D_parameters),
                         long_range = crystal_long_range,
                     )
                 end
@@ -949,16 +961,23 @@ function run_crystals(job)
 
                             if crystal_results.long_range !== nothing
                                 long_range = crystal_results.long_range
+                                splits = crystal_results.ewald_parameters
                                 # The reciprocal-space half, J_bar^LR(k). It depends on k, so what is saved
                                 # is the ingredients that rebuild it rather than a table over ΔR.
+                                # Everything here belongs to J's split, which is the one the table
+                                # was built at. D's own cutoffs are saved below it.
                                 long_range_group = create_group(couplings_group, "long_range")
-                                write(long_range_group, "eta", crystal_results.ewald_parameters.eta) # Å^-1.
-                                # The Ewald truncation error, which is not the medium permittivity below.
-                                write(long_range_group, "epsilon_tot", crystal_results.ewald_parameters.epsilon_tot)
+                                write(long_range_group, "eta_J", splits.J.eta) # Å^-1.
+                                write(long_range_group, "R_max_J", splits.J.R_max) # Å.
+                                write(long_range_group, "G_max_J", splits.J.G_max) # Å^-1.
+                                write(long_range_group, "eta_D", splits.D.eta) # Å^-1.
+                                write(long_range_group, "R_max_D", splits.D.R_max) # Å.
+                                write(long_range_group, "G_max_D", splits.D.G_max) # Å^-1.
+                                # The requested error both splits were pinned to. Not the medium
+                                # permittivity below.
+                                write(long_range_group, "epsilon_tot", splits.J.epsilon_tot)
                                 # The permittivity of the medium around the sample, scaling the Q = 0 term.
                                 write(long_range_group, "epsilon_b", long_range.epsilon_b)
-                                write(long_range_group, "R_max", crystal_results.ewald_parameters.R_max) # Å.
-                                write(long_range_group, "G_max", crystal_results.ewald_parameters.G_max) # Å^-1.
                                 write(long_range_group, "G_vectors", reduce(hcat, long_range.G_vectors)) # Å^-1.
                                 write(long_range_group, "f_table", long_range.f_table)
                                 write(long_range_group, "q_step", long_range.q_step) # Å^-1.

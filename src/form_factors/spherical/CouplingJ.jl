@@ -220,26 +220,54 @@ function build_pair_frame_P(gaunt_path::String, ::Type{T})::PairFrameP{T} where 
     return PairFrameP{T}(triples, offsets, member_L, member_weight)
 end
 
-function fill_weighted_pair_P!(
-        weighted_P_pair::Matrix{Complex{T}},
-        bessel_table::Matrix{T},
-        P_pair::PairFrameP{T},
-        radial_weights::Vector{T},
-    ) where {T<:AbstractFloat}
+function radial_quadrature(
+        q_grid_invA::Vector{T},
+        parameters::Union{Nothing, EwaldParameters{T}},
+    )::Vector{T} where {T<:AbstractFloat}
     """
-    Multiply the Gaunt part of P̄ by its Bessel functions and radial weights.
+    The weights of one coupling's q integral, including its short-range Ewald kernel.
 
     # Arguments:
-    - weighted_P_pair::Matrix{Complex{T}}: Preallocated radially weighted P̄(q) table, in Å^-1, to overwrite.
-    - bessel_table::Matrix{T}: j_L(qd), indexed by L and q.
-    - P_pair::PairFrameP{T}: The grouped Gaunt coefficients for each (l, l_prime, mu).
-    - radial_weights::Vector{T}: Quadrature weights in Å^-1, including 1 - exp(-q²/4η²) under Ewald.
+    - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
+    - parameters::Union{Nothing, EwaldParameters{T}}: The Ewald split, or nothing for the bare
+      Coulomb sum, which uses Simpson's rule instead.
 
     # Returns:
-    - Nothing. weighted_P_pair is overwritten.
+    - Vector{T}: The weights, in inverse Å.
     """
 
-    n_q = size(weighted_P_pair, 1)
+    parameters === nothing && return quadrature_weights(q_grid_invA, false)
+
+    # Use Δq at interior nodes and Δq/2 at the endpoints, as assumed by the SR spacing estimate.
+    weights = fill(q_grid_invA[2] - q_grid_invA[1], length(q_grid_invA))
+    weights[1] /= 2
+    weights[end] /= 2
+
+    return weights .* short_range_kernel(q_grid_invA, parameters.eta)
+end
+
+function fill_pair_P!(
+        P_table::Matrix{Complex{T}},
+        bessel_table::Matrix{T},
+        P_pair::PairFrameP{T},
+    ) where {T<:AbstractFloat}
+    """
+    Multiply the Gaunt part of P̄ by its Bessel functions.
+
+    Nothing here depends on η, so one table serves both couplings however their splits differ. Each
+    coupling's quadrature weights and short-range kernel are carried by the form factor it
+    contracts this against instead.
+
+    # Arguments:
+    - P_table::Matrix{Complex{T}}: Preallocated P̄(q) table to overwrite, dimensionless.
+    - bessel_table::Matrix{T}: j_L(qd), indexed by L and q.
+    - P_pair::PairFrameP{T}: The grouped Gaunt coefficients for each (l, l_prime, mu).
+
+    # Returns:
+    - Nothing. P_table is overwritten.
+    """
+
+    n_q = size(P_table, 1)
     @inbounds for triple in eachindex(P_pair.triples)
         # The triple is (l, l_prime, mu). Get the Gaunt coefficient indices for this set.
         member_start = P_pair.offsets[triple]
@@ -250,7 +278,7 @@ function fill_weighted_pair_P!(
                 total += P_pair.member_weight[member] *
                          bessel_table[P_pair.member_L[member] + 1, q_idx]
             end
-            weighted_P_pair[q_idx, triple] = radial_weights[q_idx] * total
+            P_table[q_idx, triple] = total
         end
     end
 
@@ -263,7 +291,7 @@ function add_D_potential!(
         Xi_source::Matrix{Complex{T}},
         blocks::Vector{Matrix{Complex{T}}},
         P_pair::PairFrameP{T},
-        weighted_P_pair::Matrix{Complex{T}},
+        P_table::Matrix{Complex{T}},
         Xi_pair::Matrix{Complex{T}},
         Xi_potential::Matrix{Complex{T}},
         l_max::Int,
@@ -289,10 +317,11 @@ function add_D_potential!(
     # Arguments:
     - potential::Array{Complex{T},3}: Task-local W, with dimensions (n_q, n_keys, n_images).
     - image_idx::Int: The molecule the potential is evaluated at.
-    - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the neighbouring image.
+    - Xi_source::Matrix{Complex{T}}: Conjugated Ξ coefficients of the neighbouring image, already
+      carrying D's quadrature weights and short-range kernel.
     - blocks::Vector{Matrix{Complex{T}}}: Wigner matrices for this pair frame.
     - P_pair::PairFrameP{T}: The grouped Gaunt part of P̄.
-    - weighted_P_pair::Matrix{Complex{T}}: P̄(q) for this separation.
+    - P_table::Matrix{Complex{T}}: P̄(q) for this separation.
     - Xi_pair::Matrix{Complex{T}}: Buffer for pair-frame Ξ*.
     - Xi_potential::Matrix{Complex{T}}: Buffer for P̄ Ξ* in the pair frame.
     - l_max::Int: The largest angular mode.
@@ -319,7 +348,7 @@ function add_D_potential!(
         key_second = l_prime * l_prime + (l_prime + mu) + 1
         for q_idx in 1:n_q
             Xi_potential[q_idx, key_first] +=
-                weighted_P_pair[q_idx, triple] * Xi_pair[q_idx, key_second]
+                P_table[q_idx, triple] * Xi_pair[q_idx, key_second]
         end
     end
 
@@ -395,7 +424,8 @@ function _compute_crystal_corrections(
         q_grid_invA::Vector{T},
         l_max::Int,
         gaunt_path::String;
-        parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+        J_parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+        D_parameters::Union{Nothing, EwaldParameters{T}} = nothing,
         rotated_Delta::Union{Nothing, Array{Complex{T}, 3}} = nothing,
         rotated_Xi::Union{Nothing, Array{Complex{T}, 3}} = nothing,
     ) where {T<:AbstractFloat}
@@ -411,7 +441,9 @@ function _compute_crystal_corrections(
 
         f̄^{(A_i,s)}_{ℓμ,αβ}(q)  = Σ_ν D_{μν}(S^{-1}_{αβ}) f^{(A_i,s)}_{ℓν}(q).
 
-    The short-range Ewald factor is 1 - exp(-q²/4η²), with η the Ewald parameter.
+    The short-range Ewald factor is 1 - exp(-q²/4η²), with η the Ewald parameter. J and D each carry
+    their own split, to not waste work on one of the terms. Usually D is cheaper.
+
     To ensure that the SR integral converges to the require precision, its q grid can differ
     from that of the structure function.
 
@@ -422,8 +454,9 @@ function _compute_crystal_corrections(
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
     - gaunt_path::String: Path to the coupling-shape Gaunt coefficients.
-    - parameters::Union{Nothing, EwaldParameters{T}}: The Ewald split to use, or nothing for the bare
+    - J_parameters::Union{Nothing, EwaldParameters{T}}: J's Ewald split, or nothing for the bare
       Coulomb P_pair and hence the full, only conditionally convergent, lattice sum.
+    - D_parameters::Union{Nothing, EwaldParameters{T}}: D's Ewald split, or nothing for the bare sum.
     - rotated_Delta: The rotated Δ coefficients, or nothing for a J-only calculation.
     - rotated_Xi: The rotated neutral ground-charge coefficients, or nothing for a J-only calculation.
 
@@ -440,6 +473,10 @@ function _compute_crystal_corrections(
     have_Delta_and_Xi = rotated_Delta !== nothing || rotated_Xi !== nothing
     (rotated_Delta === nothing) == (rotated_Xi === nothing) || error(
         "Both the Δ and Ξ tensors are required to compute D.")
+    # The two couplings share this pass, so an Ewald split for one without the other would leave
+    # the second as a truncated bare Coulomb sum, which does not converge.
+    !have_Delta_and_Xi || (J_parameters === nothing) == (D_parameters === nothing) || error(
+        "J and D must either both carry an Ewald split, or neither.")
 
     # Check that the rotated coefficients have the right dimensions.
     (l_max + 1)^2 == size(rotated_R, 3) ||
@@ -449,16 +486,10 @@ function _compute_crystal_corrections(
     P_pair = build_pair_frame_P(gaunt_path, T)
     n_triples = length(P_pair.triples)
 
-    if parameters === nothing
-        radial_weights = quadrature_weights(q_grid_invA, false)
-    else
-        # Use Δq at interior nodes and Δq/2 at the endpoints, as assumed by the SR spacing estimate.
-        radial_weights = fill(q_grid_invA[2] - q_grid_invA[1], n_q)
-        radial_weights[1] /= 2
-        radial_weights[end] /= 2
-    end
-    # Multiply by the short-range P_pair if using Ewald.
-    parameters !== nothing && (radial_weights .*= short_range_kernel(q_grid_invA, parameters.eta))
+    # The q integral of each coupling, weights and short-range kernel together. Each is folded into
+    # the form factor on the right of its own integral (either Ξ or f) further down, so that P̄ stays shared.
+    radial_weights_J = radial_quadrature(q_grid_invA, J_parameters)
+    radial_weights_D = radial_quadrature(q_grid_invA, D_parameters)
     prefactor = Complex{T}(2 * ALPHA_EM / π * HBAR_C_EV_ANGSTROM)
 
     n_images = length(basis.images)
@@ -483,7 +514,7 @@ function _compute_crystal_corrections(
 
     # Store the rotated f_sq_lm (R tensor) coefficients for all molecules in the unit cell.
     # The first are the unconjugated, second are conjugated. We store them with different indices to speed up
-    # matmuls later, by saving on transposing and conjugating.
+    # matmuls later, by saving on transposing and conjugating. The second copy also carries J's radial weights.
     first_coefficients = [Array{Complex{T}, 3}(undef, length(lambda_i_of_image[i]), n_q, n_keys)
                           for i in 1:n_images]
     second_coefficients = [Array{Complex{T}, 3}(undef, n_q, n_keys, length(lambda_i_of_image[i]))
@@ -492,20 +523,28 @@ function _compute_crystal_corrections(
         @inbounds for key in 1:n_keys, q_idx in 1:n_q
             value = rotated_R[lambda_i, q_idx, key]
             first_coefficients[image_idx][slot, q_idx, key] = value
-            second_coefficients[image_idx][q_idx, key, slot] = conj(value)
+            second_coefficients[image_idx][q_idx, key, slot] = radial_weights_J[q_idx] * conj(value)
         end
     end
 
-    # Ξ is conjugated once here, since it always appears that way. Δ needs no copy at all: it stays
+    # Ξ is conjugated once here, since it always appears that way, and carries D's radial weights
+    # for the same reason the second f copy carries J's. Δ needs no copy at all: it stays
     # in the crystal frame, where the potential is rotated back to meet it.
     Xi_coefficients = have_Delta_and_Xi ?
         [Matrix{Complex{T}}(undef, n_q, n_keys) for _ in 1:n_images] : nothing
     if have_Delta_and_Xi
         for image_idx in 1:n_images
             @inbounds for key in 1:n_keys, q_idx in 1:n_q
-                Xi_coefficients[image_idx][q_idx, key] = conj(rotated_Xi[image_idx, q_idx, key])
+                Xi_coefficients[image_idx][q_idx, key] =
+                    radial_weights_D[q_idx] * conj(rotated_Xi[image_idx, q_idx, key])
             end
         end
+    end
+
+    R_max_J = J_parameters === nothing ? T(Inf) : J_parameters.R_max
+    R_max_D = zero(T)
+    if have_Delta_and_Xi
+        R_max_D = D_parameters === nothing ? T(Inf) : D_parameters.R_max
     end
 
     # One job per (image pair, cell). Molecules do not interact with themselves, and under
@@ -522,8 +561,8 @@ function _compute_crystal_corrections(
             "Molecules $(image_i) and $(image_j) coincide at ΔR = $(cells.indices[cell_idx]), " *
             "which should be impossible. Check the translation vectors in the crystal metadata."
         )
-        # Check that the molecule pair is within the cutoff.
-        parameters !== nothing && distance > parameters.R_max && continue
+        # Check that the molecule pair is within the cutoff of at least one coupling.
+        distance > max(R_max_J, R_max_D) && continue
         push!(jobs, (image_i, image_j, cell_idx))
     end
 
@@ -541,7 +580,7 @@ function _compute_crystal_corrections(
                 # Allocate buffers for each thread.
                 bessel_table = Array{T, 2}(undef, L_max + 1, n_q)
                 bessel_buffer = Vector{Float64}(undef, L_max + 1)
-                weighted_P_pair = Matrix{Complex{T}}(undef, n_q, n_triples) # Stores P̄ for each frame.
+                P_table = Matrix{Complex{T}}(undef, n_q, n_triples) # Stores P̄ for each frame.
                 wigner_buffers = WignerDBuffers(T, l_max)
                 first = Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) # Stores rotated (now pair-frame) coefficients for the "first" molecule. "f1".
                 accum = Array{Complex{T}, 3}(undef, n_transitions, n_q, n_keys) # Stores sum_ℓ f1 P̄ for each q and (l', μ). "Σ f1 P̄".
@@ -566,6 +605,9 @@ function _compute_crystal_corrections(
                     separation = basis.images[image_i].tau -
                                  basis.images[image_j].tau - cells.Delta_R[cell_idx]
                     distance = norm(separation)
+                    # Each coupling keeps only the pairs inside its own reach.
+                    inside_J = distance <= R_max_J
+                    inside_D = have_Delta_and_Xi && distance <= R_max_D
 
                     # Compute the Bessel functions at each q.
                     @inbounds for q_idx in 1:n_q
@@ -574,64 +616,66 @@ function _compute_crystal_corrections(
                     end
 
                     # Build the full P_pair by multiplying the Gaunt part by the Bessel functions.
-                    fill_weighted_pair_P!(weighted_P_pair, bessel_table, P_pair, radial_weights)
+                    fill_pair_P!(P_table, bessel_table, P_pair)
 
                     # Rotate to the pair frame.
                     S_inverse = rotation_to_pair_frame(separation / distance)
                     blocks = wigner_d_blocks!(wigner_buffers, S_inverse)
 
-                    source_i = first_coefficients[image_i]
-                    source_j = second_coefficients[image_j]
+                    if inside_J
+                        source_i = first_coefficients[image_i]
+                        source_j = second_coefficients[image_j]
 
-                    @inbounds for l in 0:l_max
-                        block = (l * l + 1):((l + 1) * (l + 1))
-                        width = 2 * l + 1
-                        transposed_D = transpose(blocks[l + 1])
-                        mul!(reshape(view(first, :, :, block), n_transitions * n_q, width),
-                             reshape(view(source_i, :, :, block), n_transitions * n_q, width), transposed_D)
-                        # The adjoint rather than the transpose, since we're rotating a conjugated coefficient. 
-                        conjugated_D = adjoint(blocks[l + 1])
-                        for slot in 1:n_transitions
-                            mul!(view(second, :, block, slot),
-                                 view(source_j, :, block, slot), conjugated_D)
-                        end
-                    end
-
-                    # Compute the sum_ℓ f1 P̄.
-                    fill!(accum, zero(Complex{T}))
-                    @inbounds for t in 1:n_triples
-                        (l, l_prime, mu) = P_pair.triples[t]
-                        key_first = l * l + (l + mu) + 1
-                        key_second = l_prime * l_prime + (l_prime + mu) + 1
-                        for q_idx in 1:n_q
-                            weight = weighted_P_pair[q_idx, t]
-                            @simd for slot in 1:n_transitions
-                                accum[slot, q_idx, key_second] +=
-                                    weight * first[slot, q_idx, key_first]
+                        @inbounds for l in 0:l_max
+                            block = (l * l + 1):((l + 1) * (l + 1))
+                            width = 2 * l + 1
+                            transposed_D = transpose(blocks[l + 1])
+                            mul!(reshape(view(first, :, :, block), n_transitions * n_q, width),
+                                 reshape(view(source_i, :, :, block), n_transitions * n_q, width), transposed_D)
+                            # The adjoint rather than the transpose, since we're rotating a conjugated coefficient.
+                            conjugated_D = adjoint(blocks[l + 1])
+                            for slot in 1:n_transitions
+                                mul!(view(second, :, block, slot),
+                                     view(source_j, :, block, slot), conjugated_D)
                             end
                         end
+
+                        # Compute the sum_ℓ f1 P̄.
+                        fill!(accum, zero(Complex{T}))
+                        @inbounds for t in 1:n_triples
+                            (l, l_prime, mu) = P_pair.triples[t]
+                            key_first = l * l + (l + mu) + 1
+                            key_second = l_prime * l_prime + (l_prime + mu) + 1
+                            for q_idx in 1:n_q
+                                weight = P_table[q_idx, t]
+                                @simd for slot in 1:n_transitions
+                                    accum[slot, q_idx, key_second] +=
+                                        weight * first[slot, q_idx, key_first]
+                                end
+                            end
+                        end
+
+                        # Now contract with the second molecule coefficients.
+                        mul!(overlaps, accum_matrix, second_matrix)
+
+                        # Fill the coupling matrix.
+                        @inbounds for b in 1:n_transitions, a in 1:n_transitions
+                            lambda_i = lambda_i_on_first[a]
+                            lambda_j = lambda_i_on_second[b]
+                            lambda_i <= lambda_j || continue
+                            value = prefactor * overlaps[a, b]
+                            couplings[cell_idx, lambda_i, lambda_j] = value
+                            # The Hermitian partner lives in the opposite cell.
+                            couplings[cells.negative_of[cell_idx], lambda_j, lambda_i] = conj(value)
+                        end
                     end
 
-                    # Now contract with the second molecule coefficients.
-                    mul!(overlaps, accum_matrix, second_matrix)
-
-                    # Fill the coupling matrix.
-                    @inbounds for b in 1:n_transitions, a in 1:n_transitions
-                        lambda_i = lambda_i_on_first[a]
-                        lambda_j = lambda_i_on_second[b]
-                        lambda_i <= lambda_j || continue
-                        value = prefactor * overlaps[a, b]
-                        couplings[cell_idx, lambda_i, lambda_j] = value
-                        # The Hermitian partner lives in the opposite cell.
-                        couplings[cells.negative_of[cell_idx], lambda_j, lambda_i] = conj(value)
-                    end
-
-                    if have_Delta_and_Xi
+                    if inside_D
                         # The potential of molecule j's charge density across molecule i, in the
                         # pair frame already built for J_ij.
                         add_D_potential!(
                             local_potential, image_i,
-                            Xi_coefficients[image_j], blocks, P_pair, weighted_P_pair,
+                            Xi_coefficients[image_j], blocks, P_pair, P_table,
                             Xi_pair, Xi_potential, l_max)
 
                         # The same the other way round, molecule i across molecule j, at separation
@@ -641,7 +685,7 @@ function _compute_crystal_corrections(
                             reverse_blocks = wigner_d_blocks!(wigner_buffers, reverse_S_inverse)
                             add_D_potential!(
                                 local_potential, image_j,
-                                Xi_coefficients[image_i], reverse_blocks, P_pair, weighted_P_pair,
+                                Xi_coefficients[image_i], reverse_blocks, P_pair, P_table,
                                 Xi_pair, Xi_potential, l_max)
                         end
                     end
@@ -704,7 +748,7 @@ function compute_couplings(
     """
 
     couplings, _ = _compute_crystal_corrections(
-        rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path; parameters = parameters)
+        rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path; J_parameters = parameters)
     return couplings
 end
 
@@ -717,14 +761,16 @@ function compute_crystal_corrections(
         q_grid_invA::Vector{T},
         l_max::Int,
         gaunt_path::String;
-        parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+        J_parameters::Union{Nothing, EwaldParameters{T}} = nothing,
+        D_parameters::Union{Nothing, EwaldParameters{T}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Compute J and the short-range D in one pair pass.
 
         J: R P_pair R*,             D_SR: Delta P_pair Xi*.
 
-    The separation, Bessel table, pair-frame P table and pair-frame rotations are shared. For D, P̄ is
+    The separation, Bessel table, pair-frame P table and pair-frame rotations are shared, even where
+    the two couplings are split at different η, since none of them depends on η. For D, P̄ is
     applied once to Ξ and the resulting potential is dotted with every Δ.
 
     # Arguments:
@@ -736,7 +782,8 @@ function compute_crystal_corrections(
     - q_grid_invA::Vector{T}: The q grid, in inverse Angstroms.
     - l_max::Int: The largest angular mode.
     - gaunt_path::String: Path to the coupling Gaunt coefficients.
-    - parameters::Union{Nothing,EwaldParameters{T}}: The Ewald split, or nothing for direct sums.
+    - J_parameters::Union{Nothing,EwaldParameters{T}}: J's Ewald split, or nothing for direct sums.
+    - D_parameters::Union{Nothing,EwaldParameters{T}}: D's Ewald split, or nothing for direct sums.
 
     # Returns:
     - Tuple: CrystalCouplings J and the short-range D blocks, with dimensions
@@ -745,7 +792,8 @@ function compute_crystal_corrections(
 
     return _compute_crystal_corrections(
         rotated_R, basis, cells, q_grid_invA, l_max, gaunt_path;
-        parameters = parameters, rotated_Delta = rotated_Delta, rotated_Xi = rotated_Xi)
+        J_parameters = J_parameters, D_parameters = D_parameters,
+        rotated_Delta = rotated_Delta, rotated_Xi = rotated_Xi)
 end
 
 function subtract_self_term!(

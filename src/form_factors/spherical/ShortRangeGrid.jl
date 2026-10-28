@@ -73,7 +73,7 @@ function short_range_envelope(W, sigma_ij, mol, density_matrices, n_transitions)
     return (; sigma, n, A, r_N, Z, r_Z = Z / inverse_radius)
 end
 
-function short_range_geometry(data, basis, cells, parameters)
+function short_range_geometry(data, basis, cells, R_max::T) where {T<:AbstractFloat}
     """
     Measure the molecular and crystal distances entering the SR spacing and tail estimates:
 
@@ -92,14 +92,13 @@ function short_range_geometry(data, basis, cells, parameters)
     - data: The prepared molecular quantities for each conformer.
     - basis::CrystalExcitationBasis{T}: The crystal excitation basis.
     - cells::NeighbourCells{T}: The real-space neighbour cells.
-    - parameters::EwaldParameters{T}: The Ewald parameters.
+    - R_max::T: The furthest a coupling reaches in the short-range sum, in Å.
 
     # Returns:
     - NamedTuple: d_min, d_max, r_N, sigma_max and r_Z in Å, P in inverse Å and total nuclear charge Z.
       Across conformers, use the largest r_N, sigma_max and Z, and the smallest r_Z.
     """
 
-    T = typeof(parameters.eta)
     # Rotate the nuclei into each crystal image's orientation, keeping positions relative to its centre.
     positions = [[CrystalSymmetry.cartesian_operation(image) *
                   SVector{3, T}(view(data[image.conformer_index].mol.atom_coordinates, atom, :))
@@ -113,7 +112,7 @@ function short_range_geometry(data, basis, cells, parameters)
         separation = basis.images[i].tau - basis.images[j].tau - cells.Delta_R[cell]
         distance = norm(separation)
         # The supplied cells are padded to include all images; only pairs inside R_max enter SR.
-        distance <= parameters.R_max || continue
+        distance <= R_max || continue
         distance > eps(T) || error("Two molecular images coincide in the short-range sum.")
         d_max = max(d_max, distance)
         # Each off-diagonal image pair contributes to the neighbour sum about both images.
@@ -247,7 +246,7 @@ function reuse_short_range_grid(saved_q::Vector{T}, spacing::T, reach::T) where 
     return best_q, best_indices
 end
 
-function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, parameters, D_scale, J_scale) where {T<:AbstractFloat}
+function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, J_parameters, D_parameters, D_scale, J_scale) where {T<:AbstractFloat}
     """
     Choose a common SR grid for f_λ, Δ and Ξ from the Gaussian envelopes and crystal distances.
 
@@ -256,20 +255,21 @@ function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, paramet
         Δq = 2π / [d_max + 2 r_N + σ_alias √(2 ln(1/ε_tot))],
         σ_alias² = 2 σ_max² + 1/(2η²).
 
-    Here ε_tot = parameters.epsilon_tot, d_max + 2 r_N bounds the phase distances, r_N is the largest
+    Here ε_tot is the requested truncation error, d_max + 2 r_N bounds the phase distances, r_N is the largest
     nuclear radius, and σ_alias adds a Gaussian margin for the electronic FFs and the Ewald factor.
     Choose qmax so that both estimated tails satisfy
 
         ε_D(qmax) ≤ ε_tot D_scale/2,    ε_J(qmax) ≤ ε_tot J_scale/2.
 
     The scales come from the available grid calculation. The spacing and tail models are
-    empirical radial-error estimates at fixed angular cutoff and neighbour list.
+    empirical radial-error estimates at fixed angular cutoff and neighbour list. Both J and D
+    use the same grid.
 
     # Arguments:
     - saved_q::Vector{T}: The available FF grid, in keV.
     - data: The prepared molecular quantities and Gaussian envelopes.
     - basis, cells: The excitation basis and real-space neighbour cells.
-    - parameters: The Ewald parameters, including the requested relative error.
+    - J_parameters, D_parameters: The two Ewald splits, including the requested relative error.
     - D_scale, J_scale: The cached D and J matrix-element scales, in eV.
 
     # Returns:
@@ -277,12 +277,14 @@ function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, paramet
     """
 
     # Use the same retained neighbours as the SR integral to measure the phase distances.
-    geometry = short_range_geometry(data, basis, cells, parameters)
+    geometry = short_range_geometry(data, basis, cells,
+                                    max(J_parameters.R_max, D_parameters.R_max))
     iszero(geometry.P) && return saved_q, collect(eachindex(saved_q))
-    epsilon = parameters.epsilon_tot
+    epsilon = min(J_parameters.epsilon_tot, D_parameters.epsilon_tot)
     H = T(CrystalLattice.HBAR_C_EV_ANGSTROM / 1000)
     # Add the two FF Gaussian widths and the width from exp(-q²/(4η²)).
-    sigma_alias = sqrt(2 * geometry.sigma_max^2 + inv(2 * parameters.eta^2))
+    sigma_alias = sqrt(2 * geometry.sigma_max^2 +
+                       inv(2 * min(J_parameters.eta, D_parameters.eta)^2))
     spacing = 2 * T(π) * H / (geometry.d_max + 2 * geometry.r_N + sigma_alias * sqrt(2 * log(inv(epsilon))))
     lower, upper = zero(T), H / geometry.sigma_max
     # Vanishing density envelopes need no radial extension, even if their reference scales are zero.

@@ -687,7 +687,7 @@ end
     Xi_R = neutral_test_R(2, q_grid, l_max)
     transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
     lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
-    parameters = SF.choose_ewald_parameters(lattice, T(1e-8); eta = T(0.4))
+    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; eta = T(0.4))
 
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "off_diagonal_D_gaunt.h5")
@@ -698,7 +698,7 @@ end
         for split in (nothing, parameters)
             couplings, D_blocks = CJ.compute_crystal_corrections(
                 transition_R, Delta_R, Xi_R, basis, cells, q_grid, l_max, gaunt_path;
-                parameters = split)
+                J_parameters = split, D_parameters = split)
             J_only = CJ.compute_couplings(
                 transition_R, basis, cells, q_grid, l_max, gaunt_path; parameters = split)
             @test couplings.J_deltaR == J_only.J_deltaR
@@ -734,7 +734,7 @@ end
             _, rotated_D = CJ.compute_crystal_corrections(
                 rotate_test_R(transition_R, rotation, l_max), rotate_test_R(Delta_R, rotation, l_max),
                 rotate_test_R(Xi_R, rotation, l_max), rotated_basis, cells, q_grid, l_max, gaunt_path;
-                parameters = split)
+                J_parameters = split, D_parameters = split)
             @test rotated_D ≈ D_blocks rtol = 2e-12 atol = 2e-12
         end
 
@@ -745,6 +745,77 @@ end
             @test all(iszero, zero_D)
         end
     end
+end
+
+@testset "Ewald cutoff choice" begin
+    T = Float64
+    # Base these tests on the unit cell for benzene.
+    lattice = SF.build_crystal_lattice(T[7.46 0 0; 0 9.66 0; 0 0 7.03], T)
+    Z_mol = 4
+
+    for truncation in (SF.D_TRUNCATION, SF.J_TRUNCATION)
+        R_0 = truncation.k_R * cbrt(lattice.V_cell / Z_mol)
+        for epsilon_tot in T[1e-2, 1e-3, 1e-6]
+            split = SF.choose_ewald_parameters(lattice, Z_mol, epsilon_tot, truncation)
+            # Both cutoffs must deliver exactly the error they were asked for, which is the whole
+            # point of carrying the prefactors and the offset.
+            eta_eff = inv(sqrt(inv(split.eta^2) + inv(truncation.sigma_0^2)))
+            delta_R = truncation.A_R * exp(-split.eta^2 * (split.R_max - R_0)^2)
+            delta_G = truncation.A_G * exp(-split.G_max^2 / (4 * eta_eff^2))
+            @test delta_R ≈ epsilon_tot / sqrt(T(2)) rtol = 1e-6
+            @test delta_G ≈ epsilon_tot / sqrt(T(2)) rtol = 1e-6
+            # Check that the cutoffs are sensible.
+            @test split.R_max > R_0
+            @test split.G_max > 0
+
+            # A fixed η must satisfy the same two laws, just without minimising the work.
+            fixed = SF.choose_ewald_parameters(
+                lattice, Z_mol, epsilon_tot, truncation; eta = T(0.35))
+            @test fixed.eta == T(0.35)
+            fixed_eta_eff = inv(sqrt(inv(fixed.eta^2) + inv(truncation.sigma_0^2)))
+            @test truncation.A_R * exp(-fixed.eta^2 * (fixed.R_max - R_0)^2) ≈
+                  epsilon_tot / sqrt(T(2)) rtol = 1e-6
+            @test truncation.A_G * exp(-fixed.G_max^2 / (4 * fixed_eta_eff^2)) ≈
+                  epsilon_tot / sqrt(T(2)) rtol = 1e-6
+        end
+    end
+
+    # D converges more slowly in both sums, so it must end up with the larger cutoff.
+    D_split = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.D_TRUNCATION)
+    J_split = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.J_TRUNCATION)
+    @test D_split.R_max > J_split.R_max
+    @test D_split.G_max > J_split.G_max
+
+    # σ_0 only narrows the reciprocal cutoff, since it leads to a faster decay.
+    no_decay = SF.EwaldTruncation(
+        SF.J_TRUNCATION.A_R, SF.J_TRUNCATION.A_G, Inf, SF.J_TRUNCATION.k_R)
+    wider = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), no_decay; eta = J_split.eta)
+    @test wider.G_max > J_split.G_max
+    @test wider.R_max ≈ J_split.R_max
+
+    # Tighter tolerances lead to larger cutoffs.
+    @test SF.choose_ewald_parameters(lattice, Z_mol, T(1e-6), SF.D_TRUNCATION).R_max >
+          SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.D_TRUNCATION).R_max
+
+    # An error looser than the laws can express is decreased to the cap.
+    for truncation in (SF.D_TRUNCATION, SF.J_TRUNCATION)
+        loose = SF.choose_ewald_parameters(lattice, Z_mol, T(0.5), truncation)
+        capped = SF.choose_ewald_parameters(lattice, Z_mol, T(SF.Ewald.MAX_EPSILON_TOT), truncation)
+        @test loose.epsilon_tot == T(SF.Ewald.MAX_EPSILON_TOT)
+        @test loose.eta == capped.eta
+        @test loose.R_max == capped.R_max
+        @test loose.G_max == capped.G_max
+        # The cap has to be sensible, or else it might as well not exist.
+        @test loose.R_max > truncation.k_R * cbrt(lattice.V_cell / Z_mol)
+        @test loose.G_max > 0
+    end
+
+    @test_throws ErrorException SF.choose_ewald_parameters(
+        lattice, Z_mol, T(1.5), SF.D_TRUNCATION)
+    @test_throws ErrorException SF.choose_ewald_parameters(
+        lattice, 0, T(1e-3), SF.D_TRUNCATION)
+    @test_throws ErrorException SF.choose_ewald_parameters(
+        lattice, Z_mol, T(1e-3), SF.D_TRUNCATION; cost_ratio = 0)
 end
 
 @testset "Ewald D correction" begin
@@ -789,21 +860,24 @@ end
         @test size(direct_D) == (1, 2, 2)
         @test abs(direct_D[1, 1, 2]) > 1e-6
 
-        # η splits the sum between the two halves and must cancel out of the total.
+        # η splits the sum between the two halves and must cancel out of the total. The two splits must not
+        # depend on one another.
         ewald_values = Array{T, 3}[]
+        J_parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(9), T(4), T(1e-8))
         for eta in T[0.4, 0.5]
-            parameters = SF.Ewald.choose_ewald_parameters(
-                lattice, T(1e-8); eta = eta)
-            short_cells = CJ.enumerate_neighbour_cells(lattice, parameters.R_max)
+            D_parameters = SF.Ewald.EwaldParameters{T}(eta, T(11), 2 * eta * sqrt(T(18.76)), T(1e-8))
+            short_cells = CJ.enumerate_neighbour_cells(
+                lattice, max(J_parameters.R_max, D_parameters.R_max))
             long_range = SF.Ewald.build_ewald_long_range(
                 transition_R, transition_R_bc, [image.tau, image.tau], basis.image_of, lattice,
-                q_grid, q_bc, l_max, parameters)
+                q_grid, q_bc, l_max, J_parameters)
             _, short_D = CJ.compute_crystal_corrections(
                 transition_R, Delta_R, Xi_R, basis, short_cells,
-                q_grid, l_max, gaunt_path; parameters = parameters)
+                q_grid, l_max, gaunt_path;
+                J_parameters = J_parameters, D_parameters = D_parameters)
             long_D = SF.Ewald.compute_ewald_D(
                 Delta_R, Xi_R, Delta_R_bc, Xi_R_bc,
-                q_grid, q_bc, basis.n_transitions, l_max, long_range)
+                q_grid, q_bc, basis.n_transitions, l_max, long_range, D_parameters)
             push!(ewald_values, short_D .+ long_D)
             @test size(long_D) == (1, 2, 2)
             @test long_D[1, 1, 2] == long_D[1, 2, 1]
@@ -834,7 +908,7 @@ end
     transition_bc = vcat(Delta_bc[1:2, :, :], Delta_bc[4:5, :, :])
     tau_of_lambda_i = [images[image].tau for image in basis.image_of]
     lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
-    parameters = SF.choose_ewald_parameters(lattice, T(1e-8); eta = T(0.4))
+    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; eta = T(0.4))
     pairs = DM.build_transition_pairs(2)
 
     vacuum = SF.build_ewald_long_range(
@@ -847,11 +921,11 @@ end
         transition_R, transition_bc, tau_of_lambda_i, basis.image_of, lattice,
         q_grid, q_bc, l_max, parameters; epsilon_b = T(4))
     D_vacuum = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum, parameters)
     D_conductor = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, conductor)
+        q_grid, q_bc, basis.n_transitions, l_max, conductor, parameters)
     D_dielectric = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, dielectric)
+        q_grid, q_bc, basis.n_transitions, l_max, dielectric, parameters)
 
     # The boundary term is the scalar product of the Δ and total Ξ dipoles, including s != t.
     boundary = zeros(T, 2, 2, 2)
@@ -906,19 +980,21 @@ end
     end
     @test D_conductor + self_D ≈ real(reciprocal) rtol = 2e-5 atol = 2e-7
 
-    # Removing the reciprocal vectors with conducting boundaries leaves exactly -D_self.
-    empty!(conductor.G_vectors)
+    # Cutting the reciprocal sum below the shortest reciprocal vector, with conducting boundaries,
+    # leaves exactly -D_self.
+    no_reciprocal = SF.Ewald.EwaldParameters{T}(
+        parameters.eta, parameters.R_max, T(0.1), parameters.epsilon_tot)
     self_only = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, conductor)
+        q_grid, q_bc, basis.n_transitions, l_max, conductor, no_reciprocal)
     @test self_only ≈ -self_D rtol = 2e-12 atol = 2e-12
 
     # Malformed pair and boundary tensors must fail before the contraction starts.
     @test_throws ErrorException SF.compute_ewald_D(Delta_R[1:4, :, :], Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum, parameters)
     @test_throws ErrorException SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc[1:4, :, :], Xi_bc,
-        q_grid, q_bc, basis.n_transitions, l_max, vacuum)
+        q_grid, q_bc, basis.n_transitions, l_max, vacuum, parameters)
     @test_throws ErrorException SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
-        q_grid, q_bc, 1, l_max, vacuum)
+        q_grid, q_bc, 1, l_max, vacuum, parameters)
 end
 
 @testset "Structure function energy axis" begin
@@ -1481,15 +1557,18 @@ end
             lattice = SF.build_crystal_lattice(T[4 0 0; 0 4 0; 0 0 4], T)
             cells = CJ.enumerate_neighbour_cells(lattice, T(5))
             parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(5), T(3), T(1e-3))
-            q_loose, _ = SF.choose_short_range_grid(saved_q, [data], basis, cells, parameters, T(0.1), T(0.1))
+            q_loose, _ = SF.choose_short_range_grid(
+                saved_q, [data], basis, cells, parameters, parameters, T(0.1), T(0.1))
             parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(5), T(3), T(1e-6))
-            q_tight, _ = SF.choose_short_range_grid(saved_q, [data], basis, cells, parameters, T(0.1), T(0.1))
+            q_tight, _ = SF.choose_short_range_grid(
+                saved_q, [data], basis, cells, parameters, parameters, T(0.1), T(0.1))
             @test q_tight[end] >= q_loose[end]
             @test q_tight[2] - q_tight[1] <= q_loose[2] - q_loose[1]
 
             zero_envelope = merge(envelope, (A = zeros(T, size(envelope.A)),))
             zero_data = merge(data, (envelope = zero_envelope,))
-            q_zero, _ = SF.choose_short_range_grid(saved_q, [zero_data], basis, cells, parameters, zero(T), zero(T))
+            q_zero, _ = SF.choose_short_range_grid(
+                saved_q, [zero_data], basis, cells, parameters, parameters, zero(T), zero(T))
             @test q_zero === saved_q
         end
     end

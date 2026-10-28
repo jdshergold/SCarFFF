@@ -38,7 +38,8 @@ using .ConstructRTensor: construct_R_tensor
 using .DensityFormFactors: split_density_R_tensors
 using .ContractSphericalGrid: contract_spherical_grid
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
-using .Ewald: EwaldParameters, choose_ewald_parameters, build_ewald_long_range,
+using .Ewald: EwaldParameters, EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
+              choose_ewald_parameters, build_ewald_long_range,
               compute_ewald_D, supercell_radius,
               check_dipole_against_oscillator_strength
 using .BlochHamiltonian: CrystalImage, CrystalExcitationBasis, build_excitation_basis,
@@ -68,6 +69,7 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        incoherent_intensity_lm_E, integrate_energy, trim_energy_axis, describe_energy_grid,
        kernel_shape, apply_structure_function_prefactor!,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
+       EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
        compute_ewald_D, subtract_self_term!,
        check_dipole_against_oscillator_strength,
        image_translation_span, supercell_radius,
