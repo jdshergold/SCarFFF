@@ -199,8 +199,8 @@ function build_pair_frame_P(gaunt_path::String, ::Type{T})::PairFrameP{T} where 
 
     # Define the destination key function. Maps (l', μ) to l'^2 + (l' + μ) + 1.
     destination_key(triple) = triple[2] * triple[2] + (triple[2] + triple[3]) + 1
-    # Sort the keys by the destination key. Speeds up memory access later.
-    triples = sort!(collect(keys(grouped)); by = destination_key)
+    # Sort the keys by μ first, then by the destination key. Speeds up memory access later.
+    triples = sort!(collect(keys(grouped)); by = triple -> (triple[3], destination_key(triple)))
 
     # Now flatten the grouped data into the P_pair table.
     offsets = Vector{Int}(undef, length(triples) + 1)
