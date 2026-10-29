@@ -632,6 +632,25 @@ function run_crystals(job)
                     )
                 else
 
+                    # Print a summary of the timing, and symmetry statistics.
+                    symmetry_timing = @timed begin
+                        operations = derive_symmetry_operations(basis.images, lattice)
+                        build_stars(theta_grid, phi_grid, operations)
+                    end
+                    stars = symmetry_timing.value
+                    push!(stage_times, "symmetry stars" => symmetry_timing.time)
+                    println("Symmetry: $(length(stars.operations)) usable operations, " *
+                            "$(length(stars.irreducible_directions)) stars over " *
+                            "$(length(theta_grid) * length(phi_grid)) directions, " *
+                            "$(round(star_reduction_factor(stars, length(theta_grid), length(phi_grid)), digits = 2))x " *
+                            "fewer diagonalisations.")
+
+                    # Print a warning about even ϕ grids losing symmetry speedup.
+                    iseven(length(phi_grid)) && println(
+                        "  Note: N_phi = $(length(phi_grid)) is even, so ϕ -> ϕ + π falls between grid " *
+                        "points and roughly half the symmetry operations are unusable. An odd N_phi " *
+                        "(the default is 4 * l_max + 1) would recover them at no cost in accuracy.")
+
                     # Build the intermolecular couplings, unless they have been switched off.
                     crystal_couplings = nothing
                     J_parameters = nothing
@@ -646,10 +665,12 @@ function run_crystals(job)
                             # J and D converge at different rates, so each gets its own cutoffs to save wasted computation.
                             J_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, J_TRUNCATION;
-                                eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                                eta = ewald_eta, cost_ratio = ewald_cost_ratio,
+                                q_reach = q_grid_invA[end])
                             D_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, D_TRUNCATION;
-                                eta = ewald_eta, cost_ratio = ewald_cost_ratio)
+                                eta = ewald_eta, cost_ratio = ewald_cost_ratio,
+                                q_reach = q_grid_invA[end])
                             # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
                             real_cutoff = max(J_parameters.R_max, D_parameters.R_max) +
                                           image_translation_span(basis)
@@ -705,7 +726,7 @@ function run_crystals(job)
                                 J_parameters = J_parameters, D_parameters = D_parameters)
                             crystal_couplings, D_blocks_short_range = correction_timing.value
                             push!(stage_times, "short-range J and D(ΔR)" => correction_timing.time)
-                            subtract_self_term!(crystal_couplings, cells, crystal_long_range.J_self)
+                            subtract_self_term!(crystal_couplings, crystal_long_range.J_self)
 
                             D_long_range_timing = @timed compute_ewald_D(
                                 rotated_Delta, rotated_Xi,
@@ -744,7 +765,7 @@ function run_crystals(job)
                                 end
                                 crystal_couplings, D_blocks_short_range = sr_timing.value
                                 # The refined couplings replace the earlier SR result, so subtract their self term once.
-                                subtract_self_term!(crystal_couplings, cells, crystal_long_range.J_self)
+                                subtract_self_term!(crystal_couplings, crystal_long_range.J_self)
                                 push!(stage_times, "SR grid and J/D refinement" => sr_timing.time)
                             end
                             # Add the LR D from the original FF table to the final SR D blocks.
@@ -753,25 +774,6 @@ function run_crystals(job)
                             push!(stage_times, "Ewald long-range D" => D_long_range_timing.time)
                         end
                     end
-
-                    # Print a summary of the timing, and symmetry statistics.
-                    symmetry_timing = @timed begin
-                        operations = derive_symmetry_operations(basis.images, lattice)
-                        build_stars(theta_grid, phi_grid, operations)
-                    end
-                    stars = symmetry_timing.value
-                    push!(stage_times, "symmetry stars" => symmetry_timing.time)
-                    println("Symmetry: $(length(stars.operations)) usable operations, " *
-                            "$(length(stars.irreducible_directions)) stars over " *
-                            "$(length(theta_grid) * length(phi_grid)) directions, " *
-                            "$(round(star_reduction_factor(stars, length(theta_grid), length(phi_grid)), digits = 2))x " *
-                            "fewer diagonalisations.")
-
-                    # Print a warning about even ϕ grids losing symmetry speedup.
-                    iseven(length(phi_grid)) && println(
-                        "  Note: N_phi = $(length(phi_grid)) is even, so ϕ -> ϕ + π falls between grid " *
-                        "points and roughly half the symmetry operations are unusable. An odd N_phi " *
-                        "(the default is 4 * l_max + 1) would recover them at no cost in accuracy.")
 
                     # Build the energy grid by sampling the bands. We don't do all k points or stars as this is
                     # too expensive, but instead stride over them, and then buffer a bit. In practice, this is

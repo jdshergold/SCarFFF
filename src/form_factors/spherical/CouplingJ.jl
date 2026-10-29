@@ -566,7 +566,28 @@ function _compute_crystal_corrections(
         push!(jobs, (image_i, image_j, cell_idx))
     end
 
-    couplings = zeros(Complex{T}, n_neighbour_cells, n_lambda_i, n_lambda_i)
+    # Only do work for cells within J's cutoff.
+    keep_cell = falses(n_neighbour_cells)
+    for (image_i, image_j, cell_idx) in jobs
+        separation = basis.images[image_i].tau - basis.images[image_j].tau -
+                     cells.Delta_R[cell_idx]
+        norm(separation) <= R_max_J || continue
+        keep_cell[cell_idx] = true
+        keep_cell[cells.negative_of[cell_idx]] = true
+    end
+    # ΔR = 0 is always kept.
+    zero_cell = findfirst(index -> all(iszero, index), cells.indices)
+    zero_cell === nothing &&
+        error("The neighbour list does not contain ΔR = 0, which should be impossible.")
+    keep_cell[zero_cell] = true
+    kept_cells = findall(keep_cell)
+    # Build the map from each kept cell to its slot in the full cell list.
+    slot_of_cell = zeros(Int, n_neighbour_cells)
+    for (slot, cell_idx) in enumerate(kept_cells)
+        slot_of_cell[cell_idx] = slot
+    end
+
+    couplings = zeros(Complex{T}, length(kept_cells), n_lambda_i, n_lambda_i)
     n_chunks = min(nthreads(), max(length(jobs), 1))
     potential_chunks = have_Delta_and_Xi ?
         [zeros(Complex{T}, n_q, n_keys, n_images) for _ in 1:n_chunks] : nothing
@@ -658,15 +679,17 @@ function _compute_crystal_corrections(
                         # Now contract with the second molecule coefficients.
                         mul!(overlaps, accum_matrix, second_matrix)
 
-                        # Fill the coupling matrix.
+                        # Fill the coupling matrix, in the trimmed cell list's indexing.
+                        slot = slot_of_cell[cell_idx]
+                        negative_slot = slot_of_cell[cells.negative_of[cell_idx]]
                         @inbounds for b in 1:n_transitions, a in 1:n_transitions
                             lambda_i = lambda_i_on_first[a]
                             lambda_j = lambda_i_on_second[b]
                             lambda_i <= lambda_j || continue
                             value = prefactor * overlaps[a, b]
-                            couplings[cell_idx, lambda_i, lambda_j] = value
+                            couplings[slot, lambda_i, lambda_j] = value
                             # The Hermitian partner lives in the opposite cell.
-                            couplings[cells.negative_of[cell_idx], lambda_j, lambda_i] = conj(value)
+                            couplings[negative_slot, lambda_j, lambda_i] = conj(value)
                         end
                     end
 
@@ -716,7 +739,7 @@ function _compute_crystal_corrections(
         D_blocks .= real(total)
     end
 
-    return CrystalCouplings{T}(couplings, cells.Delta_R), D_blocks
+    return CrystalCouplings{T}(couplings, cells.Delta_R[kept_cells]), D_blocks
 end
 
 function compute_couplings(
@@ -798,7 +821,6 @@ end
 
 function subtract_self_term!(
         couplings::CrystalCouplings{T},
-        cells::NeighbourCells{T},
         J_self::Matrix{Complex{T}},
     )::CrystalCouplings{T} where {T<:AbstractFloat}
     """
@@ -807,15 +829,14 @@ function subtract_self_term!(
 
     # Arguments:
     - couplings::CrystalCouplings{T}: The short-range couplings, modified in place.
-    - cells::NeighbourCells{T}: The lattice vectors, used to locate ΔR = 0.
     - J_self::Matrix{Complex{T}}: The self-interaction J^self_{λ_iλ_j′} in eV.
 
     # Returns:
     - CrystalCouplings{T}: The same couplings, with the self term removed.
     """
 
-    zero_cell = findfirst(index -> all(iszero, index), cells.indices)
-    zero_cell === nothing && error("The neighbour list does not contain ΔR = 0, which should be impossible.")
+    zero_cell = findfirst(Delta_R -> iszero(Delta_R), couplings.Delta_R)
+    zero_cell === nothing && error("The couplings do not contain ΔR = 0, which should be impossible.")
 
     @views couplings.J_deltaR[zero_cell, :, :] .-= J_self
 

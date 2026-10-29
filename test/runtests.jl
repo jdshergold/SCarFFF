@@ -747,6 +747,64 @@ end
     end
 end
 
+@testset "J cell list trimming" begin
+    # Ensure that J doesn't do extra work in light of R_max being longer for D than J.
+    T = Float64
+    l_max = 1
+    q_grid = collect(range(zero(T), T(4), length = 41))
+    identity_rotation = Quaternionic.rotor(T[1, 0, 0, 0])
+    images = [
+        BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(-0.7, 0.1, 0.2)),
+        BH.CrystalImage{T}(1, identity_rotation, one(T), SVector{3, T}(1.2, -0.4, 0.8)),
+    ]
+    basis = BH.build_excitation_basis(images, [T[2.0, 2.6]])
+    Delta_R = neutral_test_R(6, q_grid, l_max)
+    Xi_R = neutral_test_R(2, q_grid, l_max)
+    transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
+    lattice = SF.build_crystal_lattice(T[5 0 0; 0 5.5 0; 0 0 6], T)
+
+    # J stops at 7 Å while D runs to 13, so the cell list is sized for D and most of it is dead
+    # weight for J.
+    J_split = SF.Ewald.EwaldParameters{T}(T(0.45), T(7), T(3), T(1e-3))
+    D_split = SF.Ewald.EwaldParameters{T}(T(0.45), T(13), T(3), T(1e-3))
+    wide_cells = CJ.enumerate_neighbour_cells(lattice, T(13) + CJ.image_translation_span(basis))
+    narrow_cells = CJ.enumerate_neighbour_cells(lattice, T(7) + CJ.image_translation_span(basis))
+    @test length(wide_cells.Delta_R) > length(narrow_cells.Delta_R)
+
+    mktempdir() do tmp_dir
+        gaunt_path = joinpath(tmp_dir, "trim_gaunt.h5")
+        SF.PrecomputeGaunt.precompute_gaunt_coefficients(l_max, 2 * l_max, l_max, gaunt_path, T)
+
+        trimmed, _ = CJ.compute_crystal_corrections(
+            transition_R, Delta_R, Xi_R, basis, wide_cells, q_grid, l_max, gaunt_path;
+            J_parameters = J_split, D_parameters = D_split)
+        reference, _ = CJ.compute_crystal_corrections(
+            transition_R, Delta_R, Xi_R, basis, narrow_cells, q_grid, l_max, gaunt_path;
+            J_parameters = J_split, D_parameters = D_split)
+
+        # The trim must result in a shorter list.
+        @test length(trimmed.Delta_R) < length(wide_cells.Delta_R)
+        @test !all(iszero, trimmed.J_deltaR)
+
+        # Every cell kept must carry something, bar ΔR = 0 which is kept for the self term.
+        for cell in eachindex(trimmed.Delta_R)
+            iszero(trimmed.Delta_R[cell]) && continue
+            @test !all(iszero, view(trimmed.J_deltaR, cell, :, :))
+        end
+
+        # The two cell lists are in different orders, so compare the Bloch sum J(k) over ΔR, which
+        # does not depend on the order, rather than the stored arrays.
+        bloch(couplings, k) = sum(couplings.J_deltaR[cell, :, :] *
+                                  cis(dot(k, couplings.Delta_R[cell]))
+                                  for cell in eachindex(couplings.Delta_R))
+        for fraction in (SVector{3, T}(0, 0, 0), SVector{3, T}(0.25, 0, 0),
+                         SVector{3, T}(0.1, -0.3, 0.2), SVector{3, T}(0.125, 0.125, 0.125))
+            k = SVector{3, T}(transpose(lattice.reciprocal) * fraction)
+            @test bloch(trimmed, k) ≈ bloch(reference, k) rtol = 1e-12 atol = 1e-14
+        end
+    end
+end
+
 @testset "Ewald cutoff choice" begin
     T = Float64
     # Base these tests on the unit cell for benzene.
@@ -778,6 +836,29 @@ end
             @test truncation.A_G * exp(-fixed.G_max^2 / (4 * fixed_eta_eff^2)) ≈
                   epsilon_tot / sqrt(T(2)) rtol = 1e-6
         end
+    end
+
+    # Set q_max to half the optimal G_max. G_max should be capped at q_max, and R_max extended to
+    # keep the requested error.
+    for truncation in (SF.D_TRUNCATION, SF.J_TRUNCATION)
+        R_0 = truncation.k_R * cbrt(lattice.V_cell / Z_mol)
+        free = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), truncation)
+        capped = SF.choose_ewald_parameters(
+            lattice, Z_mol, T(1e-3), truncation; q_reach = free.G_max / 2)
+        @test capped.G_max ≈ free.G_max / 2
+        @test capped.R_max > free.R_max
+        @test capped.eta < free.eta
+        eta_eff = inv(sqrt(inv(capped.eta^2) + inv(truncation.sigma_0^2)))
+        @test truncation.A_R * exp(-capped.eta^2 * (capped.R_max - R_0)^2) ≈
+              T(1e-3) / sqrt(T(2)) rtol = 1e-6
+        @test truncation.A_G * exp(-capped.G_max^2 / (4 * eta_eff^2)) ≈
+              T(1e-3) / sqrt(T(2)) rtol = 1e-6
+
+        # If q_max is beyond the optimal G_max, nothing changes.
+        roomy = SF.choose_ewald_parameters(
+            lattice, Z_mol, T(1e-3), truncation; q_reach = 2 * free.G_max)
+        @test roomy.G_max == free.G_max
+        @test roomy.R_max == free.R_max
     end
 
     # D converges more slowly in both sums, so it must end up with the larger cutoff.

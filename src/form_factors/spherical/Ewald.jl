@@ -93,6 +93,7 @@ function choose_ewald_parameters(
         truncation::EwaldTruncation;
         eta::Real = 0,
         cost_ratio::Real = 1,
+        q_reach::Real = Inf,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
     Choose η and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
@@ -120,6 +121,7 @@ function choose_ewald_parameters(
     - truncation::EwaldTruncation: The convergence constants of the coupling being split.
     - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
     - cost_ratio::Real: c_G / c_R, the cost of one reciprocal lattice vector relative to one real one.
+    - q_reach::Real: How far the saved q grid reaches, in Å^{-1}, which caps G_max. Infinite for no cap.
 
     # Returns:
     - EwaldParameters{T}: The splitting parameter and both cutoffs.
@@ -173,8 +175,16 @@ function choose_ewald_parameters(
         eta_value = T(eta)
         # The same two errors, but with η taken as given rather than derived.
         eta_eff = inv(sqrt(inv(eta_value^2) + inverse_sigma_squared))
-        return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value,
-                                  2 * eta_eff * sqrt(L_G), epsilon)
+        G_max = 2 * eta_eff * sqrt(L_G)
+        # With η fixed, R_max cannot be extended to compensate, so G_max > q_max misses the requested error.
+        if G_max > T(q_reach)
+            @warn("For this fixed η, the required G_max > q_max for the requested error, so it cannot " *
+                  "be achieved. We recommend increasing q_max, or leaving η free.", maxlog = 1, eta = eta_value, wanted = G_max,
+                  q_reach = q_reach,
+                  reciprocal_error = T(truncation.A_G) * exp(-T(q_reach)^2 / (4 * eta_eff^2)))
+            G_max = T(q_reach)
+        end
+        return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value, G_max, epsilon)
     end
 
     # Start with a simple estimate for G_max, based on R_0 = 0, then iterate to find the true solution.
@@ -192,6 +202,15 @@ function choose_ewald_parameters(
     end
     converged || error(
         "The Ewald work minimisation did not settle on a reciprocal cutoff in $(WORK_PASSES) passes.")
+
+    # If q_max < optimal G_max, then we extend R_max to ensure truncation error is achieved, but warn
+    # that this is sub-optimal from a computation time standpoint.
+    if G_max > T(q_reach)
+        @warn("The optimal G_max > q_max for the requested error, so R_max has been extended to " *
+              "compensate. This is not optimal, so we recommend increasing q_max for this error " *
+              "tolerance.", maxlog = 1, wanted = G_max, q_reach = q_reach)
+        G_max = T(q_reach)
+    end
 
     # Take the η and R_max corresponding to G_max.
     eta_value, R_max = split_at(G_max)
@@ -881,6 +900,7 @@ function compute_ewald_D(
 
     @inbounds for G in enumerate_reciprocal_vectors(data.lattice, parameters.G_max)
         # Here k = 0, so Q = G. Skip G = 0, which is handled by the boundary term.
+        G_norm = norm(G)
         G_norm < T(Q_ZERO_TOLERANCE) && continue
 
         # Compute the spherical harmonics for this G.
