@@ -39,6 +39,7 @@ using .DensityFormFactors: split_density_R_tensors
 using .ContractSphericalGrid: contract_spherical_grid
 using .CrystalLattice: CrystalLatticeData, build_crystal_lattice, fold_to_bz
 using .Ewald: EwaldParameters, EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
+              EwaldCost, D_COST, J_COST,
               choose_ewald_parameters, build_ewald_long_range,
               compute_ewald_D, supercell_radius,
               check_dipole_against_oscillator_strength
@@ -70,6 +71,7 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        kernel_shape, apply_structure_function_prefactor!,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
+       EwaldCost, D_COST, J_COST,
        compute_ewald_D, subtract_self_term!,
        check_dipole_against_oscillator_strength,
        image_translation_span, supercell_radius,

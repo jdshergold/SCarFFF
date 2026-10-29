@@ -861,6 +861,27 @@ end
         @test roomy.R_max == free.R_max
     end
 
+    # Add the cost model for a reasonably sized run. Both errors should still be the requested one.
+    sizes = (n_transitions = 12, l_max = 24, n_q = 251, n_stars = 2500)
+    q_max = 20 * SF.CrystalLattice.KEV_TO_INV_ANGSTROM
+    for (truncation, cost) in ((SF.D_TRUNCATION, SF.D_COST), (SF.J_TRUNCATION, SF.J_COST))
+        R_0 = truncation.k_R * cbrt(lattice.V_cell / Z_mol)
+        costed = SF.choose_ewald_parameters(
+            lattice, Z_mol, T(1e-3), truncation; q_reach = q_max, cost = cost, sizes...)
+        eta_eff = inv(sqrt(inv(costed.eta^2) + inv(truncation.sigma_0^2)))
+        @test truncation.A_R * exp(-costed.eta^2 * (costed.R_max - R_0)^2) ≈
+              T(1e-3) / sqrt(T(2)) rtol = 1e-6
+        @test truncation.A_G * exp(-costed.G_max^2 / (4 * eta_eff^2)) ≈
+              T(1e-3) / sqrt(T(2)) rtol = 1e-6
+    end
+
+    # D's real-space terms cost more than its reciprocal ones, so the cost model should move work into G.
+    D_costed = SF.choose_ewald_parameters(
+        lattice, Z_mol, T(1e-3), SF.D_TRUNCATION; q_reach = q_max, cost = SF.D_COST, sizes...)
+    D_equal = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.D_TRUNCATION; q_reach = q_max)
+    @test D_costed.G_max > D_equal.G_max
+    @test D_costed.R_max < D_equal.R_max
+
     # D converges more slowly in both sums, so it must end up with the larger cutoff.
     D_split = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.D_TRUNCATION)
     J_split = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), SF.J_TRUNCATION)
@@ -896,7 +917,7 @@ end
     @test_throws ErrorException SF.choose_ewald_parameters(
         lattice, 0, T(1e-3), SF.D_TRUNCATION)
     @test_throws ErrorException SF.choose_ewald_parameters(
-        lattice, Z_mol, T(1e-3), SF.D_TRUNCATION; cost_ratio = 0)
+        lattice, Z_mol, T(1e-3), SF.D_TRUNCATION; cost = SF.D_COST)
 end
 
 @testset "Ewald D correction" begin

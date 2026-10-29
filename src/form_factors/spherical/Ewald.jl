@@ -7,11 +7,11 @@ using SphericalHarmonics
 using LinearAlgebra: norm, cross, dot, mul!, BLAS
 
 using ..CrystalLattice: CrystalLatticeData, fold_to_bz, ALPHA_EM, HBAR_C_EV_ANGSTROM,
-                        HARTREE_EV, BOHR_ANGSTROM
+                        HARTREE_EV, BOHR_ANGSTROM, KEV_TO_INV_ANGSTROM
 using ..DensityFormFactors: Delta_row
 using ..ReadBasisSet: build_transition_pairs
 
-export EwaldParameters, EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
+export EwaldParameters, EwaldTruncation, D_TRUNCATION, J_TRUNCATION, EwaldCost, D_COST, J_COST,
        choose_ewald_parameters, short_range_kernel, supercell_radius,
        EwaldLongRangeData, EwaldLongRangeBuffers, build_ewald_long_range, add_long_range!,
        compute_ewald_D, J_self_matrix, check_dipole_against_oscillator_strength
@@ -53,6 +53,32 @@ end
 const D_TRUNCATION = EwaldTruncation(2.0, 15.0, Inf, 1.5)
 const J_TRUNCATION = EwaldTruncation(0.01, 0.4, 2.5, 1.5)
 
+struct EwaldCost
+    """
+    Stores the measured constants that determine the cost of each term in the Ewald sums.
+
+        c_R = B_R (Z_mol/4)² (n_tr/12)^α_1 (ℓ_max/24)^α_2 (R_max/15 Å)^{1/2},
+        c_G = B_G (n_tr/12)^β_1 (n_q/250) (n_*/2500)^β_2 (20 keV/q_max)^β_3 (500 Å³/V_cell)^β_4
+              × (G_max/2.5 keV)^β_5.
+
+    c_R is the cost per real-space cell, and c_G the cost per reciprocal lattice vector.
+
+    # Fields:
+    - B_R::Float64: The real-space cost at the reference point, in s.
+    - B_G::Float64: The reciprocal-space cost at the reference point, in s.
+    - alpha::NTuple{2, Float64}: The real-space exponents α_1 and α_2.
+    - beta::NTuple{5, Float64}: The reciprocal-space exponents β_1 to β_5.
+    """
+    B_R::Float64
+    B_G::Float64
+    alpha::NTuple{2, Float64}
+    beta::NTuple{5, Float64}
+end
+
+# Fitted parameters for the costs.
+const D_COST = EwaldCost(0.13, 3.3e-3, (0.0, 10 / 3), (2.0, 0.0, 1.0, 1.0, -1.0))
+const J_COST = EwaldCost(0.45, 3.1, (1.0, 3.0), (1.0, 1.0, 0.0, 0.0, 1.0))
+
 # How many passes the work minimisation is allowed before giving up.
 const WORK_PASSES = 50
 
@@ -92,8 +118,12 @@ function choose_ewald_parameters(
         epsilon_tot::Real,
         truncation::EwaldTruncation;
         eta::Real = 0,
-        cost_ratio::Real = 1,
         q_reach::Real = Inf,
+        cost::Union{Nothing, EwaldCost} = nothing,
+        n_transitions::Integer = 0,
+        l_max::Integer = 0,
+        n_q::Integer = 0,
+        n_stars::Integer = 0,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
     Choose η and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
@@ -112,7 +142,9 @@ function choose_ewald_parameters(
 
         G_max⁵ = (32π³ L_R L_G / V_cell²) R_max²/(R_max - R_0) (3c_R + R_max c_R')/(3c_G + G_max c_G'),
 
-    with c_R' = dc_R/dR_max. Constant costs make the last factor c_R/c_G, which is what we use.
+    with c_R' = dc_R/dR_max. The costs follow the power laws in EwaldCost, so c_R ∝ R_max^{1/2} and
+    c_G ∝ G_max^{β_5}, and the last factor is 7c_R / 2(3 + β_5)c_G. Without a cost model, c_R = c_G
+    and it is 1.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice, for the cell volume and reciprocal spacings.
@@ -120,18 +152,28 @@ function choose_ewald_parameters(
     - epsilon_tot::Real: The requested truncation error, in (0, 1).
     - truncation::EwaldTruncation: The convergence constants of the coupling being split.
     - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
-    - cost_ratio::Real: c_G / c_R, the cost of one reciprocal lattice vector relative to one real one.
-    - q_reach::Real: How far the saved q grid reaches, in Å^{-1}, which caps G_max. Infinite for no cap.
+    - q_reach::Real: How far the saved q grid reaches, q_max, in Å^{-1}, which caps G_max. Infinite
+      for no cap.
+    - cost::Union{Nothing, EwaldCost}: The cost constants of the coupling being split, or nothing for
+      equal costs.
+    - n_transitions::Integer: The number of monomer transitions, n_tr. Only used with a cost model.
+    - l_max::Integer: The maximum angular momentum mode of the form factor. Only used with a cost model.
+    - n_q::Integer: The number of points in the saved q grid. Only used with a cost model.
+    - n_stars::Integer: The number of symmetry stars, n_*. Only used with a cost model.
 
     # Returns:
     - EwaldParameters{T}: The splitting parameter and both cutoffs.
     """
 
-    # Check that an error ∈ [0,1], a cost ratio > 0 and at least one molecule are given.
+    # Check that an error ∈ [0,1] and at least one molecule are given.
     zero(epsilon_tot) < epsilon_tot < one(epsilon_tot) ||
         error("The Ewald truncation error must lie in (0, 1), got $(epsilon_tot).")
-    cost_ratio > 0 || error("The Ewald cost ratio must be positive, got $(cost_ratio).")
     Z_mol >= 1 || error("The unit cell must hold at least one molecule, got $(Z_mol).")
+    # The cost model needs the size of the run, and a finite q_max.
+    cost === nothing || min(n_transitions, l_max, n_q, n_stars) >= 1 || error(
+        "The Ewald cost model needs n_transitions, l_max, n_q and n_stars, got $(n_transitions), " *
+        "$(l_max), $(n_q) and $(n_stars).")
+    cost === nothing || isfinite(q_reach) || error("The Ewald cost model needs a finite q_reach.")
     min(truncation.A_R, truncation.A_G) > 0 || error(
         "The Ewald truncation prefactors must be positive, got A_R = $(truncation.A_R), " *
         "A_G = $(truncation.A_G).")
@@ -159,7 +201,20 @@ function choose_ewald_parameters(
     # The offset, R_0, and the form factor decay width, 1/σ_0^2.
     R_0 = T(truncation.k_R) * (lattice.V_cell / T(Z_mol))^(one(T) / 3)
     inverse_sigma_squared = inv(T(truncation.sigma_0)^2)
-    inverse_cost = inv(T(cost_ratio))
+
+    # The costs at R_max = 15 Å and G_max = 2.5 keV, for this run.
+    if cost !== nothing
+        c_R_0 = T(cost.B_R) * (T(Z_mol) / 4)^2 * (T(n_transitions) / 12)^T(cost.alpha[1]) *
+                (T(l_max) / 24)^T(cost.alpha[2])
+        c_G_0 = T(cost.B_G) * (T(n_transitions) / 12)^T(cost.beta[1]) * (T(n_q) / 250) *
+                (T(n_stars) / 2500)^T(cost.beta[2]) *
+                (20 * T(KEV_TO_INV_ANGSTROM) / T(q_reach))^T(cost.beta[3]) *
+                (500 / lattice.V_cell)^T(cost.beta[4])
+    end
+    # The bracketed cost factor in the G_max⁵ condition, (3c_R + R_max c_R')/(3c_G + G_max c_G').
+    cost_factor(R, G) = cost === nothing ? one(T) :
+        7 * c_R_0 * sqrt(R / 15) /
+        (2 * (3 + T(cost.beta[5])) * c_G_0 * (G / (T(2.5) * T(KEV_TO_INV_ANGSTROM)))^T(cost.beta[5]))
 
     # Find the η and R_max that give the requested error.
     split_at(G) = begin
@@ -187,14 +242,15 @@ function choose_ewald_parameters(
         return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value, G_max, epsilon)
     end
 
-    # Start with a simple estimate for G_max, based on R_0 = 0, then iterate to find the true solution.
-    G_max = 2 * sqrt(T(π)) * (inverse_cost / lattice.V_cell^2)^(one(T) / 6) * (L_R * L_G)^(one(T) / 4)
-    work_scale = 32 * T(π)^3 * inverse_cost * L_R * L_G / lattice.V_cell^2
+    # Start with a simple estimate for G_max, based on R_0 = 0 and equal costs, then iterate to find the
+    # true solution.
+    G_max = 2 * sqrt(T(π)) * (one(T) / lattice.V_cell^2)^(one(T) / 6) * (L_R * L_G)^(one(T) / 4)
+    work_scale = 32 * T(π)^3 * L_R * L_G / lattice.V_cell^2
     converged = false
     for _ in 1:WORK_PASSES
         previous = G_max
         _, R_max = split_at(G_max)
-        G_max = (work_scale * R_max^2 / (R_max - R_0))^(one(T) / 5)
+        G_max = (work_scale * R_max^2 / (R_max - R_0) * cost_factor(R_max, G_max))^(one(T) / 5)
         if abs(G_max - previous) <= sqrt(eps(T)) * G_max
             converged = true
             break

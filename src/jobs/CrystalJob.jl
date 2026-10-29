@@ -19,7 +19,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
-                                  D_TRUNCATION, J_TRUNCATION,
+                                  D_TRUNCATION, J_TRUNCATION, D_COST, J_COST,
                                   compute_ewald_D, subtract_self_term!,
                                   check_dipole_against_oscillator_strength,
                                   image_translation_span, supercell_radius,
@@ -226,7 +226,6 @@ function run_crystals(job)
     coupling_cutoff = crystal["coupling_cutoff"]
     epsilon_tot = crystal["ewald_epsilon_tot"]
     ewald_eta = crystal["ewald_eta"]
-    ewald_cost_ratio = crystal["ewald_cost_ratio"]
     epsilon_b = crystal["epsilon_b"] == "inf" ? Inf : crystal["epsilon_b"]
     q_bc = crystal["q_bc"]
     energy_step = crystal["energy_step"]
@@ -665,12 +664,14 @@ function run_crystals(job)
                             # J and D converge at different rates, so each gets its own cutoffs to save wasted computation.
                             J_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, J_TRUNCATION;
-                                eta = ewald_eta, cost_ratio = ewald_cost_ratio,
-                                q_reach = q_grid_invA[end])
+                                eta = ewald_eta, q_reach = q_grid_invA[end], cost = J_COST,
+                                n_transitions = basis.n_transitions, l_max = l_max,
+                                n_q = length(q_grid), n_stars = length(stars.irreducible_directions))
                             D_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, D_TRUNCATION;
-                                eta = ewald_eta, cost_ratio = ewald_cost_ratio,
-                                q_reach = q_grid_invA[end])
+                                eta = ewald_eta, q_reach = q_grid_invA[end], cost = D_COST,
+                                n_transitions = basis.n_transitions, l_max = l_max,
+                                n_q = length(q_grid), n_stars = length(stars.irreducible_directions))
                             # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
                             real_cutoff = max(J_parameters.R_max, D_parameters.R_max) +
                                           image_translation_span(basis)
