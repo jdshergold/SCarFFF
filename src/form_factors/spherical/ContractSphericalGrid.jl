@@ -6,6 +6,7 @@ export contract_spherical_grid
 
 using SphericalHarmonics
 using Base.Threads
+using LinearAlgebra: mul!, BLAS
 
 using ...ThreadChunks: chunk_count, chunk_range
 
@@ -29,8 +30,6 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
     - f_s::Array{Complex{T}, 4}: The spherical form factor with dimensions (n_transitions, n_q, n_θ, n_ϕ).
     """
 
-    typed_complex_zero = zero(Complex{T})
-
     # Get the grid sizes.
     n_transitions = size(R_tensor, 1)
     n_q = size(R_tensor, 2)
@@ -45,13 +44,22 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
     # Allocate the output form factor array.
     f_s = Array{Complex{T}}(undef, n_transitions, n_q, n_theta, n_phi)
 
+    # Reshape the R tensor to a matrix so we can use a BLAS GEMV.
+    R_matrix = reshape(R_tensor, n_transitions * n_q, n_keys)
+
     # Now loop over the angular grid and construct the form factor.
     n_chunks = chunk_count(n_theta, nthreads())
+
+    # Avoid BLAS oversubscription, since each task below makes its own BLAS calls.
+    blas_threads = BLAS.get_num_threads()
+    BLAS.set_num_threads(1)
+    try
 
     @sync for chunk in 1:n_chunks
         Threads.@spawn begin
             # Each task owns its spherical harmonic cache, to avoid races.
             Y_cache = SphericalHarmonics.cache(l_max, SphericalHarmonics.FullRange)
+            harmonics = Vector{Complex{T}}(undef, n_keys)
 
             for theta_idx in chunk_range(chunk, n_chunks, n_theta)
                 # Enumerate doesn't work with threads, so we grab θ manually.
@@ -65,27 +73,26 @@ function contract_spherical_grid(R_tensor::Array{Complex{T}, 3}, theta_grid::Vec
                     computeYlm!(Y_cache, theta, phi, l_max)
                     Yvals = SphericalHarmonics.getY(Y_cache)
 
-                    # Now contract over (ℓ, m) to compute f_s(q, θ, ϕ) for all transitions.
-                    for transition_idx in 1:n_transitions
-                        for q_idx in 1:n_q
-                            f_s_point = typed_complex_zero
-                            for l in 0:l_max
-                                # Precompute the key base.
-                                key_base = l * l + l + 1
-                                for m in -l:l
-                                    # Add the m offset.
-                                    key = key_base + m
-                                    f_s_point += R_tensor[transition_idx, q_idx, key] * Complex{T}(Yvals[(l, m)])
-                                end
-                            end
-
-                            # Store the form factor value.
-                            f_s[transition_idx, q_idx, theta_idx, phi_idx] = f_s_point
+                    # Copy the harmonics into a flat vector, so we can use BLAS later to contract.
+                    @inbounds for l in 0:l_max
+                        # Precompute the key base.
+                        key_base = l * l + l + 1
+                        for m in -l:l
+                            # Add the m offset.
+                            harmonics[key_base + m] = Complex{T}(Yvals[(l, m)])
                         end
                     end
+
+                    # BLAS is king.
+                    mul!(vec(view(f_s, :, :, theta_idx, phi_idx)), R_matrix, harmonics)
                 end
             end
         end
+    end
+
+    # Reset the BLAS thread count.
+    finally
+        BLAS.set_num_threads(blas_threads)
     end
 
     return f_s

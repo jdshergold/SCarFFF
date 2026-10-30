@@ -251,16 +251,17 @@ end
     - Nothing. amplitudes is written in place.
     """
 
-    @inbounds for lambda_i in 1:n_lambda_i
-        amplitude = zero(Complex{T})
-        for l in 0:l_max
-            # Convert l to the key index, up to the factor of m.
-            key_base = l * l + l + 1
-            for m in -l:l
-                amplitude += rotated_R[lambda_i, q_idx, key_base + m] * Complex{T}(Yvals[(l, m)])
+    fill!(amplitudes, zero(Complex{T}))
+    @inbounds for l in 0:l_max
+        # Convert l to the key index, up to the factor of m.
+        key_base = l * l + l + 1
+        for m in -l:l
+            harmonic = Complex{T}(Yvals[(l, m)])
+            key = key_base + m
+            @simd for lambda_i in 1:n_lambda_i
+                amplitudes[lambda_i] += rotated_R[lambda_i, q_idx, key] * harmonic
             end
         end
-        amplitudes[lambda_i] = amplitude
     end
 
     return nothing
