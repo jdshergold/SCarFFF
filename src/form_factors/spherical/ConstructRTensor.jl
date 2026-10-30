@@ -13,7 +13,7 @@ using .BinEncoding: decode_bins
 using ...SparseTensors
 using ...FastPowers: fast_i_pow, fast_neg1_pow
 using ...SparseTensors: SparseWTensor, SparseGauntArray, lm_key
-using ...ThreadChunks: chunk_count, chunk_range
+using ...ThreadChunks: chunk_count
 
 export construct_R_tensor
 
@@ -371,6 +371,25 @@ function construct_R_tensor(
     jL_miller_pool = [Vector{Float64}(undef, L_max + 1) for _ in 1:max_tasks]
     Y_cache_pool = [SphericalHarmonics.cache(L_max, SphericalHarmonics.FullRange) for _ in 1:max_tasks]
 
+    # The radial part of every term is gaussian(q) q^n j_L(qR), which depends on nothing but (n, L).
+    # Terms sharing an (ℓ, m, n, L) therefore have the same radial factor, and there are about two
+    # and a half times as many terms as there are distinct ones, so their angular factors are summed
+    # here first and the q loop is run once for each. The mark says which entries a pair has
+    # written, so the next pair can start from zero without clearing the whole table.
+    n_groups = n_keys_pos * (n_max + 1) * (L_max + 1)
+    group_sum_pool = [Vector{Complex{T}}(undef, n_groups) for _ in 1:max_tasks]
+    group_mark_pool = [zeros(Bool, n_groups) for _ in 1:max_tasks]
+    group_list_pool = [Vector{Int}(undef, n_groups) for _ in 1:max_tasks]
+
+    # The radial factor itself, gaussian(q) q^n j_L(qR), held one column per (n, L) and built the
+    # first time a pair asks for that column. Reading it costs one contiguous pass over q, where
+    # computing it in place needs three, two of them strided across the q grid. Its own mark and
+    # list work the same way as the groups above.
+    n_radial = (n_max + 1) * (L_max + 1)
+    radial_pool = [Array{T, 3}(undef, n_q, n_max + 1, L_max + 1) for _ in 1:max_tasks]
+    radial_mark_pool = [zeros(Bool, n_radial) for _ in 1:max_tasks]
+    radial_list_pool = [Vector{Int}(undef, n_radial) for _ in 1:max_tasks]
+
     # BLAS combines the density weights with the real and imaginary parts of S separately. This lets
     # the real density matrices use real GEMMs.
     R_pos_real = zeros(T, n_densities, n_outputs)
@@ -390,7 +409,12 @@ function construct_R_tensor(
         fill!(imag_block, zero(T))
 
         # Thread over the (i, j) pairs in this block. Each pair writes to its own column of S.
+        # The pairs are handed out one at a time from a shared counter rather than split up front,
+        # because what a pair costs depends on how many W entries survived in its bin, and that
+        # ranges from a few hundred terms to a few tens of thousands. A fixed split would leave
+        # every thread waiting on whichever one drew the heaviest pairs.
         n_tasks = chunk_count(n_block, nthreads())
+        next_pair = Threads.Atomic{Int}(1)
         @sync for task_idx in 1:n_tasks
             Threads.@spawn begin
                 # Get this task's buffers.
@@ -398,8 +422,18 @@ function construct_R_tensor(
                 jL = jL_pool[task_idx]
                 jL_miller = jL_miller_pool[task_idx]
                 Ylm_cache = Y_cache_pool[task_idx]
+                group_sum = group_sum_pool[task_idx]
+                group_mark = group_mark_pool[task_idx]
+                group_list = group_list_pool[task_idx]
+                radial_table = radial_pool[task_idx]
+                radial_mark = radial_mark_pool[task_idx]
+                radial_list = radial_list_pool[task_idx]
 
-                for pair_in_block in chunk_range(task_idx, n_tasks, n_block)
+                while true
+                    # Take the next pair nobody has claimed, and stop once they are all gone.
+                    pair_in_block = Threads.atomic_add!(next_pair, 1)
+                    pair_in_block > n_block && break
+
                     # Convert the position in this block to the full pair list, then recover (i, j).
                     global_pair_idx = pair_start + pair_in_block - 1
                     i = pair_i[global_pair_idx]
@@ -425,7 +459,9 @@ function construct_R_tensor(
                                                       q_grid_invA[q_idx] * R_mod, L_max)
                     end
 
-                    # Loop over all non-zero W entries belonging to this Cartesian pair.
+                    # Loop over all non-zero W entries belonging to this Cartesian pair, summing the
+                    # angular factors of the terms that share a radial (q) factor.
+                    n_listed = 0
                     @inbounds for W_idx in ij_bin
                         # Extract the W indices and value, then find the matching Gaunt bin.
                         lambda = W_tensor.lambda[W_idx]
@@ -448,22 +484,66 @@ function construct_R_tensor(
                             M = m - mu
                             angular = W_val * gaunt_coeffs[gaunt_idx] *
                                       conj(Complex{T}(Yvals[(L, M)])) * i_powers[L + 1]
-                            angular_real = real(angular)
-                            angular_imag = imag(angular)
 
-                            # Combine the triangular (ℓ,m) key and q index into one index so that one
-                            # Cartesian pair occupies one contiguous column.
+                            # Combine the triangular (ℓ,m) key with n and L into one index.
                             key_pos = (l * (l + 1)) ÷ 2 + m + 1
-                            output_base = (key_pos - 1) * n_q
-
-                            # Accumulate this q-dependent contribution to S_{ℓm,ij}(q).
-                            @simd for q_idx in 1:n_q
-                                radial = gaussian[q_idx] * q_powers[n_idx, q_idx] * jL[L + 1, q_idx]
-                                output_idx = output_base + q_idx
-                                real_block[output_idx, pair_in_block] += angular_real * radial
-                                imag_block[output_idx, pair_in_block] += angular_imag * radial
+                            group = ((key_pos - 1) * (n_max + 1) + n_idx - 1) * (L_max + 1) + L + 1
+                            if group_mark[group]
+                                group_sum[group] += angular
+                            else
+                                group_mark[group] = true
+                                group_sum[group] = angular
+                                n_listed += 1
+                                group_list[n_listed] = group
                             end
                         end
+                    end
+
+                    # Now one q loop per distinct radial factor, clearing each mark on the way so
+                    # the next pair sees an empty table.
+                    n_built = 0
+                    @inbounds for listed in 1:n_listed
+                        group = group_list[listed]
+                        angular = group_sum[group]
+                        group_mark[group] = false
+                        angular_real = real(angular)
+                        angular_imag = imag(angular)
+
+                        # Unpack the group key into L, (l,m) key, and n.
+                        L = (group - 1) % (L_max + 1)
+                        key_and_n = (group - 1) ÷ (L_max + 1)
+                        n_idx = key_and_n % (n_max + 1) + 1
+                        key_pos = key_and_n ÷ (n_max + 1) + 1
+
+                        # Build this (n, L) column of the radial factor if it is the first group to
+                        # ask for it. Several keys share one column, so most pairs reuse it.
+                        column = L * (n_max + 1) + n_idx
+                        if !radial_mark[column]
+                            radial_mark[column] = true
+                            n_built += 1
+                            radial_list[n_built] = column
+                            @simd for q_idx in 1:n_q
+                                radial_table[q_idx, n_idx, L + 1] =
+                                    gaussian[q_idx] * q_powers[n_idx, q_idx] * jL[L + 1, q_idx]
+                            end
+                        end
+                        radial_column = view(radial_table, :, n_idx, L + 1)
+
+                        # One Cartesian pair occupies one contiguous column of S.
+                        output_base = (key_pos - 1) * n_q
+
+                        # Accumulate this q-dependent contribution to S_{ℓm,ij}(q).
+                        @simd for q_idx in 1:n_q
+                            radial = radial_column[q_idx]
+                            output_idx = output_base + q_idx
+                            real_block[output_idx, pair_in_block] += angular_real * radial
+                            imag_block[output_idx, pair_in_block] += angular_imag * radial
+                        end
+                    end
+
+                    # The next pair has its own geometry, so none of these columns carry over.
+                    @inbounds for built in 1:n_built
+                        radial_mark[radial_list[built]] = false
                     end
                 end
             end
