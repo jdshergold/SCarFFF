@@ -67,16 +67,21 @@ def calculation_signature(job, system, stage, directory):
     # Returns:
     - str: The calculation signature.
     """
-    # TD-DFT depends on the molecule and the level of theory. For a crystal the CIF contents go in
-    # too, so editing the structure invalidates the old result.
+    precision = job['execution']['precision']
+
+    # TD-DFT depends on the molecule and the level of theory. A crystal is identified by its CIF
+    # contents rather than the file it was read from, so editing the structure invalidates the old
+    # result but moving the file does not. A molecule is identified by its SMILES.
     if stage == 'tddft':
-        parameters = {'input': system['input'], 'nstates': job['nstates'],
-                      'tddft': job['tddft'], 'execution': job['execution']}
+        parameters = {'nstates': job['nstates'], 'tddft': job['tddft'], 'precision': precision}
         if job['mode'] == 'crystal':
             parameters['cif_contents'] = content_hash(system['input'])
+        else:
+            parameters['input'] = system['input']
     # The form factors depend on the grids and the TD-DFT they were built from.
     else:
-        parameters = {key: job[key] for key in ['mode', 'transitions', 'execution', 'verification']}
+        parameters = {key: job[key] for key in ['mode', 'transitions', 'verification']}
+        parameters['precision'] = precision
         for section in ['spherical', 'fourier', 'cartesian', 'crystal']:
             if section in job:
                 parameters[section] = job[section]
