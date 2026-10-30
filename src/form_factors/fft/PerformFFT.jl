@@ -154,8 +154,8 @@ function check_parseval_theorem(
     x_problem = SampledIntegralProblem(momentum_x, Float64.(qxs); dim=1)
     momentum_integral = solve(x_problem, SimpsonsRule()).u
 
-    println("Real space integral: ", rho_integral)
-    println("Momentum space integral/(2π)^3: ", momentum_integral / ((2π)^3))
+    println("  Parseval check: ∫d³r |ρ|² = ", rho_integral,
+            "; ∫d³q |f|²/(2π)³ = ", momentum_integral / ((2π)^3))
 
     return nothing
 end

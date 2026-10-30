@@ -2,6 +2,8 @@
 
 using SCarFFF
 using HDF5, JSON, CUDA
+using SCarFFF.StageTimings: print_heading, elapsed_time
+using Printf
 
 const SF = SCarFFF.SphericalFormFactor
 include("Results.jl")
@@ -62,7 +64,8 @@ function verify_molecular_result(path, td_path, q_max_fit)
 
             # f_osc = 2 m_e dE |mu|^2, with the 0.001 taking dE from eV to keV.
             fitted = 2 * ELECTRON_MASS_KEV * read(state, "Delta_E") * 0.001 * moment
-            println("Transition $name: fitted oscillator strength $fitted; TD-DFT $(reference[parse(Int, name)]).")
+            @printf("  Oscillator strength · transition %s: fitted %.6g; TD-DFT %.6g\n",
+                    name, fitted, reference[parse(Int, name)])
         end
     end
 end
@@ -75,6 +78,9 @@ function compute_molecule(job, system)
     - job::Dict: The resolved job settings.
     - system::Dict: The numbered molecule and calculation signature.
     """
+    started = time_ns()
+    system_index = findfirst(entry -> entry["number"] == system["number"], job["systems"])
+    print_heading("FORM FACTORS", system["label"], system_index, length(job["systems"]))
     # Unpack the job settings.
     T = job["execution"]["precision"] == "float32" ? Float32 : Float64
     use_gpu = job["execution"]["gpu"]
@@ -90,6 +96,9 @@ function compute_molecule(job, system)
     if mode == "spherical"
         settings = job["spherical"]
         q, theta, phi = spherical_grid(settings, T)
+        println("  $(length(indices)) transitions · ℓ_max = $(settings["l_max"])")
+        println("  q: $(first(q))–$(last(q)) keV, (n_q, n_θ, n_φ) = " *
+                "($(length(q)), $(length(theta)), $(length(phi)))")
         save = settings["save"]
         R_tensor, f_s, f_sq_lm, energies = compute_spherical_form_factor(
             q, theta, phi, settings["l_max"], td_path;
@@ -141,6 +150,8 @@ function compute_molecule(job, system)
     write_results(path, mode, system["form_factor_signature"], grid, indices, energies;
                   f_s=f_s, f_sq_lm=f_sq_lm, R_tensor=R_tensor, transition_density=density,
                   V_tensors=V, check_result=check_result)
+    println("  Form factors, checks and save: $(elapsed_time((time_ns() - started) / 1e9))")
+    println("  Saved: $(relpath(path, job["output"]))")
 end
 
 function run_form_factors(job)

@@ -123,7 +123,7 @@ function precompute_gaunt_coefficients(l1_max::Int, l2_max::Int, l3_max::Int, ou
     end
 
     # Print the number of non-zero Gaunt coefficients computed.
-    println("Number of non-zero Gaunt coefficients: ", length(gaunt_coefficients))
+    println("  Gaunt coefficients: ", length(gaunt_coefficients), " nonzero entries")
 
     # Convert the coefficients to the target type.
     gaunt_coefficients_typed = T.(gaunt_coefficients)
@@ -164,6 +164,6 @@ function precompute_gaunt_coefficients(l1_max::Int, l2_max::Int, l3_max::Int, ou
         write(io, "l2_max", l2_max)
         write(io, "l3_max", l3_max)
     end
-    return println("Gaunt coefficients saved to: ", output_path)
+    return println("  Saved Gaunt coefficients: ", output_path)
 end
 end

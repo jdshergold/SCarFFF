@@ -325,7 +325,7 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
     end
 
     # Print the number of non-zero A tensor coefficients computed.
-    println("Number of non-zero A tensor coefficients: ", length(A_values))
+    println("  A tensor: ", length(A_values), " nonzero entries")
 
     # Convert the coefficients to the target type.
     A_values_typed = Complex{T}.(A_values)
@@ -368,6 +368,6 @@ function precompute_A_tensor(n_max::Int, output_path::String, ::Type{T} = Float6
         write(io, "n_max", n_max)
     end
 
-    return println("A tensor saved to: ", output_path)
+    return println("  Saved A tensor: ", output_path)
 end
 end

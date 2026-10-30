@@ -30,7 +30,8 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
 using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
 using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
 using SCarFFF.SphericalFormFactor.BlochHamiltonian: BlochEigensystem, solve_bloch_energies!
-using SCarFFF.StageTimings: print_stage_timings
+using SCarFFF.StageTimings: print_stage_timings, print_heading, summarise_timings
+using Printf
 
 
 
@@ -69,11 +70,11 @@ function manifold_spreads(uncoupled::Vector{T}, coupled::Vector{T}) where {T<:Ab
     return spreads
 end
 
-function print_gamma_point_shifts(
+function gamma_point_energies(
         basis, lattice, couplings, long_range, ::Type{T},
     ) where {T<:AbstractFloat}
     """
-    Print the crystal states at Γ beside the monomer energies they came from.
+    Get the crystal states at Γ beside the monomer energies they came from.
 
     With no couplings H is diag(E), so its spectrum is just the monomer energies repeated once per
     molecule in the cell. Turning J and D on and solving at k = 0 gives the crystal spectrum. Both
@@ -87,7 +88,7 @@ function print_gamma_point_shifts(
     - T::Type: The floating point type.
 
     # Returns:
-    - Nothing. The table is printed.
+    - Tuple: The uncoupled and coupled energies, ascending, in eV.
     """
 
     # Get the crystal spectrum at the Gamma point.
@@ -100,28 +101,38 @@ function print_gamma_point_shifts(
     uncoupled = sort(basis.Delta_E_monomer)
     coupled = eigensystem.Delta_E
 
-    # Fixed-width columns, with a rule between manifolds so the Davydov blocks are visible.
-    cell(x) = lpad(string(round(x, digits = 4)), 15)
-    rule = "  " * "\u2500"^7 * "\u253c" * "\u2500"^16 * "\u253c" * "\u2500"^16 * "\u253c" * "\u2500"^16
+    return uncoupled, coupled
+end
 
-    println("\nCrystal states at \u0393 (k = 0)")
-    println("  " * rpad("state", 7) * "\u2502" * lpad("no coupling", 16) * "\u2502" *
-            lpad("with coupling", 16) * "\u2502" * lpad("\u0394", 16))
-    println("  " * rpad("", 7) * "\u2502" * lpad("[eV]", 16) * "\u2502" *
-            lpad("[eV]", 16) * "\u2502" * lpad("[eV]", 16))
-    println(rule)
-    for state in 1:n_lambda_i
-        if state > 1 && !isapprox(uncoupled[state], uncoupled[state - 1]; rtol = 1e-8)
-            println(rule)
+
+function print_gamma_point_shifts(uncoupled, coupled)
+    """
+    Print one row per Γ-point multiplet.
+
+    # Arguments:
+    - uncoupled::Vector: The sorted monomer energies, in eV.
+    - coupled::Vector: The sorted crystal energies at Γ, in eV.
+    """
+
+    # Fixed-width columns, with a rule between manifolds so the Davydov blocks are visible.
+    println("\n  Γ-point splitting")
+    println("  ", "-"^65)
+    println("  States   Monomer [eV]   Crystal range [eV]    Splitting [meV]")
+    start = 1
+    for state in 2:(length(uncoupled) + 1)
+        if state > length(uncoupled) || !isapprox(uncoupled[state], uncoupled[start]; rtol = 1e-8)
+            block = @view coupled[start:(state - 1)]
+            states = start == state - 1 ? string(start) : "$(start)–$(state - 1)"
+            @printf("  %6s   %12.4f   %8.4f–%-8.4f   %15.1f\n",
+                    states, uncoupled[start], minimum(block), maximum(block),
+                    1000 * (maximum(block) - minimum(block)))
+            start = state
         end
-        println("  " * rpad(state, 7) * "\u2502" * cell(uncoupled[state]) * " \u2502" *
-                cell(coupled[state]) * " \u2502" * cell(coupled[state] - uncoupled[state]) * " ")
     end
-    println(rule)
 
     spreads = manifold_spreads(uncoupled, coupled)
-    println("  largest shift " * string(round(maximum(abs, coupled .- uncoupled), digits = 4)) *
-            " eV, largest Davydov splitting " * string(round(maximum(spreads), digits = 4)) * " eV")
+    @printf("\n  Largest |energy shift|: %.1f meV\n", 1000 * maximum(abs, coupled .- uncoupled))
+    @printf("  Largest Davydov splitting: %.1f meV\n", 1000 * maximum(spreads))
 
     return nothing
 end
@@ -254,14 +265,11 @@ function run_crystals(job)
     failures = String[]
 
     # Process each molecule or crystal.
-    for entry in entries
+    for (entry_index, entry) in enumerate(entries)
         mol_num = entry.number
         mol_output_dir = joinpath(run_directory, string(mol_num))
 
-        println("="^50)
-        println("Computing form factor for $(entry.kind) $mol_num of $(length(entries)), with label $(entry.display_name).")
-        println("="^50)
-        println()
+        print_heading("FORM FACTORS", entry.display_name, entry_index, length(entries))
 
         # Check if the TD-DFT calculation failed for this molecule or crystal.
         failed_marker = joinpath(mol_output_dir, ".tddft_failed")
@@ -333,9 +341,7 @@ function run_crystals(job)
                 widened_N_phi = choose_compatible_phi_count(
                     N_theta, N_phi, derive_symmetry_operations(grid_images, grid_lattice))
                 if widened_N_phi != N_phi
-                    println("Widening N_phi from $(N_phi) to $(widened_N_phi) so the crystal symmetry " *
-                            "operations land on grid nodes, which buys back diagonalisations for " *
-                            "$(round(100 * (widened_N_phi / N_phi - 1), digits = 1))% more grid points.")
+                    println("  Angular grid: n_φ increased from $(N_phi) to $(widened_N_phi) for crystal symmetry.")
                     N_phi = widened_N_phi
                 end
             end
@@ -359,24 +365,26 @@ function run_crystals(job)
                 transition_index = transition_indices[1]
                 transition_suffix = ordinal_suffix(transition_index)
 
-                if length(transition_indices) == 1
-                    println("Computing the spherical crystal form factor for the $(transition_index)$(transition_suffix) transition of $(entry.display_name) up to maximum angular mode l = $(l_max).")
-                else
-                    println("Computing the spherical crystal form factor for $(length(transition_indices)) transitions of $(entry.display_name) up to maximum angular mode l = $(l_max).")
-                    println("Transition indices: $(transition_indices)")
-                end
-                println("Grid: q ∈ [0, $(q_max)] keV with $(N_q) points,")
-                println("      θ ∈ [0, π] with $(N_theta) points,")
-                println("      φ ∈ [0, 2π] with $(N_phi) points.")
+                println("  $(length(conformer_labels)) conformer(s) · $(length(transition_indices)) transitions · ℓ_max = $(l_max)")
+                println("  q: 0–$(q_max) keV, (n_q, n_θ, n_φ) = ($(N_q), $(N_theta), $(N_phi))")
+                selected_transitions == collect(1:job["nstates"]) ||
+                    println("  Transition indices: $(transition_indices)")
 
                 # Create a results dict for each conformer group.
                 conformer_results = Dict{String, Any}()
+                monomer_times = Vector{Pair{String, Float64}}[]
+                monomer_totals = Float64[]
+                dipole_errors = Pair{String, Float64}[]
 
                 # Only the Ewald split has a Q = 0 term, so only it needs the dipole at q_bc.
                 need_q_bc = crystal_order == "coherent" && !no_couplings && coupling_method == "ewald"
 
                 # Compute the spherical form factor for each conformer group.
                 for conformer_label in conformer_labels
+                    monomer_started = time_ns()
+                    molecular_times = Pair{String, Float64}[]
+                    println("  Computing spherical monomer form factors: conformer $(conformer_label)...")
+                    flush(stdout)
                     td_h5 = joinpath(mol_output_dir, "conformers", conformer_label, "td_dft_results$(type_suffix).h5")
                     if !isfile(td_h5)
                         error("No conformer TD-DFT results found at $(td_h5).")
@@ -401,7 +409,8 @@ function run_crystals(job)
                                 need_grid=need_grid,
                                 need_R=need_R,
                                 need_f_sq_lm=true,
-                                need_short_range=need_q_bc
+                                need_short_range=need_q_bc,
+                                timings=molecular_times
                             )
                     else
                         R_tensor, f_s, f_sq_lm, Delta_E_eV = compute_spherical_form_factor(
@@ -416,7 +425,8 @@ function run_crystals(job)
                             use_gpu=use_gpu,
                             need_grid=need_grid,
                             need_R=need_R,
-                            need_f_sq_lm=true
+                            need_f_sq_lm=true,
+                            timings=molecular_times
                         )
                     end
 
@@ -425,6 +435,8 @@ function run_crystals(job)
                     Delta_bc = nothing
                     Xi_bc = nothing
                     if need_q_bc
+                        dipole_started = time_ns()
+                        dipole_times = Pair{String, Float64}[]
                         # We have to include the q = 0 point since there's a check for neutrality at the origin.
                         R_both, _, _, _, Delta_and_Xi_bc =
                             compute_spherical_form_factor_with_densities(
@@ -439,7 +451,8 @@ function run_crystals(job)
                                 use_gpu=use_gpu,
                                 need_grid=false,
                                 need_R=true,
-                                need_f_sq_lm=false
+                                need_f_sq_lm=false,
+                                timings=dipole_times
                             )
                         R_bc = R_both[:, 2:2, :]
                         Delta_bc = Delta_and_Xi_bc.Delta_R[:, 2:2, :]
@@ -453,8 +466,8 @@ function run_crystals(job)
                         dipole_error = check_dipole_against_oscillator_strength(
                             R_bc, T(q_bc * KEV_TO_INV_ANGSTROM),
                             T.(Delta_E_eV), f_osc, l_max)
-                        println("Conformer $(conformer_label): the dipole at q_bc = $(q_bc) keV matches " *
-                                "the oscillator strength to $(round(dipole_error * 100, digits = 4))%.")
+                        push!(molecular_times, "Ewald dipoles" => (time_ns() - dipole_started) / 1e9)
+                        push!(dipole_errors, conformer_label => Float64(dipole_error))
                     end
 
                     if job["verification"]["oscillator_strength"]
@@ -465,7 +478,8 @@ function run_crystals(job)
                             mean = perform_angular_average(abs2.(f_s[i, 1:n_fit, :, :]), theta_grid, phi_grid)
                             moment = compute_transition_dipole_moment(mean, q_grid[1:n_fit])
                             fitted = 2 * ELECTRON_MASS_KEV * Delta_E_eV[i] * 0.001 * moment
-                            println("Conformer $conformer_label, transition $s: fitted oscillator strength $fitted; TD-DFT $(reference[s]).")
+                            @printf("  Oscillator strength · conformer %s, transition %d: fitted %.6g; TD-DFT %.6g\n",
+                                    conformer_label, s, fitted, reference[s])
                         end
                     end
 
@@ -507,7 +521,27 @@ function run_crystals(job)
                             write_quantity(io, "Delta_E_eV", transition_energy, "eV")
                         end
                     end
+                    push!(monomer_times, summarise_timings(molecular_times, [
+                        "Molecular data and coefficients" => ("read molecular data", "pair coefficients", "b coefficients"),
+                        "Angular tensors" => ("precompute angular tensors",),
+                        "D and W tensors" => ("D tensor", "W tensor"),
+                        "R tensors" => ("R tensors (transition, Δ, Ξ)", "R tensor", "R tensor (GPU)",
+                                        "copy and combine R tensor"),
+                        "Form factors on angular grid" => ("spherical grid", "spherical grid (GPU)",
+                                                           "copy form factor to CPU"),
+                        "|f|² harmonic coefficients" => ("f_sq_lm tensor",),
+                        "Short-range envelope" => ("SR Gaussian envelope",),
+                        "Ewald dipoles" => ("Ewald dipoles",),
+                    ]))
+                    push!(monomer_totals, (time_ns() - monomer_started) / 1e9)
                 end
+                print_stage_timings("Spherical monomer form factors", monomer_times,
+                                    ["Conformer $(label)" for label in conformer_labels]; totals = monomer_totals)
+
+                crystal_started = time_ns()
+                crystal_times = Pair{String, Float64}[]
+                gamma_energies = nothing
+                sum_rule_residual = nothing
 
                 #Run the crystal computation. Coherent solves the Frenkel exciton Bloch problem and mixes them before
                 # squaring, incoherent adds them in intensity with no phases and no mixing.
@@ -524,11 +558,8 @@ function run_crystals(job)
                     images, dominant_group, dominant_occupancy =
                         build_dominant_group_images(crystal_metadata, conformer_labels, T)
 
-                    if crystal_order == "coherent"
-                        println("Solving the Frenkel exciton Bloch problem for disorder group $(dominant_group) ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
-                    else
-                        println("Adding the images of disorder group $(dominant_group) in intensity ($(length(images)) molecules, occupancy $(dominant_occupancy)).")
-                    end
+                    println("\n  $(titlecase(crystal_order)) crystal · $(length(images)) molecules · " *
+                            "disorder group $(dominant_group), occupancy $(dominant_occupancy)")
 
                     # Get the R tensors for each conformer.
                     conformer_R_tensors = [conformer_results[label].R_tensor for label in conformer_labels]
@@ -578,6 +609,9 @@ function run_crystals(job)
                     q_bc_invA = T(q_bc * KEV_TO_INV_ANGSTROM)
 
                 if crystal_order != "coherent"
+                    push!(crystal_times, "Crystal geometry" => (time_ns() - crystal_started) / 1e9)
+                    println("  Computing incoherent crystal form factors...")
+                    flush(stdout)
                     # Nothing here depends on k, so there is no Bloch problem to solve: no couplings,
                     # no Ewald sum, no symmetry stars and no diagonalisation.
                     incoherent_timing = @timed compute_incoherent_unit_cell_f_sq_lm(
@@ -585,12 +619,14 @@ function run_crystals(job)
                         need_grid = need_grid)
                     crystal_state_f_sq_lm, I_uc = incoherent_timing.value
                     push!(stage_times, "incoherent f_sq_lm" => incoherent_timing.time)
+                    push!(crystal_times, "Incoherent crystal form factors" => incoherent_timing.time)
 
                     # Build the energy axis and spread the f_sq_lm coefficients over it.
                     # We use the raw monomer energies here for the energy grid, since there are no bands.
                     crystal_S_lm = nothing
                     crystal_energy_grid = nothing
                     if need_structure_factor
+                        energy_grid_started = time_ns()
                         # basis.Delta_E_monomer is indexed by λ_i, and the first n_trans entries are just the energies for one molecule.
                         transition_energies = basis.Delta_E_monomer[1:basis.n_transitions]
                         crystal_energy_grid = build_energy_grid(
@@ -602,11 +638,10 @@ function run_crystals(job)
                         # The 2π/V_cell that makes this the structure function rather than the bare sum.
                         apply_structure_function_prefactor!(crystal_S_lm, lattice.V_cell)
                         push!(stage_times, "structure function f_sq_lm(q, E)" => structure_timing.time)
+                        push!(crystal_times, "Structure function" => (time_ns() - energy_grid_started) / 1e9)
                     end
 
-                    print_stage_timings("Crystal stage timings", stage_times)
-                    crystal_energy_grid === nothing ||
-                        println("\n" * describe_energy_grid(crystal_energy_grid))
+                    checks_started = time_ns()
 
                     crystal_results = (
                         order = "incoherent",
@@ -638,11 +673,10 @@ function run_crystals(job)
                     end
                     stars = symmetry_timing.value
                     push!(stage_times, "symmetry stars" => symmetry_timing.time)
-                    println("Symmetry: $(length(stars.operations)) usable operations, " *
-                            "$(length(stars.irreducible_directions)) stars over " *
-                            "$(length(theta_grid) * length(phi_grid)) directions, " *
-                            "$(round(star_reduction_factor(stars, length(theta_grid), length(phi_grid)), digits = 2))x " *
-                            "fewer diagonalisations.")
+                    println("  Symmetry: $(length(stars.operations)) operations · " *
+                            "$(length(theta_grid) * length(phi_grid)) directions → " *
+                            "$(length(stars.irreducible_directions)) stars")
+                    push!(crystal_times, "Crystal geometry and symmetry" => (time_ns() - crystal_started) / 1e9)
 
                     # Print a warning about even ϕ grids losing symmetry speedup.
                     iseven(length(phi_grid)) && println(
@@ -651,6 +685,7 @@ function run_crystals(job)
                         "(the default is 4 * l_max + 1) would recover them at no cost in accuracy.")
 
                     # Build the intermolecular couplings, unless they have been switched off.
+                    coupling_started = time_ns()
                     crystal_couplings = nothing
                     J_parameters = nothing
                     D_parameters = nothing
@@ -694,7 +729,7 @@ function run_crystals(job)
                         end
 
                         if J_parameters === nothing
-                            println("Computing intermolecular corrections directly out to $(coupling_cutoff) Å ($(length(cells.Delta_R)) cells).")
+                            println("  Direct couplings: R_max = $(coupling_cutoff) Å · $(length(cells.Delta_R)) cells")
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
                                 basis, cells, q_grid_invA, l_max, coupling_gaunt_path)
@@ -713,18 +748,15 @@ function run_crystals(job)
 
                             # Print a summary of both Ewald splits, against the 3x3x3 supercell as a
                             # familiar length to read the real-space cutoffs against.
-                            println("Ewald split at ε_tot = $(epsilon_tot), one per coupling " *
-                                    "($(length(cells.Delta_R)) cells searched, padded by the cell span, " *
-                                    "3x3x3 supercell radius $(round(supercell_radius(lattice), digits = 2)) Å):")
+                            @printf("\n  Ewald split · δ_tot = %.1e\n", epsilon_tot)
+                            println("  ", "-"^54)
+                            println("              η [Å⁻¹]    R_max [Å]    G_max [Å⁻¹]")
                             for (name, split) in (("J", J_parameters), ("D", D_parameters))
                                 expected_G = lattice.V_cell * split.G_max^3 / (6 * π^2)
-                                println("  $(name): η = $(round(split.eta, digits = 4)) Å^-1, " *
-                                        "R_max = $(round(split.R_max, digits = 2)) Å, " *
-                                        "G_max = $(round(split.G_max, digits = 4)) Å^-1 " *
-                                        "(N_G ≈ $(round(Int, expected_G))).")
+                                @printf("  %-4s %13.4f %12.2f %15.4f\n", name, split.eta, split.R_max, split.G_max)
                             end
-                            println("  J long-range table: $(length(crystal_long_range.G_vectors)) " *
-                                    "candidate G, ℓ ceiling $(crystal_long_range.l_max_lr) of $(l_max).")
+                            println("  Computing crystal couplings...")
+                            flush(stdout)
 
                             correction_timing = @timed compute_crystal_corrections(
                                 rotated_R, rotated_Delta, rotated_Xi,
@@ -750,9 +782,6 @@ function run_crystals(job)
                                 q_grid, sr_data, basis, cells, J_parameters, D_parameters,
                                 D_scale, J_scale)
                             missing_points = count(iszero, saved_indices)
-                            println("SR radial grid: $(length(q_sr)) points through $(round(q_sr[end], digits = 2)) keV, " *
-                                    "Δq = $(round(q_sr[2] - q_sr[1], digits = 5)) keV, " *
-                                    "$(missing_points) new FF samples per conformer (estimated ε = $(epsilon_tot)).")
                             # If the original grid suffices, keep the SR J and D already computed above.
                             if q_sr != q_grid
                                 sr_timing = @timed begin
@@ -780,6 +809,7 @@ function run_crystals(job)
                             push!(stage_times, "Ewald long-range D" => D_long_range_timing.time)
                         end
                     end
+                    no_couplings || push!(crystal_times, "Coupling preparation" => (time_ns() - coupling_started) / 1e9)
 
                     # Build the energy grid by sampling the bands. We don't do all k points or stars as this is
                     # too expensive, but instead stride over them, and then buffer a bit. In practice, this is
@@ -787,6 +817,7 @@ function run_crystals(job)
                     # are skipped in calculation, and trimmed.
                     crystal_energy_grid = nothing
                     if need_structure_factor
+                        energy_grid_started = time_ns()
                         range_timing = @timed band_energy_range(
                             basis, lattice, q_grid_invA, stars, crystal_couplings,
                             crystal_long_range; star_stride = band_range_star_stride,
@@ -795,16 +826,15 @@ function run_crystals(job)
                         crystal_energy_grid = build_energy_grid(
                             energy_low - energy_margin, energy_high + energy_margin, T(energy_step))
                         push!(stage_times, "band energy range" => range_timing.time)
-                        println("\nSampled band range $(round(energy_low, digits = 4)) to " *
-                                "$(round(energy_high, digits = 4)) eV from every " *
-                                "$(band_range_star_stride) star and every " *
-                                "$(band_range_q_stride) q, widened by " *
-                                "$(round(1000 * energy_margin, digits = 1)) meV each side.")
+                        push!(crystal_times, "Energy grid" => (time_ns() - energy_grid_started) / 1e9)
                     end
 
                     # This streams over q internally, projecting each block onto real spherical
                     # spherical harmonics as it goes, so the full |f|^2 grid is never held in memory. Overwritten
                     # need grid is specfied.
+                    println("  Computing Bloch states and crystal form factors...")
+                    flush(stdout)
+                    form_factor_started = time_ns()
                     coherent_timing = @timed compute_coherent_unit_cell_f_sq_lm(
                         rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max,
                         stars;
@@ -821,11 +851,9 @@ function run_crystals(job)
                         crystal_S_lm, crystal_energy_grid =
                             trim_energy_axis(crystal_S_lm, crystal_energy_grid)
                         trimmed_points = built_points - length(crystal_energy_grid.E)
-                        trimmed_points == 0 ||
-                            println("  Trimmed $(trimmed_points) empty bins of $(built_points) " *
-                                    "off the ends of the energy axis.")
                     end
                     push!(stage_times, "coherent f_sq_lm (H(k), diagonalise, project)" => coherent_timing.time)
+                    push!(crystal_times, "Bloch solve and form factors" => (time_ns() - form_factor_started) / 1e9)
 
                     # The same molecules added up without any mixing, which is what the crystal
                     # states must sum back to. Cheap, because contracting in lm space needs no grid.
@@ -836,17 +864,17 @@ function run_crystals(job)
                             need_grid = false)
                         crystal_incoherent_f_sq_lm = reference_timing.value[1]
                         push!(stage_times, "incoherent reference f_sq_lm" => reference_timing.time)
+                        push!(crystal_times, "Incoherent reference" => reference_timing.time)
                     end
 
-                    print_stage_timings("Crystal stage timings", stage_times)
+                    checks_started = time_ns()
 
                     # Show what the crystal did to the monomer energies, at least at the gamma point.
-                    print_gamma_point_shifts(
+                    gamma_energies = gamma_point_energies(
                         basis, lattice, crystal_couplings, crystal_long_range, T)
 
                     # Check that ∫dE S_lm = (2π/V_cell) Σ_n f²_{n,uc;lm}, with no averaging.
                     if crystal_energy_grid !== nothing
-                        println("\n" * describe_energy_grid(crystal_energy_grid))
 
                         # Make sure that no point fell outside the energy axis.
                         crystal_outside_grid == 0 ||
@@ -857,10 +885,8 @@ function run_crystals(job)
                         summed = dropdims(sum(crystal_state_f_sq_lm, dims = 1), dims = 1) .*
                                  (T(2 * π) / lattice.V_cell)
                         residual = maximum(abs, integrated .- summed) / maximum(abs, summed)
-                        println("  sum rule, ∫dE S_lm(q, E) against (2π/V_cell) Σ_n f²_lm(q): " *
-                                string(round(residual, sigdigits = 3)) * " relative.")
+                        sum_rule_residual = residual
                     end
-                    println()
 
                     crystal_results = (
                         order = "coherent",
@@ -1001,7 +1027,24 @@ function run_crystals(job)
                         write_quantity(io, "q_grid", q_grid, "keV") # keV.
                     end
 
-                    println("$(titlecase(crystal_results.order)) crystal form factor saved to $(coherent_path).")
+                    push!(crystal_times, "Checks and save" => (time_ns() - checks_started) / 1e9)
+                    print_stage_timings("Crystal calculation", crystal_times;
+                                        total = (time_ns() - crystal_started) / 1e9)
+                    if gamma_energies !== nothing
+                        print_gamma_point_shifts(gamma_energies...)
+                    end
+                    if crystal_results.energy_grid !== nothing
+                        energy_grid = crystal_results.energy_grid
+                        @printf("  Energy grid: %d points · %.4f–%.4f eV · ΔE = %.1f meV\n",
+                                length(energy_grid.E), first(energy_grid.E), last(energy_grid.E),
+                                1000 * energy_step)
+                    end
+                    checks = [@sprintf("dipole error (%s) %.4f%%", label, 100 * error)
+                              for (label, error) in dipole_errors]
+                    sum_rule_residual === nothing ||
+                        push!(checks, @sprintf("sum rule residual %.3g", sum_rule_residual))
+                    isempty(checks) || println("  Checks: ", join(checks, " · "))
+                    println("\n  Saved: $(relpath(coherent_path, run_directory))")
                 end
 
             end

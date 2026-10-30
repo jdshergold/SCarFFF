@@ -141,6 +141,7 @@ function _compute_spherical_form_factor(
         need_f_sq_lm::Bool = true,
         need_Delta_and_Xi::Bool = false,
         need_short_range::Bool = false,
+        timings::Union{Nothing, Vector{Pair{String, Float64}}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Compute the spherical form factor f_s(q, θ, ϕ) on a spherical grid up to some angular mode ℓ_max.
@@ -160,6 +161,7 @@ function _compute_spherical_form_factor(
     - need_f_sq_lm::Bool: Whether to compute the f_sq_lm tensor (default: true).
     - need_Delta_and_Xi::Bool: Whether to also construct Δ and Ξ for the crystal correction.
     - need_short_range::Bool: Whether to retain W, the pair geometry and density matrices for an independent SR grid (default: false).
+    - timings::Union{Nothing,Vector}: Where to collect timings instead of printing them.
 
     # Returns:
     - R_tensor::Union{Array{Complex{T}, 3}, Nothing}: The prefactored R tensor keyed by ℓ^2 + (ℓ + m) + 1, or nothing if not requested for saving.
@@ -171,7 +173,8 @@ function _compute_spherical_form_factor(
     """
 
     need_short_range && !need_Delta_and_Xi && error("The SR grid needs the transition, Δ and Ξ densities.")
-    stage_times = Pair{String, Float64}[]
+    started = time_ns()
+    stage_times = timings === nothing ? Pair{String, Float64}[] : timings
 
     # Construct MoleculeData structure.
     mol = time_stage!(stage_times, "read molecular data") do
@@ -373,7 +376,8 @@ function _compute_spherical_form_factor(
     # Extract the transition energies for the requested transitions.
     Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
-    print_stage_timings("Spherical form-factor stage timings", stage_times)
+    timings === nothing && print_stage_timings("Spherical monomer form factors", stage_times;
+                                                total = (time_ns() - started) / 1e9)
 
     return R_lm, f_s, f_sq_lm, Delta_E_eV, Delta_and_Xi
 end

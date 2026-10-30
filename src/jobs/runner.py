@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from time import perf_counter
 
 import h5py
 import numpy as np
@@ -13,6 +14,7 @@ import yaml
 
 from .config import ROOT, load_job, read_systems
 from ..results import text_attribute
+from .output import print_heading, print_stage_timings
 
 
 def content_hash(path):
@@ -263,6 +265,8 @@ def run_job(job):
     # Arguments:
     - job::dict: The resolved job.
     """
+    started = perf_counter()
+    run_times = []
     # Save the resolved job and a summary table beside the results, so a run can be identified later.
     systems = read_systems(job)
     output = Path(job['output'])
@@ -279,11 +283,13 @@ def run_job(job):
     for system in systems:
         directory = output / str(system['number'])
         directory.mkdir(exist_ok=True)
-        print(f'[{system["number"]}/{len(systems)}] {system["label"]}', flush=True)
+        print_heading('TD-DFT', system['label'], system['number'], len(systems))
         tddft_complete = False
         try:
             # TD-DFT first, stamping the file with its signature so it can be reused later.
             stage = job['stages']['tddft']
+            if stage != 'run':
+                print(f'  TD-DFT: {"reuse saved results" if stage == "reuse" else "skipped"}', flush=True)
             signature = calculation_signature(job, system, 'tddft', directory)
             if stage == 'run':
                 compute_tddft(job, system, directory)
@@ -300,10 +306,12 @@ def run_job(job):
             # Then the form factors, which either reuse a saved result or go on the work list.
             stage = job['stages']['form_factors']
             if stage == 'skip':
+                print('  Form factors: skipped', flush=True)
                 continue
             signature = calculation_signature(job, system, 'form_factors', directory)
             if stage == 'reuse':
                 validate_form_factors(job, form_factor_path(job, directory), signature)
+                print('  Form factors: reused saved results', flush=True)
             else:
                 work.append({**system, 'form_factor_signature': signature})
         except Exception as error:
@@ -314,11 +322,14 @@ def run_job(job):
                 (directory / '.tddft_failed').write_text(str(error) + '\n')
 
     # Hand the whole work list to Julia in one go, as JSON on its standard input.
+    run_times.append(('Preparation and TD-DFT', perf_counter() - started))
     if work:
         settings = {**job, 'systems': work}
         command = ['julia', f'--project={ROOT}', '-t', str(job['execution']['threads']),
                    str(ROOT / 'src/jobs/compute.jl')]
+        form_factors_started = perf_counter()
         result = subprocess.run(command, input=json.dumps(settings, allow_nan=False), text=True)
+        run_times.append(('Form factors (including Julia startup)', perf_counter() - form_factors_started))
 
         # Check what Julia wrote, so a silent or partial failure still gets reported.
         for system in work:
@@ -331,7 +342,8 @@ def run_job(job):
             failures.append(f'The Julia calculation exited with status {result.returncode}.')
     if failures:
         raise ValueError('Job incomplete:\n' + '\n'.join(failures))
-    print(f'Results saved to {output}', flush=True)
+    print_stage_timings('Run timings', run_times, perf_counter() - started)
+    print(f'\n  Results: {output}', flush=True)
 
 
 def main():

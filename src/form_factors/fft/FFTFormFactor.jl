@@ -51,6 +51,7 @@ function compute_fft_form_factor(
     - Delta_E_eV::Vector{T}: The transition energies in eV.
     """
 
+    started = time_ns()
     stage_times = Pair{String, Float64}[]
 
     # Construct the MoleculeData structure.
@@ -140,7 +141,8 @@ function compute_fft_form_factor(
     # Extract the transition energies for the requested transitions.
     Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
-    print_stage_timings("FFT form-factor stage timings", stage_times)
+    print_stage_timings("Fourier monomer form factors", stage_times;
+                        total = (time_ns() - started) / 1e9)
 
     return form_factors, transition_densities, r_lim, Delta_E_eV
 end

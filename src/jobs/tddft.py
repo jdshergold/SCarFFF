@@ -2,6 +2,7 @@
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDistGeom
 from pyscf import gto, dft, tddft
+from pyscf.lib import logger
 from pyscf.tools import cubegen
 from pyscf.geomopt.geometric_solver import optimize
 import plotly.graph_objects as go
@@ -11,6 +12,9 @@ import os
 import psutil
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
+from time import perf_counter
+
+from .output import print_stage_timings
 
 
 # Atomic numbers for elements up to Mo, used for weighting when flattening molecule.
@@ -92,7 +96,7 @@ def get_rdkit_optimised_geometry(smiles="C1=CC=CC=C1", n_top=5, energy_thresh=0.
     # Check that we have at least one valid conformer, otherwise fall back to random coords and no basic knowledge.
     # This should hopefully only come up for very large or unusual molecules, such as fullerenes.
     if list(cids) == []:
-        print("No conformers generated, retrying with relaxed parameters.")
+        print("  Warning: no conformers generated. Retrying with relaxed parameters.", flush=True)
         params.useRandomCoords = True
         params.useBasicKnowledge = False
         params.useExpTorsionAnglePrefs = True
@@ -156,9 +160,8 @@ def get_dft_optimised_geometry(coords, basis="6-31g*", xc="b3lyp", use_gpu=False
     mf.verbose = 0
     mf.mol.verbose = 0
 
-    print("Running geometric optimisation with PySCF.")
+    print("  Optimising geometry with PySCF...", flush=True)
     if use_gpu:
-        print("Moving mean-field object to GPU for geometry optimisation...")
         mf = mf.to_gpu()
 
     # Run the geometry optimisation. Be quiet.
@@ -166,7 +169,6 @@ def get_dft_optimised_geometry(coords, basis="6-31g*", xc="b3lyp", use_gpu=False
         mol_eq = optimize(mf)
 
     if use_gpu:
-        print("Moving mean-field object back to CPU after geometry optimisation...")
         mf = mf.to_cpu()
     
     # Extract the optimised coordinates and convert back to Angstrom from Bohr.
@@ -192,7 +194,7 @@ def flatten_molecule_ring(coordinates, ring_indices):
 
     # If no rings, just flatten based on whole molecule.
     if len(ring_indices) == 0:
-        print("No rings found, flattening based on whole molecule.")
+        print("  Geometry: no rings found. Flattening the whole molecule.")
         return flatten_molecule(coordinates)
 
     # Separate the symbols and coordinates.
@@ -410,7 +412,7 @@ def plot_molecule_3d_interactive(coordinates, output_directory="."):
     )
 
     fig.write_html(f"{output_directory}/molecule_3d.html")
-    print(f"3D molecule plot saved to {output_directory}/molecule_3d.html.")
+    print(f"  Saved: {output_directory}/molecule_3d.html")
 
 
 def get_max_memory_mb():
@@ -434,6 +436,7 @@ def create_pyscf_mol(coordinates, basis="ccpvdz"):
     """
 
     mol = gto.Mole()
+    mol.verbose = logger.WARN
     mol.atom = coordinates
     mol.basis = basis
     mol.symmetry = False  # True
@@ -448,19 +451,11 @@ def print_excited_states(td):
     # Arguments:
     - td::TDDFT: The TD-DFT object containing excited state information.
     """
-    print("\nExcited State Energies:")
-    print("-" * 50)
-    print("State   Energy (eV)   Oscillator Strength   Major Transitions")
-    print("-" * 50)
-
-    for i, (energy, oscillator_strength) in enumerate(
-        zip(td.e, td.oscillator_strength())
-    ):
-        energy_ev = energy * 27.211396  # Convert from Hartree to eV.
-        print(f"{i+1:3d}     {energy_ev:8.4f}      {oscillator_strength:8.4f}")
+    energies = np.asarray(td.e) * 27.211396  # Convert from Hartree to eV.
+    print(f"  Excited state energies: {energies.min():.4f}–{energies.max():.4f} eV")
 
 
-def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False):
+def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False, timings=None):
     """Run TD-DFT calculation to find excited states.
 
     # Arguments:
@@ -468,50 +463,57 @@ def calculate_excited_states(mol, nstates=10, xc="b3lyp", use_gpu=False):
     - nstates::Int: The number of excited states to calculate (default: 10).
     - xc::str: Exchange-correlation functional to use (default: 'b3lyp').
     - use_gpu::bool: Whether to run the DFT and TD-DFT calculations on a GPU (default: False).
+    - timings::list or None: Where to collect the DFT and TD-DFT elapsed times.
     """
 
     # First run DFT calculation.
+    dft_started = perf_counter()
     mf = dft.RKS(mol)
     mf.xc = xc
     mf = mf.density_fit()
+    mf.verbose = logger.WARN
 
     # Move to GPU if requested.
     if use_gpu:
-        print("Moving mean-field object to GPU...")
         mf = mf.to_gpu()
 
+    print("  Computing ground state DFT...", flush=True)
     mf.kernel()
 
     # Move back to CPU if GPU was used.
     if use_gpu:
-        print("Moving mean-field object back to CPU...")
         mf = mf.to_cpu()
 
     # Check if SCF converged.
     if not mf.converged:
-        print("DFT calculation did not converge!")
+        print("  Failed: ground state DFT did not converge.", flush=True)
         return None, None
+    if timings is not None:
+        timings.append(('Ground state DFT', perf_counter() - dft_started))
 
     # Run TD-DFT calculation for excited states.
+    tddft_started = perf_counter()
     td = tddft.TDDFT(mf)
+    td.verbose = logger.WARN
     td.nstates = nstates
 
     # Move to GPU if requested.
     if use_gpu:
         from gpu4pyscf.lib.cupy_helper import get_avail_mem
 
-        print("Moving TD-DFT object to GPU...")
         td = td.to_gpu()
         # td.max_memory sizes Davidson's GPU bookkeeping matrices, which grow as
         # O(max_space^2), so only give it a quarter of what's free, not all of it.
         td.max_memory = get_avail_mem() / 1024**2 * 0.25
 
+    print("  Computing TD-DFT excited states...", flush=True)
     td.kernel()
 
     # Move back to CPU if GPU was used.
     if use_gpu:
-        print("Moving TD-DFT object back to CPU...")
         td = td.to_cpu()
+    if timings is not None:
+        timings.append(('TD-DFT', perf_counter() - tddft_started))
 
     # Print results.
     print_excited_states(td)
@@ -581,7 +583,7 @@ def select_conformer_by_dft_sp(conformers, basis="6-31g*", xc="b3lyp", use_gpu=F
     best_energy = float("inf")
 
     for i, coords in enumerate(conformers):
-        print(f"DFT single-point on conformer {i + 1}/{len(conformers)}...")
+        print(f"  Ranking conformer {i + 1}/{len(conformers)} by DFT energy...", flush=True)
         mol = create_pyscf_mol(coords, basis=basis)
         mf = dft.RKS(mol)
         mf.xc = xc
@@ -597,7 +599,8 @@ def select_conformer_by_dft_sp(conformers, basis="6-31g*", xc="b3lyp", use_gpu=F
             best_coords = coords
 
     if best_coords is None:
-        print("All DFT single-points failed to converge, using the MMFF94 minimum instead. If you're seeing this, you should probably be wary of any further results too.")
+        print("  Warning: all DFT single-points failed to converge. Using the MMFF94 minimum. "
+              "Further results may be unreliable.", flush=True)
         best_coords = conformers[0]
 
     return best_coords
@@ -637,26 +640,34 @@ def run_td_dft_analysis(
     if nstates < 1:
         raise ValueError("nstates must be a positive integer.")
 
-    print("Optimising geometry with RDKit.")
+    geometry_started = perf_counter()
+    geometry_times = []
+    print("  Optimising geometry with RDKit...", flush=True)
     top_conformers, ring_indices = get_rdkit_optimised_geometry(smiles=smiles)
+    geometry_times.append(('RDKit geometry', perf_counter() - geometry_started))
 
     if dft_optimisation:
-        print(f"Ranking {len(top_conformers)} conformers by DFT single-point energy.")
+        ranking_started = perf_counter()
+        print(f"  Ranking {len(top_conformers)} conformers by DFT energy...", flush=True)
         coords0 = select_conformer_by_dft_sp(top_conformers, basis=basis, xc=xc, use_gpu=use_gpu)
-        print("Further optimising geometry with PySCF DFT.")
+        geometry_times.append(('Conformer ranking', perf_counter() - ranking_started))
+        optimisation_started = perf_counter()
         coords = get_dft_optimised_geometry(coords0, basis=basis, xc=xc, use_gpu=use_gpu)
+        geometry_times.append(('DFT geometry optimisation', perf_counter() - optimisation_started))
     else:
         coords = top_conformers[0]
 
-    print("Flattening molecule.")
+    flatten_started = perf_counter()
+    print("  Flattening molecule...", flush=True)
     if ring_flatten:
         coords = flatten_molecule_ring(coords, ring_indices=ring_indices)
     else:
         coords = flatten_molecule(coords)
+    geometry_times.append(('Flattening', perf_counter() - flatten_started))
 
     if plot_molecule_3d:
         plot_molecule_3d_interactive(coords, output_directory)
-    print("RDKit optimisation complete.")
+    print_stage_timings('Geometry preparation', geometry_times, perf_counter() - geometry_started)
 
     return run_td_dft_analysis_from_coordinates(
         coordinates=coords,
@@ -705,16 +716,18 @@ def run_td_dft_analysis_from_coordinates(
     if nstates < 1:
         raise ValueError("nstates must be a positive integer.")
 
-    print("Creating pySCF molecule with generated geometry.")
+    started = perf_counter()
+    stage_times = []
+    print(f"\n  {species} · {xc} / {basis} · {'GPU' if use_gpu else 'CPU'}")
     mol = create_pyscf_mol(coordinates, basis=basis)
-    print("Molecule created.")
 
     if plot_molecule_3d:
         plot_molecule_3d_interactive(coordinates, output_directory)
 
     nstates_td_dft = nstates + 3
-    print(f"Running TD-DFT for {nstates_td_dft} states ({nstates} form factors and 3 buffer states).")
-    mf, td = calculate_excited_states(mol, nstates=nstates_td_dft, xc=xc, use_gpu=use_gpu)
+    print(f"  States: {nstates} saved + 3 buffer")
+    mf, td = calculate_excited_states(mol, nstates=nstates_td_dft, xc=xc, use_gpu=use_gpu,
+                                      timings=stage_times)
     if mf is None:
         raise ValueError("DFT calculation did not converge.")
     else:
@@ -725,9 +738,9 @@ def run_td_dft_analysis_from_coordinates(
             )
         if not np.all(td.converged):
             raise ValueError("Not all requested TD-DFT states converged, including the three-state buffer.")
-        td.analyze()
+        print(f"  Convergence: ground state and all {nstates_td_dft} excited states converged")
 
-    print(f"Extracting X and Y for the first N={nstates} transitions.")
+    save_started = perf_counter()
 
     # Save amplitudes only for the states used in the form factors.
     mxXY = [get_xy(td, state=i + 1) for i in range(nstates)]
@@ -796,7 +809,10 @@ def run_td_dft_analysis_from_coordinates(
             f.create_dataset(f"Y_state_{i+1}", data=np.asarray(Y, dtype=complex_dtype))
 
     os.replace(temporary_file, output_file)
-    print(f"\nResults saved to {output_file}")
+    stage_times.append(('Extract amplitudes and save', perf_counter() - save_started))
+    print_stage_timings('TD-DFT', stage_times, perf_counter() - started)
+    print(f"  Saved-state energies: {min(energies):.4f}–{max(energies):.4f} eV")
+    print(f"  Saved: {output_file}")
 
     return coordinates, mol, mf, td, mxXY
 

@@ -163,7 +163,8 @@ end
     end
     @test occursin("Test timings", output)
     @test occursin("small stage", output)
-    @test occursin('%', output)
+    @test occursin("Total", output)
+    @test occursin("Time", output)
 end
 
 function build_small_R_case(::Type{T}, tmp_dir::String) where {T<:AbstractFloat}

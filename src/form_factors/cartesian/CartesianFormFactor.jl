@@ -56,6 +56,7 @@ function compute_cartesian_form_factor(
     - Delta_E_eV::Vector{T}: The transition energies in eV for the requested transitions.
     """
 
+    started = time_ns()
     stage_times = Pair{String, Float64}[]
 
     # Construct MoleculeData structure.
@@ -115,7 +116,8 @@ function compute_cartesian_form_factor(
     # Extract the transition energies for the requested transitions.
     Delta_E_eV = [T(mol.Delta_E_eV[idx]) for idx in transition_indices]
 
-    print_stage_timings("Cartesian form-factor stage timings", stage_times)
+    print_stage_timings("Cartesian monomer form factors", stage_times;
+                        total = (time_ns() - started) / 1e9)
 
     return V_tensors, f_s, Delta_E_eV
 end
