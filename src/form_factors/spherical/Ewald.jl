@@ -59,25 +59,31 @@ struct EwaldCost
 
         c_R = B_R (Z_mol/4)² (n_tr/12)^α_1 (ℓ_max/24)^α_2 (R_max/15 Å)^{1/2},
         c_G = B_G (n_tr/12)^β_1 (n_q/250) (n_*/2500)^β_2 (20 keV/q_max)^β_3 (500 Å³/V_cell)^β_4
-              × (G_max/2.5 keV)^β_5.
+              × (G_max/2.5 keV)^β_5,
+        c_F = (B_F1 + B_F2 (n_tr/12)²) (n_pair/15000) (ℓ_max/24)² (R_max/15 Å)^{1/2}.
 
-    c_R is the cost per real-space cell, and c_G the cost per reciprocal lattice vector.
+    c_R is the cost per real-space cell, c_G the cost per reciprocal lattice vector, and c_F the
+    molecular form factor at the short-range grid's new radial nodes.
 
     # Fields:
     - B_R::Float64: The real-space cost at the reference point, in s.
     - B_G::Float64: The reciprocal-space cost at the reference point, in s.
+    - B_F1::Float64: The form factor's primitive-pair cost (constructing S_ij) at the reference point, in s.
+    - B_F2::Float64: The form factor's density contraction at the reference point, in s.
     - alpha::NTuple{2, Float64}: The real-space exponents α_1 and α_2.
     - beta::NTuple{5, Float64}: The reciprocal-space exponents β_1 to β_5.
     """
     B_R::Float64
     B_G::Float64
+    B_F1::Float64
+    B_F2::Float64
     alpha::NTuple{2, Float64}
     beta::NTuple{5, Float64}
 end
 
 # Fitted parameters for the costs.
-const D_COST = EwaldCost(0.13, 3.3e-3, (0.0, 10 / 3), (2.0, 0.0, 1.0, 1.0, -1.0))
-const J_COST = EwaldCost(0.45, 3.1, (1.0, 3.0), (1.0, 1.0, 0.0, 0.0, 1.0))
+const D_COST = EwaldCost(0.13, 3.3e-3, 0.0, 0.0, (0.0, 10 / 3), (2.0, 0.0, 1.0, 1.0, -1.0))
+const J_COST = EwaldCost(0.39, 3.1, 8.5, 15.6, (1.0, 3.0), (1.0, 1.0, 0.0, 0.0, 1.0))
 
 # How many passes the work minimisation is allowed before giving up.
 const WORK_PASSES = 50
@@ -124,6 +130,7 @@ function choose_ewald_parameters(
         l_max::Integer = 0,
         n_q::Integer = 0,
         n_stars::Integer = 0,
+        n_pair::Integer = 0,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
     Choose η and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
@@ -131,20 +138,17 @@ function choose_ewald_parameters(
     Pinning both truncation errors to ε_tot/√2 leaves one free parameter, which is fixed by
     minimising the total work
 
-        W = c_R N_R + c_G N_G,     N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π².
+        W = c_R N_R + c_G N_G + c_F,   N_R ≃ 4π R_max³ / 3 V_cell,   N_G ≃ V_cell G_max³ / 6π²,
+
+    where c_F is the cost of building th e molecular form factor at the short-range grid's new radial nodes.
 
     Taking G_max as the free one, the error on the reciprocal sum fixes η and the error on the real
     space sum then fixes R_max,
 
         1/η² = 4 L_G/G_max² - 1/σ_0²,    R_max = R_0 + √L_R / η,    L_{R/G} = ln(√2 A_{R/G}/ε_tot),
 
-    and dW/dG_max = 0 leaves
+    we then find the best G_max which satisfies dW/dG_max = 0.
 
-        G_max⁵ = (32π³ L_R L_G / V_cell²) R_max²/(R_max - R_0) (3c_R + R_max c_R')/(3c_G + G_max c_G'),
-
-    with c_R' = dc_R/dR_max. The costs follow the power laws in EwaldCost, so c_R ∝ R_max^{1/2} and
-    c_G ∝ G_max^{β_5}, and the last factor is 7c_R / 2(3 + β_5)c_G. Without a cost model, c_R = c_G
-    and it is 1.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice, for the cell volume and reciprocal spacings.
@@ -160,6 +164,8 @@ function choose_ewald_parameters(
     - l_max::Integer: The maximum angular momentum mode of the form factor. Only used with a cost model.
     - n_q::Integer: The number of points in the saved q grid. Only used with a cost model.
     - n_stars::Integer: The number of symmetry stars, n_*. Only used with a cost model.
+    - n_pair::Integer: The Cartesian term pairs left after thresholding, n_pair. Only used with a
+      cost model that carries the form factor term.
 
     # Returns:
     - EwaldParameters{T}: The splitting parameter and both cutoffs.
@@ -174,6 +180,10 @@ function choose_ewald_parameters(
         "The Ewald cost model needs n_transitions, l_max, n_q and n_stars, got $(n_transitions), " *
         "$(l_max), $(n_q) and $(n_stars).")
     cost === nothing || isfinite(q_reach) || error("The Ewald cost model needs a finite q_reach.")
+    # Only the coupling carrying the form factor term needs the pair count.
+    cost === nothing || iszero(cost.B_F1 + cost.B_F2) || n_pair >= 1 || error(
+        "The Ewald cost model's form factor term needs n_pair, the number of Cartesian term pairs " *
+        "left after thresholding, got $(n_pair).")
     min(truncation.A_R, truncation.A_G) > 0 || error(
         "The Ewald truncation prefactors must be positive, got A_R = $(truncation.A_R), " *
         "A_G = $(truncation.A_G).")
@@ -210,12 +220,9 @@ function choose_ewald_parameters(
                 (T(n_stars) / 2500)^T(cost.beta[2]) *
                 (20 * T(KEV_TO_INV_ANGSTROM) / T(q_reach))^T(cost.beta[3]) *
                 (500 / lattice.V_cell)^T(cost.beta[4])
+        c_F_0 = (T(cost.B_F1) + T(cost.B_F2) * (T(n_transitions) / 12)^2) *
+                (T(n_pair) / 15000) * (T(l_max) / 24)^2
     end
-    # The bracketed cost factor in the G_max⁵ condition, (3c_R + R_max c_R')/(3c_G + G_max c_G').
-    cost_factor(R, G) = cost === nothing ? one(T) :
-        7 * c_R_0 * sqrt(R / 15) /
-        (2 * (3 + T(cost.beta[5])) * c_G_0 * (G / (T(2.5) * T(KEV_TO_INV_ANGSTROM)))^T(cost.beta[5]))
-
     # Find the η and R_max that give the requested error.
     split_at(G) = begin
         inverse_eta_squared = 4 * L_G / G^2 - inverse_sigma_squared
@@ -242,22 +249,59 @@ function choose_ewald_parameters(
         return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value, G_max, epsilon)
     end
 
-    # Start with a simple estimate for G_max, based on R_0 = 0 and equal costs, then iterate to find the
-    # true solution.
-    G_max = 2 * sqrt(T(π)) * (one(T) / lattice.V_cell^2)^(one(T) / 6) * (L_R * L_G)^(one(T) / 4)
-    work_scale = 32 * T(π)^3 * L_R * L_G / lattice.V_cell^2
-    converged = false
+    # The work at one G_max, with R_max taken from the truncation laws so that the requested error is
+    # delivered whatever G_max is. Differentiating this by hand gives an expression too unwieldy to
+    # be worth it, so the minimum is found by searching instead.
+    work_at(G) = begin
+        _, R = split_at(G)
+        if cost === nothing
+            # With cG = cR = cG = 1, every term is priced the same, so the work is just the term count.
+            return 4 * T(π) * R^3 / (3 * lattice.V_cell) + lattice.V_cell * G^3 / (6 * T(π)^2)
+        end
+        c_R = c_R_0 * sqrt(R / 15)
+        c_G = c_G_0 * (G / (T(2.5) * T(KEV_TO_INV_ANGSTROM)))^T(cost.beta[5])
+        c_F = c_F_0 * sqrt(R / 15)
+        return c_R * 4 * T(π) * R^3 / (3 * lattice.V_cell) +
+               c_G * lattice.V_cell * G^3 / (6 * T(π)^2) + c_F
+    end
+
+    # There should only be one minimum, so keep going up from small G until you find the turning point to bracket it.
+    G_ceiling = isfinite(truncation.sigma_0) ?
+        2 * T(truncation.sigma_0) * sqrt(L_G) * (one(T) - sqrt(eps(T))) : T(Inf)
+    G_low = min(T(0.05), G_ceiling / 16)
+    G_high = G_low
+    work_high = work_at(G_high)
     for _ in 1:WORK_PASSES
-        previous = G_max
-        _, R_max = split_at(G_max)
-        G_max = (work_scale * R_max^2 / (R_max - R_0) * cost_factor(R_max, G_max))^(one(T) / 5)
-        if abs(G_max - previous) <= sqrt(eps(T)) * G_max
-            converged = true
+        next = min(G_high * T(1.5), G_ceiling)
+        next > G_high || break
+        work_next = work_at(next)
+        G_low, G_high = G_high, next
+        work_next < work_high || break
+        work_high = work_next
+    end
+
+    # Then close the bracket by golden-section search, which needs no derivative and cannot step
+    # outside it.
+    inverse_phi = (sqrt(T(5)) - 1) / 2
+    left, right = G_low, G_high
+    middle_left = right - inverse_phi * (right - left)
+    middle_right = left + inverse_phi * (right - left)
+    work_left, work_right = work_at(middle_left), work_at(middle_right)
+    for _ in 1:WORK_PASSES
+        if right - left <= sqrt(eps(T)) * right
             break
         end
+        if work_left < work_right
+            right, middle_right, work_right = middle_right, middle_left, work_left
+            middle_left = right - inverse_phi * (right - left)
+            work_left = work_at(middle_left)
+        else
+            left, middle_left, work_left = middle_left, middle_right, work_right
+            middle_right = left + inverse_phi * (right - left)
+            work_right = work_at(middle_right)
+        end
     end
-    converged || error(
-        "The Ewald work minimisation did not settle on a reciprocal cutoff in $(WORK_PASSES) passes.")
+    G_max = (left + right) / 2
 
     # If q_max < optimal G_max, then we extend R_max to ensure truncation error is achieved, but warn
     # that this is sub-optimal from a computation time standpoint.

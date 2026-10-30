@@ -662,11 +662,16 @@ function run_crystals(job)
                     else
                         if coupling_method == "ewald"
                             # J and D converge at different rates, so each gets its own cutoffs to save wasted computation.
+                            n_cartesian_pairs = maximum(
+                                count(!isempty,
+                                      conformer_results[label].Delta_and_Xi.short_range_data.W_ij.ij_bins)
+                                for label in conformer_labels)
                             J_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, J_TRUNCATION;
                                 eta = ewald_eta, q_reach = q_grid_invA[end], cost = J_COST,
                                 n_transitions = basis.n_transitions, l_max = l_max,
-                                n_q = length(q_grid), n_stars = length(stars.irreducible_directions))
+                                n_q = length(q_grid), n_stars = length(stars.irreducible_directions),
+                                n_pair = n_cartesian_pairs)
                             D_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, D_TRUNCATION;
                                 eta = ewald_eta, q_reach = q_grid_invA[end], cost = D_COST,

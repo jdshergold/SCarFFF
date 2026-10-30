@@ -862,7 +862,7 @@ end
     end
 
     # Add the cost model for a reasonably sized run. Both errors should still be the requested one.
-    sizes = (n_transitions = 12, l_max = 24, n_q = 251, n_stars = 2500)
+    sizes = (n_transitions = 12, l_max = 24, n_q = 251, n_stars = 2500, n_pair = 15000)
     q_max = 20 * SF.CrystalLattice.KEV_TO_INV_ANGSTROM
     for (truncation, cost) in ((SF.D_TRUNCATION, SF.D_COST), (SF.J_TRUNCATION, SF.J_COST))
         R_0 = truncation.k_R * cbrt(lattice.V_cell / Z_mol)

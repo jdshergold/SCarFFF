@@ -200,9 +200,10 @@ function run_mock_crystal(::Type{T}) where {T<:AbstractFloat}
 
         # Both splits are chosen the way the crystal job chooses them.
         n_stars = length(stars.irreducible_directions)
+        # J's cost carries the form factor term, so it needs a Cartesian pair count.
         SFF.choose_ewald_parameters(lattice, length(images), T(1.0e-3), SFF.J_TRUNCATION;
             q_reach = q_grid[end], cost = SFF.J_COST, n_transitions = basis.n_transitions,
-            l_max = l_max, n_q = n_q, n_stars = n_stars)
+            l_max = l_max, n_q = n_q, n_stars = n_stars, n_pair = 15000)
         SFF.choose_ewald_parameters(lattice, length(images), T(1.0e-3), SFF.D_TRUNCATION;
             q_reach = q_grid[end], cost = SFF.D_COST, n_transitions = basis.n_transitions,
             l_max = l_max, n_q = n_q, n_stars = n_stars)
