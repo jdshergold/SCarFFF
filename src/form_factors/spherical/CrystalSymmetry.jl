@@ -5,17 +5,51 @@ module CrystalSymmetry
 
 using StaticArrays
 using Quaternionic
-using LinearAlgebra: inv
+using LinearAlgebra: I, inv, norm
 
 using ..CrystalLattice: CrystalLatticeData
 using ..BlochHamiltonian: CrystalImage, CrystalExcitationBasis
 
-export SymmetryOperation, StarMember, Stars, derive_symmetry_operations,
+export SymmetryOperation, StarMember, Stars, MoleculeMatching, derive_symmetry_operations,
        build_stars, star_reduction_factor, choose_compatible_phi_count
 
 # How close a matched rotation, or a lattice vector's fractional coordinates, has to be.
 # Max part is used to make sure float32 is not too strict to work.
 match_tolerance(::Type{T}) where {T<:AbstractFloat} = max(T(1.0e-6), 100 * eps(T))
+
+struct MoleculeMatching{T<:AbstractFloat}
+    """
+    What is needed to decide whether two images hold the same molecule, placed the same way.
+
+    Without this the comparison is exact equality of the recorded rotations, which is right only
+    when every image of a conformer is a perfect copy and the molecule has no symmetry of its own.
+
+    # Fields:
+    - point_groups::Vector{Vector{SMatrix{3, 3, T, 9}}}: Each conformer's own symmetry operations.
+    - orientation_tolerances::Vector{T}: How far two rotations of each conformer may differ.
+    - distance_tolerance::T: How far an atom may sit from where it is expected, in Å.
+    """
+    point_groups::Vector{Vector{SMatrix{3, 3, T, 9}}}
+    orientation_tolerances::Vector{T}
+    distance_tolerance::T
+end
+
+function MoleculeMatching{T}(n_conformers::Int) where {T<:AbstractFloat}
+    """
+    The strict default: molecules have no symmetry of their own and images are exact copies.
+
+    # Arguments:
+    - n_conformers::Int: How many conformers the crystal has.
+
+    # Returns:
+    - MoleculeMatching{T}: Matching that reproduces plain equality.
+    """
+
+    identity = SMatrix{3, 3, T, 9}(one(T) * I)
+    return MoleculeMatching{T}([[identity] for _ in 1:n_conformers],
+                               fill(match_tolerance(T), n_conformers),
+                               match_tolerance(T))
+end
 
 # The largest crystallographic point group, m-3m, has 48 elements. Passing this means the closure is
 # not converging, so it stops rather than getting stuck.
@@ -150,22 +184,58 @@ function cartesian_operation(image::CrystalImage{T})::SMatrix{3, 3, T, 9} where 
     return SMatrix{3, 3, T, 9}(image.det_rotation .* Quaternionic.to_rotation_matrix(image.R_tilde))
 end
 
-function is_lattice_vector(lattice::CrystalLatticeData{T}, vector::SVector{3, T})::Bool where {T<:AbstractFloat}
+function is_lattice_vector(
+        lattice::CrystalLatticeData{T},
+        vector::SVector{3, T},
+        tolerance::T = match_tolerance(T),
+    )::Bool where {T<:AbstractFloat}
     """
-    Check whether a displacement is a lattice vector, tested in fractional coordinates.
+    Check whether a displacement is a lattice vector.
 
     # Arguments:
     - lattice::CrystalLatticeData{T}: The crystal lattice.
     - vector::SVector{3, T}: The displacement, in Å.
+    - tolerance::T: How far from the nearest lattice vector it may sit, in Å.
 
     # Returns:
-    - Bool: True if the fractional coordinates are integers to within MATCH_TOLERANCE.
+    - Bool: True if it lands on a lattice vector within the tolerance.
     """
 
     # The rows of `direct` are the lattice vectors, so the fractional coordinates satisfy Aᵀ x = vector.
     fractional = inv(transpose(lattice.direct)) * vector
+    residual = fractional - round.(fractional)
 
-    return all(component -> abs(component - round(component)) < match_tolerance(T), fractional)
+    return norm(transpose(lattice.direct) * residual) < tolerance
+end
+
+function same_orientation(
+        rotated::SMatrix{3, 3, T, 9},
+        reference::SMatrix{3, 3, T, 9},
+        point_group::Vector{SMatrix{3, 3, T, 9}},
+        tolerance::T,
+    )::Bool where {T<:AbstractFloat}
+    """
+    Check whether a rotated molecule is placed the same way as one of the images.
+
+    An orientation only fixes a molecule up to its own symmetry: if S maps the molecule onto
+    itself, then M and M S put every atom in the same place. An example is benzene: if a
+    symop maps it to a mirror version of itself, then the two molecules are the same, as
+    beznene is centrosymmetric.
+
+    # Arguments:
+    - rotated::SMatrix{3, 3, T, 9}: The orientation after the candidate operation.
+    - reference::SMatrix{3, 3, T, 9}: The image being compared against.
+    - point_group::Vector{SMatrix{3, 3, T, 9}}: The molecule's own symmetry operations.
+    - tolerance::T: How far the matrix elements may differ.
+
+    # Returns:
+    - Bool: True if the two place the molecule identically.
+    """
+
+    for own in point_group
+        maximum(abs, rotated - reference * own) < tolerance && return true
+    end
+    return false
 end
 
 function match_operation(
@@ -175,6 +245,7 @@ function match_operation(
         translations::Vector{SVector{3, T}},
         conformers::Vector{Int},
         lattice::CrystalLatticeData{T},
+        matching::MoleculeMatching{T},
     )::Union{Nothing, SymmetryOperation{T}} where {T<:AbstractFloat}
     """
     Work out where a candidate operation sends each image, or decide that it is not a symmetry.
@@ -193,6 +264,7 @@ function match_operation(
     - translations::Vector{SVector{3, T}}: The translation of each image, in Å.
     - conformers::Vector{Int}: Which conformer each image is, so that only like maps onto like.
     - lattice::CrystalLatticeData{T}: The crystal lattice.
+    - matching::MoleculeMatching{T}: Each conformer's own symmetry and how closely to match.
 
     # Returns:
     - Union{Nothing, SymmetryOperation{T}}: The operation with its image map and offsets, or nothing
@@ -212,11 +284,13 @@ function match_operation(
         for j in 1:n_images
             # Check that it is the same molecule, not merely one sitting in the same place.
             conformers[i] == conformers[j] || continue
-            # Check if each image points along the same direction as the rotated one.
-            maximum(abs, rotated - operations[j]) < match_tolerance(T) || continue
+            # Check if each image points along the same direction as the rotated one, allowing for
+            # the molecule's own symmetry.
+            same_orientation(rotated, operations[j], matching.point_groups[conformers[j]],
+                             matching.orientation_tolerances[conformers[j]]) || continue
             # Check that the rotated image sits on top of the candidate image, up to a lattice vector.
             offset = position - translations[j]
-            is_lattice_vector(lattice, offset) || continue
+            is_lattice_vector(lattice, offset, matching.distance_tolerance) || continue
             image_of[i] = j
             offsets[i] = offset
             break
@@ -230,7 +304,9 @@ end
 
 function derive_symmetry_operations(
         images::Vector{CrystalImage{T}},
-        lattice::CrystalLatticeData{T},
+        lattice::CrystalLatticeData{T};
+        candidates::Union{Nothing, Vector{Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}}} = nothing,
+        matching::Union{Nothing, MoleculeMatching{T}} = nothing,
     )::Vector{SymmetryOperation{T}} where {T<:AbstractFloat}
     """
     Find the symmetry operations relating the images in the unit cell, each also paired with time
@@ -239,6 +315,8 @@ function derive_symmetry_operations(
     # Arguments:
     - images::Vector{CrystalImage{T}}: The molecules in the unit cell.
     - lattice::CrystalLatticeData{T}: The crystal lattice.
+    - candidates: The operations to test.
+    - matching::MoleculeMatching{T}: Each conformer's own symmetry and how closely to match.
 
     # Returns:
     - Vector{SymmetryOperation{T}}: The operations, identity first, then their time reversed partners.
@@ -248,22 +326,29 @@ function derive_symmetry_operations(
     n_images = length(images)
     operations = [cartesian_operation(image) for image in images]
     translations = [image.tau for image in images]
-
-    # The recorded pairs orient and place each image relative to the reference conformer.
-    # As a result, to get from image e.g. 1 to i, we need to map 1 -> reference, then
-    # reference -> i. This means we need R_i R_1^{-1} and τ_i - R_i R_1^{-1} τ_1, which is what the following does.
-    reference_inverse = inv(operations[1])
     conformers = [image.conformer_index for image in images]
-    proposed = Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}[]
-    for i in 1:n_images
-        rotation = operations[i] * reference_inverse
-        push!(proposed, (rotation, translations[i] - rotation * translations[1]))
+    matching = matching === nothing ?
+        MoleculeMatching{T}(maximum(conformers)) : matching
+
+    if candidates !== nothing
+        proposed = copy(candidates)
+    else
+        # The recorded pairs orient and place each image relative to the reference conformer.
+        # As a result, to get from image e.g. 1 to i, we need to map 1 -> reference, then
+        # reference -> i. This means we need R_i R_1^{-1} and τ_i - R_i R_1^{-1} τ_1, which is what the following does.
+        reference_inverse = inv(operations[1])
+        proposed = Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}[]
+        for i in 1:n_images
+            rotation = operations[i] * reference_inverse
+            push!(proposed, (rotation, translations[i] - rotation * translations[1]))
+        end
     end
 
     # Only keep the ones that really are symmetries before going any further. That is, operations
     # which map to like molecules.
     candidates = filter(
-        candidate -> match_operation(candidate..., operations, translations, conformers, lattice) !== nothing,
+        candidate -> match_operation(candidate..., operations, translations, conformers, lattice,
+                                     matching) !== nothing,
         proposed)
 
     # Close the space group, if it is not already. Usually does nothing, but good to be safe.
@@ -277,11 +362,12 @@ function derive_symmetry_operations(
             composed_translation = rotation_a * translation_b + translation_a
             seen = any(candidates) do candidate
                 maximum(abs, candidate[1] - composed_rotation) < match_tolerance(T) &&
-                    is_lattice_vector(lattice, candidate[2] - composed_translation)
+                    is_lattice_vector(lattice, candidate[2] - composed_translation,
+                                      matching.distance_tolerance)
             end
             seen && continue
             match_operation(composed_rotation, composed_translation, operations, translations,
-                            conformers, lattice) === nothing && continue
+                            conformers, lattice, matching) === nothing && continue
 
             push!(candidates, (composed_rotation, composed_translation))
             growing = true
@@ -299,7 +385,8 @@ function derive_symmetry_operations(
     found = SymmetryOperation{T}[]
     # Build the symops: find which image each operation maps each image onto, and the lattice vector left over.
     for (rotation, translation) in candidates
-        operation = match_operation(rotation, translation, operations, translations, conformers, lattice)
+        operation = match_operation(rotation, translation, operations, translations, conformers,
+                                    lattice, matching)
         operation === nothing && continue
         push!(found, operation)
     end

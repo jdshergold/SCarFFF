@@ -25,7 +25,7 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   image_translation_span, supercell_radius,
                                   set_D_couplings!,
                                   choose_short_range_grid, short_range_scales, short_range_coefficients,
-                                  derive_symmetry_operations, build_stars,
+                                  derive_symmetry_operations, MoleculeMatching, build_stars,
                                   star_reduction_factor, choose_compatible_phi_count
 using SCarFFF.SphericalFormFactor.PrecomputeGaunt: precompute_gaunt_coefficients
 using SCarFFF.SphericalFormFactor.CrystalLattice: KEV_TO_INV_ANGSTROM
@@ -158,6 +158,48 @@ function ordinal_suffix(n::Int)::String
     else
         return "th"
     end
+end
+
+function build_symmetry_inputs(crystal_metadata, conformer_labels::Vector{String}, ::Type{T}) where {T<:AbstractFloat}
+    """
+    Read the symmetry operations from the CIF.
+
+    # Arguments:
+    - crystal_metadata::Dict{String, Any}: The crystal metadata read from JSON.
+    - conformer_labels::Vector{String}: The conformer labels, whose order sets the conformer indices.
+    - T::Type: The floating point type to use.
+
+    # Returns:
+    - Tuple: The candidate operations and the matching data, or nothing for each if the metadata
+      predates them and the operations have to be worked out from the images instead.
+    """
+
+    if !haskey(crystal_metadata, "symmetry_operations") || !haskey(crystal_metadata, "point_groups")
+        return nothing, nothing
+    end
+
+    candidates = Tuple{SMatrix{3, 3, T, 9}, SVector{3, T}}[]
+    for operation in crystal_metadata["symmetry_operations"]
+        rotation = SMatrix{3, 3, T, 9}(reduce(vcat,
+            [reshape(T.(row), 1, 3) for row in operation["rotation"]]))
+        push!(candidates, (rotation, SVector{3, T}(T.(operation["translation"]))))
+    end
+    isempty(candidates) && return nothing, nothing
+
+    point_groups = Vector{SMatrix{3, 3, T, 9}}[]
+    tolerances = T[]
+    for label in conformer_labels
+        group = SMatrix{3, 3, T, 9}[]
+        for rotation in crystal_metadata["point_groups"][label]
+            push!(group, SMatrix{3, 3, T, 9}(reduce(vcat,
+                [reshape(T.(row), 1, 3) for row in rotation])))
+        end
+        push!(point_groups, group)
+        push!(tolerances, T(crystal_metadata["orientation_tolerances"][label]))
+    end
+    distance = T(get(crystal_metadata, "symmetry_tolerance", 0.1))
+
+    return candidates, MoleculeMatching{T}(point_groups, tolerances, distance)
 end
 
 function build_dominant_group_images(crystal_metadata, conformer_labels::Vector{String}, ::Type{T}) where {T<:AbstractFloat}
@@ -338,8 +380,13 @@ function run_crystals(job)
                     grid_metadata, String.(grid_metadata["conformer_labels"]), T)
                 grid_lattice = build_crystal_lattice(
                     reduce(vcat, [reshape(T.(row), 1, 3) for row in grid_metadata["lattice"]]), T)
+                grid_candidates, grid_matching = build_symmetry_inputs(
+                    grid_metadata, String.(grid_metadata["conformer_labels"]), T)
                 widened_N_phi = choose_compatible_phi_count(
-                    N_theta, N_phi, derive_symmetry_operations(grid_images, grid_lattice))
+                    N_theta, N_phi,
+                    derive_symmetry_operations(grid_images, grid_lattice;
+                                               candidates = grid_candidates,
+                                               matching = grid_matching))
                 if widened_N_phi != N_phi
                     println("  Angular grid: n_φ increased from $(N_phi) to $(widened_N_phi) for crystal symmetry.")
                     N_phi = widened_N_phi
@@ -668,7 +715,11 @@ function run_crystals(job)
 
                     # Print a summary of the timing, and symmetry statistics.
                     symmetry_timing = @timed begin
-                        operations = derive_symmetry_operations(basis.images, lattice)
+                        symmetry_candidates, symmetry_matching =
+                            build_symmetry_inputs(crystal_metadata, conformer_labels, T)
+                        operations = derive_symmetry_operations(
+                            basis.images, lattice;
+                            candidates = symmetry_candidates, matching = symmetry_matching)
                         build_stars(theta_grid, phi_grid, operations)
                     end
                     stars = symmetry_timing.value
