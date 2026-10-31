@@ -5,11 +5,14 @@ from networkx.algorithms import isomorphism
 from scipy.spatial.transform import Rotation
 from pymatgen.analysis.dimensionality import get_structure_components
 from pymatgen.analysis.local_env import JmolNN
-from pymatgen.core import Structure
+from pymatgen.core import Molecule, Structure
+from pymatgen.core.operations import SymmOp
 from pymatgen.io.cif import CifParser
+from pymatgen.symmetry.analyzer import PointGroupAnalyzer, SpacegroupAnalyzer
 
-# Two molecules are the same conformer if their Kabsch RMSD is below this threshold.
-CONFORMER_RMSD_THRESHOLD = 0.01  # Å
+# How far an atom may sit from where it is expected and still count as the same atom, in Angstroms.
+# This effectively determines what counts as different conformers.
+SYMMETRY_TOLERANCE = 0.01  # Å
 
 # Fractional coordinates this close to a cell face are treated as sitting on it when wrapping
 # molecule centroids into the primary unit cell.
@@ -101,6 +104,89 @@ def rotation_matrix_to_quaternion(rotation_matrix):
     
     # Scipy returns [x, y, z, w], but we want it in the form [w, x, y, z].
     return [q[3], q[0], q[1], q[2]]             
+
+
+def read_symmetry_operations(raw_block, structure):
+    """
+    Collect the crystal's symmetry operations, in Cartesian form.
+
+    # Arguments:
+    - raw_block::dict: The CIF block as parsed by pymatgen.
+    - structure::Structure: The expanded structure.
+
+    # Returns:
+    - list[dict]: Each operation's Cartesian rotation and translation in Angstroms.
+    """
+
+    fractional = []
+    for key in ("_symmetry_equiv_pos_as_xyz", "_space_group_symop_operation_xyz"):
+        if key in raw_block:
+            value = raw_block[key]
+            strings = [value] if isinstance(value, str) else list(value)
+            fractional += [SymmOp.from_xyz_str(s.strip().strip("'\"")) for s in strings]
+            break
+
+    try:
+        analyzer = SpacegroupAnalyzer(structure, symprec=SYMMETRY_TOLERANCE)
+        fractional += list(analyzer.get_symmetry_operations())
+    except Exception as error:
+        # Use the file, rather than the structure if it is unreadable.
+        warnings.warn(f"Could not search {structure.formula} for symmetry operations, so only the "
+                      f"ones the CIF states will be used: {error}")
+
+    direct = structure.lattice.matrix  # Rows are a1, a2, a3.
+    operations, seen = [], set()
+    for operation in fractional:
+        # Two operations differing by a lattice vector are the same operation.
+        key = (tuple(np.round(operation.rotation_matrix, 4).ravel()),
+               tuple(np.round(np.mod(operation.translation_vector, 1.0), 4)))
+        if key in seen:
+            continue
+        seen.add(key)
+        # The operation acts on fractional coordinates, the form factor code works in Cartesian.
+        # With x_cart = Aᵀ x_frac, a fractional (P, p) becomes (Aᵀ P A⁻ᵀ, Aᵀ p).
+        rotation = direct.T @ operation.rotation_matrix @ np.linalg.inv(direct.T)
+        translation = direct.T @ operation.translation_vector
+        operations.append({"rotation": rotation.tolist(),
+                           "translation": translation.tolist()})
+    return operations
+
+
+def molecular_point_group(species, coordinates):
+    """
+    Find the rotations and reflections that map a molecule onto itself.
+
+    # Arguments:
+    - species::list: The element of each atom.
+    - coordinates::ndarray: The atom positions about the molecule's centroid, in Angstroms.
+
+    # Returns:
+    - list: The 3x3 matrices of the molecule's point group.
+    """
+
+    molecule = Molecule(species, np.asarray(coordinates))
+    analyzer = PointGroupAnalyzer(molecule, tolerance=SYMMETRY_TOLERANCE)
+    matrices = []
+    for operation in analyzer.get_symmetry_operations():
+        rotation = np.asarray(operation.rotation_matrix)
+        if not any(np.allclose(rotation, seen, atol=1.0e-6) for seen in matrices):
+            matrices.append(rotation)
+    return [matrix.tolist() for matrix in matrices]
+
+
+def orientation_tolerance(coordinates):
+    """
+    Turn the atom tolerance into one on a rotation matrix, for this molecule's size.
+
+    # Arguments:
+    - coordinates::ndarray: The atom positions about the molecule's centroid, in Angstroms.
+
+    # Returns:
+    - float: The largest tolerable difference in a rotation matrix element.
+    """
+
+    radius = float(np.max(np.linalg.norm(np.asarray(coordinates), axis=1)))
+    return SYMMETRY_TOLERANCE / max(radius, SYMMETRY_TOLERANCE)
 
 
 def get_crystal_data(cif_path):
@@ -212,9 +298,11 @@ def get_crystal_data(cif_path):
             mol_fractional[np.isclose(mol_fractional, 1.0, atol=CELL_WRAP_TOLERANCE)] = 0.0
             mol_translation = structure.lattice.get_cartesian_coords(mol_fractional)
 
-            # Check this molecule against each known conformer using graph matching + Kabsch.
+            # Check this molecule against each known conformer using graph matching + Kabsch. The
+            # fit is scored by how far the worst atom lands from where the reference puts it, so
+            # that it is the same measure of "same place" the symmetry tests use.
             best_label = None
-            best_rmsd = np.inf
+            best_distance = np.inf
             best_R = None
             best_mapping = None
 
@@ -224,21 +312,21 @@ def get_crystal_data(cif_path):
                 if not mapper.is_isomorphic():
                     continue
 
-                # Check each isomorphism, and pick the one with the lowest RMSD against the reference.
+                # Check each isomorphism, and pick the one that superimposes best.
                 for mapping in mapper.isomorphisms_iter():
                     new_indices = [mapping[ref_idx] for ref_idx in range(len(mapping))]
                     x_prime = mol_coordinates[new_indices].T
                     x_ref = ref_coords.T
                     R = kabsch_rotation(x_ref, x_prime)
-                    rmsd = np.sqrt(np.mean(np.sum((x_ref - R.T @ x_prime) ** 2, axis=0)))
-                    if rmsd < best_rmsd:
-                        best_rmsd = rmsd
+                    distance = np.max(np.linalg.norm(x_ref - R.T @ x_prime, axis=0))
+                    if distance < best_distance:
+                        best_distance = distance
                         best_R = R
                         best_label = label
                         best_mapping = new_indices
 
             # If the best match is above threshold, this is a new conformer.
-            if best_rmsd >= CONFORMER_RMSD_THRESHOLD:
+            if best_distance >= SYMMETRY_TOLERANCE:
                 best_label = next_label()
                 conformer_coordinates[best_label] = mol_coordinates
                 conformer_species[best_label] = mol_species
@@ -275,6 +363,11 @@ def get_crystal_data(cif_path):
         conformers[label] = {
             "atom_symbols": list(conformer_species[label]),
             "atom_coordinates": conformer_coordinates[label].tolist(),
+            # A molecule's orientation only fixes it up to its own symmetry, so the crystal
+            # symmetry search needs to know what that symmetry is.
+            "point_group": molecular_point_group(conformer_species[label],
+                                                 conformer_coordinates[label]),
+            "orientation_tolerance": orientation_tolerance(conformer_coordinates[label]),
         }
 
     # The dominant disorder group is the one with the highest occupancy. For now the crystal
@@ -290,6 +383,8 @@ def get_crystal_data(cif_path):
         "lattice": structure.lattice.matrix.tolist(),
         "dominant_group": dominant_group,
         "disorder_groups": disorder_groups,
+        # The operations the CIF states, which is where the crystal symmetry comes from.
+        "symmetry_operations": read_symmetry_operations(raw_block, structure),
     }
 
     return crystal_data
@@ -333,6 +428,16 @@ def build_crystal_metadata(crystal_data):
         "lattice": crystal_data["lattice"],  # Angstroms, rows are a1, a2, a3.
         "dominant_group": crystal_data["dominant_group"],
         "disorder_groups": disorder_groups,
+        # Cartesian rotations and translations in Angstroms, read from the CIF.
+        "symmetry_operations": crystal_data["symmetry_operations"],
+        # Each conformer's own point group, as 3x3 Cartesian rotations.
+        "point_groups": {label: crystal_data["conformers"][label]["point_group"]
+                         for label in crystal_data["conformer_labels"]},
+        # How far two orientations of one conformer may differ, given its size.
+        "orientation_tolerances": {label: crystal_data["conformers"][label]["orientation_tolerance"]
+                                   for label in crystal_data["conformer_labels"]},
+        # How far an atom may sit from where it is expected, in Angstroms.
+        "symmetry_tolerance": SYMMETRY_TOLERANCE,
     }
 
     return crystal_metadata
