@@ -133,9 +133,9 @@ def molecular_plot(data, request, settings):
                 subscript = state_subscript(group)
                 if signed:
                     symbol = r'\operatorname{Re}' if kind == 'real' else r'\operatorname{Im}'
-                    label = rf'${symbol}[f_{{{subscript}}}(\vec q)]$'
+                    label = rf'${symbol}[f_{{{subscript}}}(\mathbf{{q}})]$'
                 else:
-                    label = rf'$|f_{{{subscript}}}(\vec q)|^2$'
+                    label = rf'$|f_{{{subscript}}}(\mathbf{{q}})|^2$'
                 style.add_colourbar(fig, ax, norm, cmap, label, settings, signed=signed)
                 fixed = {'xy': 'z', 'xz': 'y', 'yz': 'x'}[plane]
                 style.add_boxes(ax, [rf'$q_{fixed}=0$'])
@@ -163,7 +163,7 @@ def molecular_plot(data, request, settings):
                 ax.set_xlabel(rf'${plane[0]}\ [\mathrm{{\AA}}]$')
                 ax.set_ylabel(rf'${plane[1]}\ [\mathrm{{\AA}}]$')
                 style.add_colourbar(fig, ax, norm, 'RdBu_r',
-                    rf'$\Phi^{{g\to {group[0]}}}(\vec r)\ [\mathrm{{\AA}}^{{-3}}]$', settings, signed=True)
+                    rf'$\Phi^{{g\to {group[0]}}}(\mathbf{{r}})\ [\mathrm{{\AA}}^{{-3}}]$', settings, signed=True)
                 fixed = {'xy': 'z', 'xz': 'y', 'yz': 'x'}[plane]
                 style.add_boxes(ax, [rf'${fixed}=0$'])
                 name = f'{kind}_s{group[0]}_{plane}'
@@ -227,7 +227,7 @@ def structure_plot(data, request, settings):
         ax.set_xlim(data.q[0], data.q[-1])
         ax.set_ylim(bottom=0)
         ax.set_xlabel(r'$q\ [\mathrm{keV}]$')
-        ax.set_ylabel(r'$\int dE\,\langle S(\vec q,E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
+        ax.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
         style.save_plot(fig, settings, kind)
         return
     modes = data.ranked_modes(request['count']) if request['modes'] == 'dominant' else request['modes']

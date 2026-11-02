@@ -90,7 +90,7 @@ def molecular_overview(data, request, config):
         ax.grid(False, which='both')
         ax.set_xlabel(rf'$q_{plane[0]}\ [\mathrm{{keV}}]$')
         ax.set_ylabel(rf'$q_{plane[1]}\ [\mathrm{{keV}}]$')
-        label = rf'$|f_{{{state_subscript(group)}}}(\vec q)|^2'
+        label = rf'$|f_{{{state_subscript(group)}}}(\mathbf{{q}})|^2'
         if len(group) > 1:
             label += '=' + '+'.join(rf'|f_{{{s}}}|^2' for s in group)
         overview_colourbar(fig, ax, norm, 'magma', label + '$')
@@ -106,7 +106,7 @@ def molecular_overview(data, request, config):
         ax.set_ylim(bottom=0)
         ax.set_xlabel(r'$q\ [\mathrm{keV}]$')
         ax.legend(loc='best', borderpad=.35)
-    axes[2].set_ylabel(r'$\langle |f_s(q)|^2\rangle_\Omega=(1/4\pi)\int d\Omega\,|f_s(\vec q)|^2$')
+    axes[2].set_ylabel(r'$\langle |f_s(q)|^2\rangle_\Omega=(1/4\pi)\int d\Omega\,|f_s(\mathbf{q})|^2$')
     axes[3].set_ylabel(r'$\sigma_\Omega(|f_s|^2)$')
     return fig
 
@@ -156,7 +156,7 @@ def structure_overview(data, config):
     ax_mean.set_ylabel(r'$E\ [\mathrm{eV}]$')
     style.style_axes(ax_mean, heatmap=True, tick_size=font)
     overview_colourbar(fig, ax_mean, mean_norm, 'magma',
-        r'$\langle S(\vec q,E)\rangle_\Omega=S_{00}(q,E)/\sqrt{4\pi}$' + '\n' +
+        r'$\langle S(\mathbf{q},E)\rangle_\Omega=S_{00}(q,E)/\sqrt{4\pi}$' + '\n' +
         r'$[\mathrm{\AA}^{-3}\,\mathrm{eV}^{-1}]$')
     # Top right: the three strongest harmonics, stacked in the space of one panel.
     left, bottom, frame_width, frame_height = rects[1]
@@ -185,7 +185,7 @@ def structure_overview(data, config):
     # Bottom left: the same angular mean, integrated over energy.
     ax_total.plot(data.q, integrated_mean, **line_style(0))
     ax_total.set_ylim(bottom=0)
-    ax_total.set_ylabel(r'$\int dE\,\langle S(\vec q,E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
+    ax_total.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
 
     # Bottom right: the energy integrals of the same three harmonics, which do change sign.
     ax_integrals.axhline(0, color='.45', lw=.5)
