@@ -18,6 +18,8 @@ Computation of form factors for scattering on molecules and crystals.
    python3 -m pip install -r requirements.txt
    ```
 
+Python GPU support is optional. Uncomment the matching CUDA group in `requirements.txt` before installing if needed. The CuPy and cuTENSOR versions follow the [GPU4PySCF installation recommendations](https://github.com/pyscf/gpu4pyscf#installation).
+
 3. **Install Julia and required packages:**
     Follow the instructions at https://julialang.org/downloads/ to install Julia.
 
