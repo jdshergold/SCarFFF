@@ -29,6 +29,7 @@ def use_style(caption_pt=9):
                          'font.serif': ['Computer Modern'], 'font.size': caption_pt,
                          'text.latex.preamble': r'\usepackage{amsmath,amssymb}',
                          'axes.labelsize': caption_pt, 'axes.linewidth': 0.65,
+                         'axes.formatter.limits': (-2, 6), 'axes.formatter.use_mathtext': True,
                          'xtick.labelsize': caption_pt, 'ytick.labelsize': caption_pt,
                          'legend.fontsize': caption_pt, 'legend.frameon': True,
                          'legend.framealpha': 0.9, 'legend.fancybox': False,
