@@ -688,7 +688,7 @@ end
     Xi_R = neutral_test_R(2, q_grid, l_max)
     transition_R = vcat(Delta_R[1:2, :, :], Delta_R[4:5, :, :])
     lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
-    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; eta = T(0.4))
+    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; kappa = T(0.4))
 
     mktempdir() do tmp_dir
         gaunt_path = joinpath(tmp_dir, "off_diagonal_D_gaunt.h5")
@@ -709,7 +709,7 @@ end
 
             radial_weights = CJ.quadrature_weights(q_grid, false)
             if split !== nothing
-                radial_weights .*= one(T) .- exp.(-(q_grid ./ (2 * split.eta)).^2)
+                radial_weights .*= one(T) .- exp.(-(q_grid ./ (2 * split.kappa)).^2)
             end
             for image in 1:2
                 neighbour = 3 - image
@@ -818,23 +818,23 @@ end
             split = SF.choose_ewald_parameters(lattice, Z_mol, epsilon_tot, truncation)
             # Both cutoffs must deliver exactly the error they were asked for, which is the whole
             # point of carrying the prefactors and the offset.
-            eta_eff = inv(sqrt(inv(split.eta^2) + inv(truncation.sigma_0^2)))
-            delta_R = truncation.A_R * exp(-split.eta^2 * (split.R_max - R_0)^2)
-            delta_G = truncation.A_G * exp(-split.G_max^2 / (4 * eta_eff^2))
+            kappa_eff = inv(sqrt(inv(split.kappa^2) + inv(truncation.sigma_0^2)))
+            delta_R = truncation.A_R * exp(-split.kappa^2 * (split.R_max - R_0)^2)
+            delta_G = truncation.A_G * exp(-split.G_max^2 / (4 * kappa_eff^2))
             @test delta_R ≈ epsilon_tot / sqrt(T(2)) rtol = 1e-6
             @test delta_G ≈ epsilon_tot / sqrt(T(2)) rtol = 1e-6
             # Check that the cutoffs are sensible.
             @test split.R_max > R_0
             @test split.G_max > 0
 
-            # A fixed η must satisfy the same two laws, just without minimising the work.
+            # A fixed κ must satisfy the same two laws, just without minimising the work.
             fixed = SF.choose_ewald_parameters(
-                lattice, Z_mol, epsilon_tot, truncation; eta = T(0.35))
-            @test fixed.eta == T(0.35)
-            fixed_eta_eff = inv(sqrt(inv(fixed.eta^2) + inv(truncation.sigma_0^2)))
-            @test truncation.A_R * exp(-fixed.eta^2 * (fixed.R_max - R_0)^2) ≈
+                lattice, Z_mol, epsilon_tot, truncation; kappa = T(0.35))
+            @test fixed.kappa == T(0.35)
+            fixed_kappa_eff = inv(sqrt(inv(fixed.kappa^2) + inv(truncation.sigma_0^2)))
+            @test truncation.A_R * exp(-fixed.kappa^2 * (fixed.R_max - R_0)^2) ≈
                   epsilon_tot / sqrt(T(2)) rtol = 1e-6
-            @test truncation.A_G * exp(-fixed.G_max^2 / (4 * fixed_eta_eff^2)) ≈
+            @test truncation.A_G * exp(-fixed.G_max^2 / (4 * fixed_kappa_eff^2)) ≈
                   epsilon_tot / sqrt(T(2)) rtol = 1e-6
         end
     end
@@ -848,11 +848,11 @@ end
             lattice, Z_mol, T(1e-3), truncation; q_reach = free.G_max / 2)
         @test capped.G_max ≈ free.G_max / 2
         @test capped.R_max > free.R_max
-        @test capped.eta < free.eta
-        eta_eff = inv(sqrt(inv(capped.eta^2) + inv(truncation.sigma_0^2)))
-        @test truncation.A_R * exp(-capped.eta^2 * (capped.R_max - R_0)^2) ≈
+        @test capped.kappa < free.kappa
+        kappa_eff = inv(sqrt(inv(capped.kappa^2) + inv(truncation.sigma_0^2)))
+        @test truncation.A_R * exp(-capped.kappa^2 * (capped.R_max - R_0)^2) ≈
               T(1e-3) / sqrt(T(2)) rtol = 1e-6
-        @test truncation.A_G * exp(-capped.G_max^2 / (4 * eta_eff^2)) ≈
+        @test truncation.A_G * exp(-capped.G_max^2 / (4 * kappa_eff^2)) ≈
               T(1e-3) / sqrt(T(2)) rtol = 1e-6
 
         # If q_max is beyond the optimal G_max, nothing changes.
@@ -869,10 +869,10 @@ end
         R_0 = truncation.k_R * cbrt(lattice.V_cell / Z_mol)
         costed = SF.choose_ewald_parameters(
             lattice, Z_mol, T(1e-3), truncation; q_reach = q_max, cost = cost, sizes...)
-        eta_eff = inv(sqrt(inv(costed.eta^2) + inv(truncation.sigma_0^2)))
-        @test truncation.A_R * exp(-costed.eta^2 * (costed.R_max - R_0)^2) ≈
+        kappa_eff = inv(sqrt(inv(costed.kappa^2) + inv(truncation.sigma_0^2)))
+        @test truncation.A_R * exp(-costed.kappa^2 * (costed.R_max - R_0)^2) ≈
               T(1e-3) / sqrt(T(2)) rtol = 1e-6
-        @test truncation.A_G * exp(-costed.G_max^2 / (4 * eta_eff^2)) ≈
+        @test truncation.A_G * exp(-costed.G_max^2 / (4 * kappa_eff^2)) ≈
               T(1e-3) / sqrt(T(2)) rtol = 1e-6
     end
 
@@ -892,7 +892,7 @@ end
     # σ_0 only narrows the reciprocal cutoff, since it leads to a faster decay.
     no_decay = SF.EwaldTruncation(
         SF.J_TRUNCATION.A_R, SF.J_TRUNCATION.A_G, Inf, SF.J_TRUNCATION.k_R)
-    wider = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), no_decay; eta = J_split.eta)
+    wider = SF.choose_ewald_parameters(lattice, Z_mol, T(1e-3), no_decay; kappa = J_split.kappa)
     @test wider.G_max > J_split.G_max
     @test wider.R_max ≈ J_split.R_max
 
@@ -905,7 +905,7 @@ end
         loose = SF.choose_ewald_parameters(lattice, Z_mol, T(0.5), truncation)
         capped = SF.choose_ewald_parameters(lattice, Z_mol, T(SF.Ewald.MAX_EPSILON_TOT), truncation)
         @test loose.epsilon_tot == T(SF.Ewald.MAX_EPSILON_TOT)
-        @test loose.eta == capped.eta
+        @test loose.kappa == capped.kappa
         @test loose.R_max == capped.R_max
         @test loose.G_max == capped.G_max
         # The cap has to be sensible, or else it might as well not exist.
@@ -963,12 +963,12 @@ end
         @test size(direct_D) == (1, 2, 2)
         @test abs(direct_D[1, 1, 2]) > 1e-6
 
-        # η splits the sum between the two halves and must cancel out of the total. The two splits must not
+        # κ splits the sum between the two halves and must cancel out of the total. The two splits must not
         # depend on one another.
         ewald_values = Array{T, 3}[]
         J_parameters = SF.Ewald.EwaldParameters{T}(T(0.45), T(9), T(4), T(1e-8))
-        for eta in T[0.4, 0.5]
-            D_parameters = SF.Ewald.EwaldParameters{T}(eta, T(11), 2 * eta * sqrt(T(18.76)), T(1e-8))
+        for kappa in T[0.4, 0.5]
+            D_parameters = SF.Ewald.EwaldParameters{T}(kappa, T(11), 2 * kappa * sqrt(T(18.76)), T(1e-8))
             short_cells = CJ.enumerate_neighbour_cells(
                 lattice, max(J_parameters.R_max, D_parameters.R_max))
             long_range = SF.Ewald.build_ewald_long_range(
@@ -1011,7 +1011,7 @@ end
     transition_bc = vcat(Delta_bc[1:2, :, :], Delta_bc[4:5, :, :])
     tau_of_lambda_i = [images[image].tau for image in basis.image_of]
     lattice = SF.build_crystal_lattice(T[8 0 0; 0 8 0; 0 0 8], T)
-    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; eta = T(0.4))
+    parameters = SF.choose_ewald_parameters(lattice, 2, T(1e-8), SF.D_TRUNCATION; kappa = T(0.4))
     pairs = DM.build_transition_pairs(2)
 
     vacuum = SF.build_ewald_long_range(
@@ -1054,7 +1054,7 @@ end
         Xi_at_G = neutral_test_R(2, T[G_norm], l_max)
         total_Xi = sum(cis(dot(G, images[image].tau)) *
                        sum(Xi_at_G[image, 1, :] .* harmonics) for image in 1:2)
-        weight = vacuum.prefactor * exp(-(G_norm / (2 * parameters.eta))^2) / G_norm^2
+        weight = vacuum.prefactor * exp(-(G_norm / (2 * parameters.kappa))^2) / G_norm^2
         for image in 1:2, (pair, (s, t)) in enumerate(pairs.transitions_of_pair)
             row = (image - 1) * 3 + pair
             value = weight * cis(dot(G, images[image].tau)) *
@@ -1069,7 +1069,7 @@ end
     # At zero separation the angular integral reduces to an inner product. Only the Ξ on the
     # same molecule is removed, rather than the whole unit-cell charge density.
     q_step = q_grid[2] - q_grid[1]
-    self_weights = q_step .* exp.(-(q_grid ./ (2 * parameters.eta)).^2)
+    self_weights = q_step .* exp.(-(q_grid ./ (2 * parameters.kappa)).^2)
     self_weights[1] /= 2
     self_weights[end] /= 2
     self_D = zeros(T, 2, 2, 2)
@@ -1086,7 +1086,7 @@ end
     # Cutting the reciprocal sum below the shortest reciprocal vector, with conducting boundaries,
     # leaves exactly -D_self.
     no_reciprocal = SF.Ewald.EwaldParameters{T}(
-        parameters.eta, parameters.R_max, T(0.1), parameters.epsilon_tot)
+        parameters.kappa, parameters.R_max, T(0.1), parameters.epsilon_tot)
     self_only = SF.compute_ewald_D(Delta_R, Xi_R, Delta_bc, Xi_bc,
         q_grid, q_bc, basis.n_transitions, l_max, conductor, no_reciprocal)
     @test self_only ≈ -self_D rtol = 2e-12 atol = 2e-12

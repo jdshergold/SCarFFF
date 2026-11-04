@@ -20,7 +20,7 @@ DEFAULTS = {
     'cartesian': {'q_x': [-15.0, 15.0, 101], 'q_y': [-15.0, 15.0, 101],
                   'q_z': [-15.0, 15.0, 101], 'threshold': 1.0e-6, 'save': ['f_s']},
     'crystal': {'order': 'coherent', 'coupling_method': 'ewald', 'coupling_cutoff': 40.0,
-                'epsilon_b': 'inf', 'ewald_epsilon_tot': 1.0e-3, 'ewald_eta': 0.0,
+                'epsilon_b': 'inf', 'ewald_epsilon_tot': 1.0e-3, 'ewald_kappa': 0.0,
                 'q_bc': 1.0e-4, 'energy_step': 0.01,
                 'band_range_star_stride': 8, 'band_range_q_stride': 4,
                 'structure_function': True, 'couplings': True,
@@ -208,9 +208,9 @@ def load_job(path):
         if not epsilon_b >= 1:
             raise ValueError('crystal.epsilon_b must be at least one.')
         settings['epsilon_b'] = 'inf' if epsilon_b == float('inf') else epsilon_b
-        for name in ('coupling_cutoff', 'ewald_eta', 'ewald_epsilon_tot', 'q_bc', 'energy_step'):
+        for name in ('coupling_cutoff', 'ewald_kappa', 'ewald_epsilon_tot', 'q_bc', 'energy_step'):
             settings[name] = number(settings[name], 'crystal.' + name,
-                                    strict=name not in ('coupling_cutoff', 'ewald_eta'))
+                                    strict=name not in ('coupling_cutoff', 'ewald_kappa'))
         if settings['ewald_epsilon_tot'] >= 1:
             raise ValueError('crystal.ewald_epsilon_tot must be less than one.')
         for name in ('band_range_star_stride', 'band_range_q_stride'):

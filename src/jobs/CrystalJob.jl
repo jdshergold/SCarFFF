@@ -278,7 +278,7 @@ function run_crystals(job)
     coupling_method = crystal["coupling_method"]
     coupling_cutoff = crystal["coupling_cutoff"]
     epsilon_tot = crystal["ewald_epsilon_tot"]
-    ewald_eta = crystal["ewald_eta"]
+    ewald_kappa = crystal["ewald_kappa"]
     epsilon_b = crystal["epsilon_b"] == "inf" ? Inf : crystal["epsilon_b"]
     q_bc = crystal["q_bc"]
     energy_step = crystal["energy_step"]
@@ -754,13 +754,13 @@ function run_crystals(job)
                                 for label in conformer_labels)
                             J_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, J_TRUNCATION;
-                                eta = ewald_eta, q_reach = q_grid_invA[end], cost = J_COST,
+                                kappa = ewald_kappa, q_reach = q_grid_invA[end], cost = J_COST,
                                 n_transitions = basis.n_transitions, l_max = l_max,
                                 n_q = length(q_grid), n_stars = length(stars.irreducible_directions),
                                 n_pair = n_cartesian_pairs)
                             D_parameters = choose_ewald_parameters(
                                 lattice, length(basis.images), epsilon_tot, D_TRUNCATION;
-                                eta = ewald_eta, q_reach = q_grid_invA[end], cost = D_COST,
+                                kappa = ewald_kappa, q_reach = q_grid_invA[end], cost = D_COST,
                                 n_transitions = basis.n_transitions, l_max = l_max,
                                 n_q = length(q_grid), n_stars = length(stars.irreducible_directions))
                             # Pad the cutoff to not miss any molecules. Extra molecules will be dropped later.
@@ -801,10 +801,10 @@ function run_crystals(job)
                             # familiar length to read the real-space cutoffs against.
                             @printf("\n  Ewald split · δ_tot = %.1e\n", epsilon_tot)
                             println("  ", "-"^54)
-                            println("              η [Å⁻¹]    R_max [Å]    G_max [Å⁻¹]")
+                            println("              κ [Å⁻¹]    R_max [Å]    G_max [Å⁻¹]")
                             for (name, split) in (("J", J_parameters), ("D", D_parameters))
                                 expected_G = lattice.V_cell * split.G_max^3 / (6 * π^2)
-                                @printf("  %-4s %13.4f %12.2f %15.4f\n", name, split.eta, split.R_max, split.G_max)
+                                @printf("  %-4s %13.4f %12.2f %15.4f\n", name, split.kappa, split.R_max, split.G_max)
                             end
                             println("  Computing crystal couplings...")
                             flush(stdout)
@@ -1052,10 +1052,10 @@ function run_crystals(job)
                                 # Everything here belongs to J's split, which is the one the table
                                 # was built at. D's own cutoffs are saved below it.
                                 long_range_group = create_group(couplings_group, "long_range")
-                                write(long_range_group, "eta_J", splits.J.eta) # Å^-1.
+                                write(long_range_group, "kappa_J", splits.J.kappa) # Å^-1.
                                 write(long_range_group, "R_max_J", splits.J.R_max) # Å.
                                 write(long_range_group, "G_max_J", splits.J.G_max) # Å^-1.
-                                write(long_range_group, "eta_D", splits.D.eta) # Å^-1.
+                                write(long_range_group, "kappa_D", splits.D.kappa) # Å^-1.
                                 write(long_range_group, "R_max_D", splits.D.R_max) # Å.
                                 write(long_range_group, "G_max_D", splits.D.G_max) # Å^-1.
                                 # The requested error both splits were pinned to. Not the medium

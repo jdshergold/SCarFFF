@@ -253,7 +253,7 @@ function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, J_param
     In natural units, the spacing estimate is
 
         Δq = 2π / [d_max + 2 r_N + σ_alias √(2 ln(1/ε_tot))],
-        σ_alias² = 2 σ_max² + 1/(2η²).
+        σ_alias² = 2 σ_max² + 1/(2κ²).
 
     Here ε_tot is the requested truncation error, d_max + 2 r_N bounds the phase distances, r_N is the largest
     nuclear radius, and σ_alias adds a Gaussian margin for the electronic FFs and the Ewald factor.
@@ -282,9 +282,9 @@ function choose_short_range_grid(saved_q::Vector{T}, data, basis, cells, J_param
     iszero(geometry.P) && return saved_q, collect(eachindex(saved_q))
     epsilon = min(J_parameters.epsilon_tot, D_parameters.epsilon_tot)
     H = T(CrystalLattice.HBAR_C_EV_ANGSTROM / 1000)
-    # Add the two FF Gaussian widths and the width from exp(-q²/(4η²)).
+    # Add the two FF Gaussian widths and the width from exp(-q²/(4κ²)).
     sigma_alias = sqrt(2 * geometry.sigma_max^2 +
-                       inv(2 * min(J_parameters.eta, D_parameters.eta)^2))
+                       inv(2 * min(J_parameters.kappa, D_parameters.kappa)^2))
     spacing = 2 * T(π) * H / (geometry.d_max + 2 * geometry.r_N + sigma_alias * sqrt(2 * log(inv(epsilon))))
     lower, upper = zero(T), H / geometry.sigma_max
     # Vanishing density envelopes need no radial extension, even if their reference scales are zero.

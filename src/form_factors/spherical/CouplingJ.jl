@@ -243,7 +243,7 @@ function radial_quadrature(
     weights[1] /= 2
     weights[end] /= 2
 
-    return weights .* short_range_kernel(q_grid_invA, parameters.eta)
+    return weights .* short_range_kernel(q_grid_invA, parameters.kappa)
 end
 
 function fill_pair_P!(
@@ -254,7 +254,7 @@ function fill_pair_P!(
     """
     Multiply the Gaunt part of P̄ by its Bessel functions.
 
-    Nothing here depends on η, so one table serves both couplings however their splits differ. Each
+    Nothing here depends on κ, so one table serves both couplings however their splits differ. Each
     coupling's quadrature weights and short-range kernel are carried by the form factor it
     contracts this against instead.
 
@@ -432,7 +432,7 @@ function _compute_crystal_corrections(
     """
     Compute the short-range Frenkel couplings and, when supplied, the same-molecule D blocks in each pair frame.
 
-        J_SR_{A_i s, B_j t}(ΔR) = (2 α_EM / π) Σ_{ℓ,ℓ'} Σ_μ ∫dq [1 - exp(-q²/4η²)]
+        J_SR_{A_i s, B_j t}(ΔR) = (2 α_EM / π) Σ_{ℓ,ℓ'} Σ_μ ∫dq [1 - exp(-q²/4κ²)]
                                       f̄^{(A_i,s)}_{ℓμ,αβ}(q) P̄^{αβ}_{ℓℓ',μ}(q) f̄^{(B_j,t)*}_{ℓ'μ,αβ}(q),
 
     where d_{αβ} = τ_λ_i - τ_λ_j′ - ΔR is the vector between the two molecules, and
@@ -441,7 +441,7 @@ function _compute_crystal_corrections(
 
         f̄^{(A_i,s)}_{ℓμ,αβ}(q)  = Σ_ν D_{μν}(S^{-1}_{αβ}) f^{(A_i,s)}_{ℓν}(q).
 
-    The short-range Ewald factor is 1 - exp(-q²/4η²), with η the Ewald parameter. J and D each carry
+    The short-range Ewald factor is 1 - exp(-q²/4κ²), with κ the Ewald parameter. J and D each carry
     their own split, to not waste work on one of the terms. Usually D is cheaper.
 
     To ensure that the SR integral converges to the require precision, its q grid can differ
@@ -793,7 +793,7 @@ function compute_crystal_corrections(
         J: R P_pair R*,             D_SR: Delta P_pair Xi*.
 
     The separation, Bessel table, pair-frame P table and pair-frame rotations are shared, even where
-    the two couplings are split at different η, since none of them depends on η. For D, P̄ is
+    the two couplings are split at different κ, since none of them depends on κ. For D, P̄ is
     applied once to Ξ and the resulting potential is dotted with every Δ.
 
     # Arguments:

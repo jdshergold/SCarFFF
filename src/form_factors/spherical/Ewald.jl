@@ -30,8 +30,8 @@ struct EwaldTruncation
     """
     Stores the measured constants that determine the truncation error of the Ewald splits.
 
-        δ_R ≃ A_R exp[-η²(R_max - R_0)²],      R_0 = k_R (V_cell/Z_mol)^{1/3},
-        δ_G ≃ A_G exp[-G_max²/4η_eff²],        1/η_eff² = 1/η² + 1/σ_0².
+        δ_R ≃ A_R exp[-κ²(R_max - R_0)²],      R_0 = k_R (V_cell/Z_mol)^{1/3},
+        δ_G ≃ A_G exp[-G_max²/4κ_eff²],        1/κ_eff² = 1/κ² + 1/σ_0².
 
     R_0 accounts for the fact that elements of charge can be closer than the molecular centres,
     whilst σ_0 accounts for the natural decay of the form factor with q.
@@ -105,14 +105,14 @@ struct EwaldParameters{T<:AbstractFloat}
     G_max and R_max are then chosen such that the amount of work done is minimised.
 
     # Fields:
-    - eta::T: The splitting parameter η, in Å^{-1}.
+    - kappa::T: The splitting parameter κ, in Å^{-1}.
     - R_max::T: The real-space cutoff for the short-range sum, in Å.
     - G_max::T: The reciprocal-space cutoff for the long-range sum, in Å^{-1}. The sum runs over
       reciprocal lattice vectors G, but the term dropped at the cutoff is the one at Q = k + G, so
       this bounds |Q| rather than |G|. See add_long_range!.
     - epsilon_tot::T: The truncation error the cutoffs are pinned to.
     """
-    eta::T
+    kappa::T
     R_max::T
     G_max::T
     epsilon_tot::T
@@ -123,7 +123,7 @@ function choose_ewald_parameters(
         Z_mol::Integer,
         epsilon_tot::Real,
         truncation::EwaldTruncation;
-        eta::Real = 0,
+        kappa::Real = 0,
         q_reach::Real = Inf,
         cost::Union{Nothing, EwaldCost} = nothing,
         n_transitions::Integer = 0,
@@ -133,7 +133,7 @@ function choose_ewald_parameters(
         n_pair::Integer = 0,
     )::EwaldParameters{T} where {T<:AbstractFloat}
     """
-    Choose η and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
+    Choose κ and the two cutoffs of one coupling's (J or D) split for a requested total error, ε_tot.
 
     Pinning both truncation errors to ε_tot/√2 leaves one free parameter, which is fixed by
     minimising the total work
@@ -142,10 +142,10 @@ function choose_ewald_parameters(
 
     where c_F is the cost of building th e molecular form factor at the short-range grid's new radial nodes.
 
-    Taking G_max as the free one, the error on the reciprocal sum fixes η and the error on the real
+    Taking G_max as the free one, the error on the reciprocal sum fixes κ and the error on the real
     space sum then fixes R_max,
 
-        1/η² = 4 L_G/G_max² - 1/σ_0²,    R_max = R_0 + √L_R / η,    L_{R/G} = ln(√2 A_{R/G}/ε_tot),
+        1/κ² = 4 L_G/G_max² - 1/σ_0²,    R_max = R_0 + √L_R / κ,    L_{R/G} = ln(√2 A_{R/G}/ε_tot),
 
     we then find the best G_max which satisfies dW/dG_max = 0.
 
@@ -155,7 +155,7 @@ function choose_ewald_parameters(
     - Z_mol::Integer: The number of molecules in the unit cell, which sets the volume per molecule.
     - epsilon_tot::Real: The requested truncation error, in (0, 1).
     - truncation::EwaldTruncation: The convergence constants of the coupling being split.
-    - eta::Real: A fixed η in Å^{-1}, or 0 to derive one.
+    - kappa::Real: A fixed κ in Å^{-1}, or 0 to derive one.
     - q_reach::Real: How far the saved q grid reaches, q_max, in Å^{-1}, which caps G_max. Infinite
       for no cap.
     - cost::Union{Nothing, EwaldCost}: The cost constants of the coupling being split, or nothing for
@@ -223,30 +223,30 @@ function choose_ewald_parameters(
         c_F_0 = (T(cost.B_F1) + T(cost.B_F2) * (T(n_transitions) / 12)^2) *
                 (T(n_pair) / 15000) * (T(l_max) / 24)^2
     end
-    # Find the η and R_max that give the requested error.
+    # Find the κ and R_max that give the requested error.
     split_at(G) = begin
-        inverse_eta_squared = 4 * L_G / G^2 - inverse_sigma_squared
-        inverse_eta_squared > 0 || error(
+        inverse_kappa_squared = 4 * L_G / G^2 - inverse_sigma_squared
+        inverse_kappa_squared > 0 || error(
             "The reciprocal cutoff $(G) Å^{-1} is wider than the form factor's own decay allows " *
-            "(σ_0 = $(truncation.sigma_0) Å^{-1}), so no η delivers the requested error.")
-        eta_value = inv(sqrt(inverse_eta_squared))
-        return eta_value, R_0 + sqrt(L_R) / eta_value
+            "(σ_0 = $(truncation.sigma_0) Å^{-1}), so no κ delivers the requested error.")
+        kappa_value = inv(sqrt(inverse_kappa_squared))
+        return kappa_value, R_0 + sqrt(L_R) / kappa_value
     end
 
-    if eta > 0
-        eta_value = T(eta)
-        # The same two errors, but with η taken as given rather than derived.
-        eta_eff = inv(sqrt(inv(eta_value^2) + inverse_sigma_squared))
-        G_max = 2 * eta_eff * sqrt(L_G)
-        # With η fixed, R_max cannot be extended to compensate, so G_max > q_max misses the requested error.
+    if kappa > 0
+        kappa_value = T(kappa)
+        # The same two errors, but with κ taken as given rather than derived.
+        kappa_eff = inv(sqrt(inv(kappa_value^2) + inverse_sigma_squared))
+        G_max = 2 * kappa_eff * sqrt(L_G)
+        # With κ fixed, R_max cannot be extended to compensate, so G_max > q_max misses the requested error.
         if G_max > T(q_reach)
-            @warn("For this fixed η, the required G_max > q_max for the requested error, so it cannot " *
-                  "be achieved. We recommend increasing q_max, or leaving η free.", maxlog = 1, eta = eta_value, wanted = G_max,
+            @warn("For this fixed κ, the required G_max > q_max for the requested error, so it cannot " *
+                  "be achieved. We recommend increasing q_max, or leaving κ free.", maxlog = 1, kappa = kappa_value, wanted = G_max,
                   q_reach = q_reach,
-                  reciprocal_error = T(truncation.A_G) * exp(-T(q_reach)^2 / (4 * eta_eff^2)))
+                  reciprocal_error = T(truncation.A_G) * exp(-T(q_reach)^2 / (4 * kappa_eff^2)))
             G_max = T(q_reach)
         end
-        return EwaldParameters{T}(eta_value, R_0 + sqrt(L_R) / eta_value, G_max, epsilon)
+        return EwaldParameters{T}(kappa_value, R_0 + sqrt(L_R) / kappa_value, G_max, epsilon)
     end
 
     # The work at one G_max, with R_max taken from the truncation laws so that the requested error is
@@ -312,10 +312,10 @@ function choose_ewald_parameters(
         G_max = T(q_reach)
     end
 
-    # Take the η and R_max corresponding to G_max.
-    eta_value, R_max = split_at(G_max)
+    # Take the κ and R_max corresponding to G_max.
+    kappa_value, R_max = split_at(G_max)
 
-    return EwaldParameters{T}(eta_value, R_max, G_max, epsilon)
+    return EwaldParameters{T}(kappa_value, R_max, G_max, epsilon)
 end
 
 function supercell_radius(lattice::CrystalLatticeData{T})::T where {T<:AbstractFloat}
@@ -346,18 +346,18 @@ function supercell_radius(lattice::CrystalLatticeData{T})::T where {T<:AbstractF
     return radius
 end
 
-function short_range_kernel(q_grid_invA::Vector{T}, eta::T)::Vector{T} where {T<:AbstractFloat}
+function short_range_kernel(q_grid_invA::Vector{T}, kappa::T)::Vector{T} where {T<:AbstractFloat}
     """
-    The short-range Ewald kernel, [1 - exp(-q²/4η²)].
+    The short-range Ewald kernel, [1 - exp(-q²/4κ²)].
 
     # Arguments:
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
-    - eta::T: The splitting parameter η, in Å^{-1}.
+    - kappa::T: The splitting parameter κ, in Å^{-1}.
 
     # Returns:
     - Vector{T}: The kernel on the q grid.
     """
-    return [one(T) - exp(-(q / (2 * eta))^2) for q in q_grid_invA]
+    return [one(T) - exp(-(q / (2 * kappa))^2) for q in q_grid_invA]
 end
 
 struct EwaldLongRangeData{T<:AbstractFloat}
@@ -379,7 +379,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     - image_of::Vector{Int}: Which of those tau each λ_i carries, so its length is n_lambda_i.
     - dipole_slopes::Matrix{Complex{T}}: lim_{q→0} f_{1m}(q)/q for each λ_i, columns m = -1, 0, 1, in Å. Used for the boundary term.
     - J_self::Matrix{Complex{T}}: J^self_{λ_iλ_j′} for λ_i, λ_j′ on the same image, in eV.
-    - eta::T: The splitting parameter η, in Å^{-1}.
+    - kappa::T: The splitting parameter κ, in Å^{-1}.
     - G_max::T: The reciprocal-space cutoff, in Å^{-1}.
     - prefactor::T: 4π α_EM ħc / V_cell, in eV Å^{-2}.
     - epsilon_b::T: The permittivity of the medium around the sample. Not to be confused with the Ewald truncation
@@ -395,7 +395,7 @@ struct EwaldLongRangeData{T<:AbstractFloat}
     image_of::Vector{Int}
     dipole_slopes::Matrix{Complex{T}}
     J_self::Matrix{Complex{T}}
-    eta::T
+    kappa::T
     G_max::T
     prefactor::T
     epsilon_b::T
@@ -658,7 +658,7 @@ function build_ewald_long_range(
     """
     Assemble everything the long-range sum
 
-        J_bar^LR_{λ_iλ_j′}(k) = (4π α_EM ħc / V_cell) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4η²) f_{λ_i}(Q) conj(f_{λ_j′}(Q)),
+        J_bar^LR_{λ_iλ_j′}(k) = (4π α_EM ħc / V_cell) Σ_{Q ≠ 0}^{G_max} (1/Q²) exp(-Q²/4κ²) f_{λ_i}(Q) conj(f_{λ_j′}(Q)),
         
     with
         
@@ -745,7 +745,7 @@ function build_ewald_long_range(
 
     # Compute the q -> 0 term, and self-interaction term.
     dipole_slopes = dipole_slope_matrix(rotated_R_bc, q_bc_invA, l_max)
-    J_self = J_self_matrix(rotated_R, image_of, q_grid_invA, l_max, parameters.eta)
+    J_self = J_self_matrix(rotated_R, image_of, q_grid_invA, l_max, parameters.kappa)
 
     prefactor = T(4 * π * ALPHA_EM * HBAR_C_EV_ANGSTROM) / lattice.V_cell
 
@@ -756,7 +756,7 @@ function build_ewald_long_range(
     return EwaldLongRangeData{T}(
         lattice, G_vectors, f_table, f_tangent, q_step, l_max_lr,
         tau, copy(image_of),
-        dipole_slopes, J_self, parameters.eta, parameters.G_max, prefactor, T(epsilon_b),
+        dipole_slopes, J_self, parameters.kappa, parameters.G_max, prefactor, T(epsilon_b),
     )
 end
 
@@ -864,7 +864,7 @@ function J_self_matrix(
         image_of::Vector{Int},
         q_grid_invA::Vector{T},
         l_max::Int,
-        eta::T,
+        kappa::T,
     )::Matrix{Complex{T}} where {T<:AbstractFloat}
     """
     The self-interaction J^self_{λ_iλ_j′} that the reciprocal sum includes but the physics does not,
@@ -872,7 +872,7 @@ function J_self_matrix(
 
     At zero separation the phase drops out and the full integral reduces to a single radial integral:
 
-        J^self_{λ_iλ_j′} = (α_EM ħc / 2π²) ∫dq exp(-q²/4η²) Σ_{ℓm} f^{λ_i}_{ℓm}(q) conj(f^{λ_j′}_{ℓm}(q)).
+        J^self_{λ_iλ_j′} = (α_EM ħc / 2π²) ∫dq exp(-q²/4κ²) Σ_{ℓm} f^{λ_i}_{ℓm}(q) conj(f^{λ_j′}_{ℓm}(q)).
 
     Only pairs on the same molecule are affected, so the matrix is zero between different images.
 
@@ -881,7 +881,7 @@ function J_self_matrix(
     - image_of::Vector{Int}: The image index for each λ_i.
     - q_grid_invA::Vector{T}: The |q| grid, in inverse Å.
     - l_max::Int: The maximum angular momentum mode of the form factor.
-    - eta::T: The splitting parameter η, in Å^{-1}.
+    - kappa::T: The splitting parameter κ, in Å^{-1}.
 
     # Returns:
     - Matrix{Complex{T}}: The self-interaction in eV, with dimensions (n_lambda_i, n_lambda_i).
@@ -901,7 +901,7 @@ function J_self_matrix(
                (q_grid_invA[q_idx + 1] - q_grid_invA[q_idx - 1]) / 2
         # Endpoint and interior weights are different from interior.
         weights[q_idx] = (q_idx == 1 || q_idx == n_q ? step / 2 : step) *
-                         exp(-(q_grid_invA[q_idx] / (2 * eta))^2)
+                         exp(-(q_grid_invA[q_idx] / (2 * kappa))^2)
     end
 
     prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
@@ -1045,7 +1045,7 @@ function compute_ewald_D(
 
         # Contract Δ with the shared Ξ sum, phased onto each molecule's position in the cell. Both
         # excitations of a block sit on the same molecule, so there is one phase for the whole block.
-        weight = data.prefactor * exp(-(G_norm / (2 * parameters.eta))^2) / (G_norm * G_norm)
+        weight = data.prefactor * exp(-(G_norm / (2 * parameters.kappa))^2) / (G_norm * G_norm)
         for image in 1:n_images
             phase = cis(dot(G, data.tau[image]))
             for pair in 1:n_pairs
@@ -1098,7 +1098,7 @@ function compute_ewald_D(
                (q_grid_invA[q_idx + 1] - q_grid_invA[q_idx - 1]) / 2
         # Endpoint and interior weights are different from interior.
         radial_weights[q_idx] = (q_idx == 1 || q_idx == n_q ? step / 2 : step) *
-                                exp(-(q_grid_invA[q_idx] / (2 * parameters.eta))^2)
+                                exp(-(q_grid_invA[q_idx] / (2 * parameters.kappa))^2)
     end
     # At d = 0 orthonormality collapses the angular integral to an inner product over keys.
     self_prefactor = Complex{T}(ALPHA_EM * HBAR_C_EV_ANGSTROM / (2 * π^2))
@@ -1160,7 +1160,7 @@ end
 
     @inbounds for G in data.G_vectors
         # Find Q = k + G. The cutoff goes on |Q|, not |G|, because the Gaussian weight that sets
-        # the truncation error is exp(-Q²/4η²).
+        # the truncation error is exp(-Q²/4κ²).
         Q = k_folded + G
         Q_norm = norm(Q)
         Q_norm <= data.G_max || continue
@@ -1219,7 +1219,7 @@ end
         end
 
         # Accumulate weight * f_image f_image^† into the upper triangle ('U') of H.
-        weight = data.prefactor * exp(-(Q_norm / (2 * data.eta))^2) / (Q_norm * Q_norm)
+        weight = data.prefactor * exp(-(Q_norm / (2 * data.kappa))^2) / (Q_norm * Q_norm)
         BLAS.her!('U', weight, f_image, H)
     end
 
