@@ -16,6 +16,7 @@ using ..BlochHamiltonian: CrystalImage, CrystalExcitationBasis, BlochEigensystem
 using ..ProjectFSquared: build_projection_matrix, build_U_blocks, project_block!
 using ..WignerRotations: wigner_d_blocks
 using ..CrystalSymmetry: Stars, SymmetryOperation
+using ..SiteSymmetry: SiteSymmetryTransfer, build_site_symmetry
 using ..StructureFactor: EnergyGrid, accumulate_delta!
 using ...ThreadChunks: chunk_count, chunk_range
 
@@ -323,6 +324,7 @@ function compute_coherent_unit_cell_form_factor(
         long_range::Union{Nothing, EwaldLongRangeData{T}} = nothing,
         energy_grid::Union{Nothing, EnergyGrid{T}} = nothing,
         structure_factor_buffer::Union{Nothing, Array{T, 4}} = nothing,
+        site_symmetry::Union{Nothing, Vector{Vector{SiteSymmetryTransfer{T}}}} = nothing,
     ) where {T<:AbstractFloat}
     """
     Build the coherent unit-cell form factor for each crystal band n,
@@ -342,9 +344,12 @@ function compute_coherent_unit_cell_form_factor(
 
     The crystal symmetries relate k-points on the "star", k -> k_Λ, by
 
-        k_Λ = R_Λ k,   ΔE_n(k_Λ) = ΔE_n(k),   C_{Λ(A_i),s}(k_Λ) = C_{A_i,s}(k) exp(-i k_Λ · L_{Λ,A_i}),
-    
-    with L_{Λ,A_i} = R_Λ τ_{A,i} - τ_{Λ(A_i)} + τ_Λ. Internally, time reversal is treated as a special case of a symmetry operation, so the same code handles both.
+        k_Λ = R_Λ k,   ΔE_n(k_Λ) = ΔE_n(k),
+
+        C_{Λ(A_i),s'}(k_Λ) = exp(-i k_Λ · L_{Λ,A_i}) Σ_s ζ^{(s,s')}_{A,Λi} C_{A_i,s}(k),
+
+    with L_{Λ,A_i} = R_Λ τ_{A,i} - τ_{Λ(A_i)} + τ_Λ. Internally, time reversal is treated as a special case of a symmetry
+    operation, so the same code handles both.
 
     # Arguments:
     - rotated_R::Array{Complex{T}, 3}: The rotated coefficients f, with dimensions (n_lambda_i, n_q, n_keys).
@@ -364,6 +369,8 @@ function compute_coherent_unit_cell_form_factor(
     - structure_factor_buffer::Union{Nothing, Array{T, 4}}: The array the structure factor is built
       in, holding one block of q at a time, with dimensions (n_energy, q_block, n_theta, n_phi). The
       whole q grid at once would be several GB. Required when energy_grid is given.
+    - site_symmetry::Union{Nothing, Vector{Vector{SiteSymmetryTransfer{T}}}}: The site symmetry
+      terms.
 
     # Returns:
     - f_sq::Array{T, 4}: |f_{n,uc}(q)|² with dimensions (n_states, length(q_indices), n_theta, n_phi).
@@ -413,7 +420,11 @@ function compute_coherent_unit_cell_form_factor(
     image_translations = [image.tau for image in basis.images]
     n_images = length(image_translations)
     image_of_lambda_i = basis.image_of
-    permutations = build_lambda_i_permutations(basis, stars.operations)
+    # How each operation changes the mixing coefficients, including the site symmetry mixing that
+    # a molecule on a special position introduces. It does not depend on which q are being done,
+    # so a caller working through q in blocks builds it once.
+    transfers = site_symmetry === nothing ?
+        build_site_symmetry(basis, stars.operations, rotated_R, q_grid_invA, l_max) : site_symmetry
 
     # Thread over stars, since each star is independent and the number of stars is usually very large.
     n_chunks = chunk_count(n_stars, nthreads())
@@ -480,7 +491,7 @@ function compute_coherent_unit_cell_form_factor(
 
                 for member in stars.members[star_idx]
                     operation = stars.operations[member.operation]
-                    permutation = permutations[member.operation]
+                    transfer = transfers[member.operation]
                     direction = member.direction
 
                     # k_Λ = R_Λ k, with a further sign when the operation carries time reversal.
@@ -520,20 +531,22 @@ function compute_coherent_unit_cell_form_factor(
 
                         # Now compute the eigenvectors for the star.
                         k_lambda = reversal * (star_rotation * star_wavevectors[q_local])
-                        @inbounds for lambda_i in 1:n_lambda_i
+                        fill!(member_coefficients, zero(Complex{T}))
+                        @inbounds for term in transfer
                             # Compute e^{-i k_Λ . L_{Λ,A_i}} that rephases eigenvectors/mixing coefficients.
-                            phase_star = cis(-dot(k_lambda, operation.L_offsets[image_of_lambda_i[lambda_i]]))
-                            target = permutation[lambda_i]
+                            phase_star = cis(-dot(k_lambda,
+                                                  operation.L_offsets[image_of_lambda_i[term.source]]))
+                            weight = term.weight * phase_star
                             # Handle time reversal with conjugation if necessary.
                             if operation.conjugate
                                 for state_idx in 1:n_lambda_i
-                                    member_coefficients[target, state_idx] =
-                                        conj(star_coefficients[lambda_i, state_idx, q_local]) * phase_star
+                                    member_coefficients[term.target, state_idx] +=
+                                        conj(star_coefficients[term.source, state_idx, q_local]) * weight
                                 end
                             else
                                 for state_idx in 1:n_lambda_i
-                                    member_coefficients[target, state_idx] =
-                                        star_coefficients[lambda_i, state_idx, q_local] * phase_star
+                                    member_coefficients[term.target, state_idx] +=
+                                        star_coefficients[term.source, state_idx, q_local] * weight
                                 end
                             end
                         end
@@ -805,6 +818,9 @@ function compute_coherent_unit_cell_f_sq_lm(
     BLAS.set_num_threads(1)
     try
 
+    # Get the site symmetry terms, which are independent of q and can be reused across blocks.
+    site_symmetry = build_site_symmetry(basis, stars.operations, rotated_R, q_grid_invA, l_max)
+
     for q_start in 1:q_block:n_q
         q_stop = min(q_start + q_block - 1, n_q)
         q_indices = q_start:q_stop
@@ -815,7 +831,8 @@ function compute_coherent_unit_cell_f_sq_lm(
             compute_coherent_unit_cell_form_factor(
                 rotated_R, basis, lattice, q_grid_invA, theta_grid, phi_grid, l_max, stars,
                 q_indices; need_grid = need_grid, couplings = couplings, long_range = long_range,
-                energy_grid = energy_grid, structure_factor_buffer = structure_factor_buffer)
+                energy_grid = energy_grid, structure_factor_buffer = structure_factor_buffer,
+                site_symmetry = site_symmetry)
 
         # Now project the block onto spherical harmonics.
         BLAS.set_num_threads(blas_threads)

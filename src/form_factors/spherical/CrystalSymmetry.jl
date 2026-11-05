@@ -65,12 +65,15 @@ struct SymmetryOperation{T<:AbstractFloat}
 
     # Fields:
     - R_Lambda::SMatrix{3, 3, T, 9}: The Cartesian rotation R_Λ, including the improper sign.
+    - tau_Lambda::SVector{3, T}: The translation τ_Λ, in Å. Needed to work out
+      the site symmetry operation each image picks up.
     - image_of::Vector{Int}: Λ(A_i), the image each image is carried onto.
     - L_offsets::Vector{SVector{3, T}}: The lattice vector L_{Λ,A_i} left over for each image, in Å.
     - conjugate::Bool: Whether this operation is composed with time reversal, which sends k to -k
       and conjugates the coefficients.
     """
     R_Lambda::SMatrix{3, 3, T, 9}
+    tau_Lambda::SVector{3, T}
     image_of::Vector{Int}
     L_offsets::Vector{SVector{3, T}}
     conjugate::Bool
@@ -299,7 +302,7 @@ function match_operation(
         image_of[i] == 0 && return nothing
     end
 
-    return SymmetryOperation{T}(rotation, image_of, offsets, false)
+    return SymmetryOperation{T}(rotation, translation, image_of, offsets, false)
 end
 
 function derive_symmetry_operations(
@@ -403,7 +406,8 @@ function derive_symmetry_operations(
     end
 
     # Add in the time reversed operations, k -> -k and conjugation.
-    time_reversed = [SymmetryOperation{T}(operation.R_Lambda, operation.image_of, operation.L_offsets, true)
+    time_reversed = [SymmetryOperation{T}(operation.R_Lambda, operation.tau_Lambda,
+                                          operation.image_of, operation.L_offsets, true)
                      for operation in found]
 
     return vcat(found, time_reversed)

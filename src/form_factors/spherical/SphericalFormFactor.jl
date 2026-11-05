@@ -22,6 +22,7 @@ include("ProjectFSquared.jl")
 include("WignerRotations.jl")
 include("CouplingJ.jl")
 include("CrystalSymmetry.jl")
+include("SiteSymmetry.jl")
 include("StructureFactor.jl")
 include("CoherentCrystalFormFactor.jl")
 
@@ -49,6 +50,7 @@ using .ProjectFSquared: project_f_sq_lm, default_angular_grid
 using .CouplingJ: NeighbourCells, enumerate_neighbour_cells, compute_couplings,
                   compute_crystal_corrections, subtract_self_term!,
                   image_translation_span
+using .SiteSymmetry: SiteSymmetryTransfer, build_site_symmetry, site_symmetry_operation
 using .CrystalSymmetry: SymmetryOperation, Stars, MoleculeMatching, derive_symmetry_operations,
                         build_stars, star_reduction_factor, choose_compatible_phi_count
 using .StructureFactor: EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
