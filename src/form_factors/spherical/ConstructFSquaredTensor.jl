@@ -103,8 +103,8 @@ function construct_f_sq_lm_tensor(
     n_transitions, n_q, n_keys = size(R_tensor)
     n_gaunt = length(gaunt_coeffs)
 
-    # Allocate the output tensor.
-    f_sq_lm = zeros(Complex{T}, n_transitions, n_q, n_keys)
+    # Allocate the output tensor. f_{ℓm}^2 is real, so only the real part is kept.
+    f_sq_lm = zeros(T, n_transitions, n_q, n_keys)
 
     # Preallocate one accumulation buffer per task, keyed by chunk rather than by threadid so that
     # each buffer has exactly one writer. These are reused across transitions.
@@ -153,27 +153,32 @@ function construct_f_sq_lm_tensor(
                             f_sq_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
                         end
                     else
-                        # U_{μ, μ} and U_{μ, -μ} are the two non-zero entries.
-                        for m in (mu, -mu)
-                            u_val = U(mu, m, T)
-                            combined = sign_m2 * gaunt_val * u_val
-                            key_out = l * l + (l + m) + 1
-                            @inbounds for q_idx in 1:n_q
-                                f_sq_lm_local[q_idx, key_out] += combined * R[q_idx, key1] * conj(R[q_idx, key2])
-                            end
+                        # U_{μ, μ} and U_{μ, -μ} are the two non-zero entries. Both multiply the
+                        # same R R*, so we reuse it.
+                        combined_plus = sign_m2 * gaunt_val * U(mu, mu, T)
+                        combined_minus = sign_m2 * gaunt_val * U(mu, -mu, T)
+                        key_plus = l * l + (l + mu) + 1
+                        key_minus = l * l + (l - mu) + 1
+                        @inbounds for q_idx in 1:n_q
+                            product = R[q_idx, key1] * conj(R[q_idx, key2])
+                            f_sq_lm_local[q_idx, key_plus] += combined_plus * product
+                            f_sq_lm_local[q_idx, key_minus] += combined_minus * product
                         end
                     end
                 end
             end
         end
 
-        # Accumulate the per-task results into the global f_sq_lm tensor.
+        # Accumulate the per-task results into the global f_sq_lm tensor. Written out as a loop
+        # because f_sq_lm[transition_idx, :, :] is not contiguous, and broadcasting into it copies.
         @inbounds for f_sq_lm_per_chunk in f_sq_lm_local_pool
-            f_sq_lm[transition_idx, :, :] .+= f_sq_lm_per_chunk
+            for key in 1:n_keys, q_idx in 1:n_q
+                f_sq_lm[transition_idx, q_idx, key] += real(f_sq_lm_per_chunk[q_idx, key])
+            end
         end
     end
 
-    return real.(f_sq_lm)
+    return f_sq_lm
 end
 
 end
