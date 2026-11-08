@@ -142,17 +142,40 @@ class JobConfiguration(unittest.TestCase):
             for s in [1, 2]:
                 results[f'X_state_{s}'] = np.ones((1, 1), dtype=np.complex64)
                 results[f'Y_state_{s}'] = np.zeros((1, 1), dtype=np.complex64)
-        validate_tddft(path, 2, 'valid', 'float32')
+        validate_tddft(path, [], 2, 'valid', 'float32')
 
         # Asking for a third state, changing the settings, or changing the precision all invalidate
         # it, as does an extra amplitude that no saved state owns.
         for n, signature, precision in [(3, 'valid', 'float32'), (2, 'changed', 'float32'), (2, 'valid', 'float64')]:
             with self.assertRaises(ValueError):
-                validate_tddft(path, n, signature, precision)
+                validate_tddft(path, [], n, signature, precision)
         with h5py.File(path, 'r+') as results:
             results['X_state_3'] = np.ones((1, 1))
         with self.assertRaises(ValueError):
-            validate_tddft(path, 2, 'valid', 'float32')
+            validate_tddft(path, [], 2, 'valid', 'float32')
+
+    def test_tddft_conformers_are_checked_one_group_at_a_time(self):
+        # A crystal keeps every conformer in one file, each in its own group.
+        path = self.directory / 'td_dft.h5'
+        with h5py.File(path, 'w') as results:
+            results.attrs['stage_signature'] = 'valid'
+            results.attrs['nstates_td_dft'] = 5
+            for label in ['A', 'B']:
+                group = results.create_group(f'conformers/{label}')
+                group['Delta_E_eV'] = np.array([1, 2], dtype=np.float32)
+                group['f_osc'] = np.ones(2, dtype=np.float32)
+                for s in [1, 2]:
+                    group[f'X_state_{s}'] = np.ones((1, 1), dtype=np.complex64)
+                    group[f'Y_state_{s}'] = np.zeros((1, 1), dtype=np.complex64)
+        validate_tddft(path, ['A', 'B'], 2, 'valid', 'float32')
+
+        # A conformer that is named but absent, and one that is short of a state, both invalidate it.
+        with self.assertRaises(ValueError):
+            validate_tddft(path, ['A', 'B', 'C'], 2, 'valid', 'float32')
+        with h5py.File(path, 'r+') as results:
+            del results['conformers/B/Y_state_2']
+        with self.assertRaises(ValueError):
+            validate_tddft(path, ['A', 'B'], 2, 'valid', 'float32')
 
     def test_stage_signatures_ignore_controls_and_track_physics(self):
         # Switching a stage from reuse to run is a control, not physics, so the signature holds and
@@ -525,15 +548,17 @@ class StructureFunctionQuantities(unittest.TestCase):
         # sign across q and the (1,0) one does not, so ranking by absolute area picks (1,0) and
         # never the monopole, which is plotted on its own.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'crystal.h5'
+            path = Path(directory) / 'structure_function.h5'
             with h5py.File(path, 'w') as results:
-                results['q_grid'] = [0., 1., 2.]
-                results['E_grid_eV'] = [5., 5.5, 6.]
+                results['grid/q'] = [0., 1., 2.]
+                results['grid/E'] = [5., 5.5, 6.]
                 values = np.zeros((9, 3, 3))
                 values[0] = 8
                 values[1] = [10, 0, -10]
                 values[2] = 1
                 results['S_lm'] = values
+                # The integral is saved rather than taken from the axis, so it goes in too.
+                results['S_lm_integrated'] = values.sum(axis=2) * .5
             data = CrystalData(path)
             np.testing.assert_array_equal(data.mode((0, 0)), 8*np.ones((3, 3)))
             np.testing.assert_array_equal(data.integrals[:, 0], [12, 12, 12])
@@ -545,51 +570,43 @@ class StructureFunctionQuantities(unittest.TestCase):
             with self.assertRaises(ValueError):
                 data.mode((3, 0))
 
-    def test_state_sum_normalisation_and_incoherent_file(self):
-        # Summing the coefficients over states and multiplying by 2π/V_cell is what turns them into
-        # the structure function, so that factor has to appear exactly once.
+    def test_saved_integral_is_read_without_the_energy_axis(self):
+        # The energy integral is saved in the structure function's own normalisation, so a reader
+        # applies no volume factor of its own and needs no energy axis to get it.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'crystal.h5'
-            coefficients = np.arange(9*3*2, dtype=np.float32).reshape(9, 3, 2)
+            path = Path(directory) / 'structure_function.h5'
+            integral = np.arange(9*3, dtype=np.float32).reshape(9, 3)
             with h5py.File(path, 'w') as results:
-                results['q_grid'] = np.array([0, 1, 2], dtype=np.float32)
-                results['V_cell_A3'] = 17.
-                results['f_sq_lm'] = coefficients
-                results['crystal_order'] = np.bytes_('incoherent')
+                results['grid/q'] = np.array([0, 1, 2], dtype=np.float32)
+                results['S_lm_integrated'] = integral
+                results.attrs['crystal_order'] = 'incoherent'
             data = CrystalData(path)
-            expected = coefficients.sum(axis=2, dtype=float).T * (2*np.pi/17.)
-            np.testing.assert_allclose(data.state_sums, expected)
+            np.testing.assert_allclose(data.state_sums, integral.T)
             self.assertEqual(data.ranked_modes(1, data.state_sums), [(2, 2)])
 
             # No energy axis was saved, so there is no structure function to read yet.
+            self.assertIsNone(data.energy)
             with self.assertRaisesRegex(ValueError, 'no structure function'):
                 data.mode((0, 0))
 
-            # Spread that same sum over three energy bins in any proportion, and integrating the
-            # energy axis has to give it straight back.
-            with h5py.File(path, 'r+') as results:
-                results['E_grid_eV'] = [4., 4.5, 5.]
-                results['S_lm'] = expected.T[:, :, None] * np.array([.2, .3, .5])[None, None, :] / .5
-            integrated = CrystalData(path)
-            np.testing.assert_allclose(integrated.integrals, integrated.state_sums)
+            # The incoherent reference is a separate dataset, and is missing until it is written.
+            with self.assertRaisesRegex(ValueError, 'S_lm_integrated_incoherent'):
+                _ = data.incoherent_sums
 
     def test_incoherent_reference_is_read_and_gates_the_sum_rule(self):
         # Four crystal bands built out of two monomer transitions on two molecules, so the mixing is
         # a change of basis and the total intensity has to be the same either way.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'crystal.h5'
-            states = np.arange(1, 9*3*4 + 1, dtype=np.float32).reshape(9, 3, 4)
-            # The same intensity, carried by two monomer transitions rather than four crystal bands.
-            reference = states.reshape(9, 3, 2, 2).sum(axis=3)
-            summed = states.sum(axis=2, dtype=float).T * (2*np.pi/11.)
+            path = Path(directory) / 'structure_function.h5'
+            integral = np.arange(1, 9*3 + 1, dtype=np.float32).reshape(9, 3)
             with h5py.File(path, 'w') as results:
-                results['q_grid'] = np.array([0, 1, 2], dtype=np.float32)
-                results['E_grid_eV'] = [4., 4.5]
-                results['V_cell_A3'] = 11.
-                results['f_sq_lm'] = states
-                results['f_sq_lm_incoherent'] = reference
-                results['S_lm'] = summed.T[:, :, None] * np.array([.4, .6])[None, None, :] / .5
-                results['crystal_order'] = np.bytes_('coherent')
+                results['grid/q'] = np.array([0, 1, 2], dtype=np.float32)
+                results['grid/E'] = [4., 4.5]
+                results['S_lm_integrated'] = integral
+                # The same total intensity, carried by the monomer transitions instead.
+                results['S_lm_integrated_incoherent'] = integral
+                results['S_lm'] = integral[:, :, None] * np.array([.4, .6])[None, None, :] / .5
+                results.attrs['crystal_order'] = 'coherent'
             data = CrystalData(path)
             # The sum rule the plot draws: the mixed bands and the unmixed molecules must agree.
             np.testing.assert_allclose(data.incoherent_sums, data.state_sums)
@@ -599,25 +616,11 @@ class StructureFunctionQuantities(unittest.TestCase):
 
             # With no reference saved there is nothing to compare against, so the plot is dropped.
             with h5py.File(path, 'r+') as results:
-                del results['f_sq_lm_incoherent']
+                del results['S_lm_integrated_incoherent']
             bare = CrystalData(path)
             self.assertEqual(figures_for_data(requests, bare.saved), requests[1:])
-            with self.assertRaisesRegex(ValueError, 'f_sq_lm_incoherent'):
+            with self.assertRaisesRegex(ValueError, 'S_lm_integrated_incoherent'):
                 bare.incoherent_sums
-
-    def test_energy_integral_uses_full_float32_grid(self):
-        # 451 bins of 10 meV in float32, where neighbouring energies round to the same value, so the
-        # step has to come from the whole axis rather than from one difference. A normalised S_lm
-        # must still integrate to one.
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'crystal.h5'
-            step = np.float32(.01)
-            energy = np.float32(5.43) + np.arange(451, dtype=np.float32)*step
-            with h5py.File(path, 'w') as results:
-                results['q_grid'] = [0., 1., 2.]
-                results['E_grid_eV'] = energy
-                results['S_lm'] = np.ones((1, 3, len(energy)), dtype=np.float32) / (len(energy)*step)
-            np.testing.assert_allclose(CrystalData(path).integrals, 1., rtol=1e-6)
 
 
 if __name__ == '__main__':

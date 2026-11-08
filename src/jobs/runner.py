@@ -35,25 +35,37 @@ def content_hash(path):
     return contents.hexdigest()
 
 
-def tddft_paths(job, directory):
+def tddft_path(directory):
     """
-    Find the TD-DFT files belonging to one molecule or crystal.
+    Find the TD-DFT file belonging to one molecule or crystal.
+
+    # Arguments:
+    - directory::Path: The numbered result directory.
+
+    # Returns:
+    - Path: The TD-DFT file.
+    """
+    return directory / 'td_dft.h5'
+
+
+def conformer_labels(job, directory):
+    """
+    List the groups the TD-DFT file holds, one per conformer of a crystal.
 
     # Arguments:
     - job::dict: The resolved job.
     - directory::Path: The numbered result directory.
 
     # Returns:
-    - list[Path]: The molecular or conformer files.
+    - list[str]: The conformer labels, or an empty list for a single molecule at the file's root.
     """
     if job['mode'] != 'crystal':
-        return [directory / 'td_dft.h5']
+        return []
     with (directory / 'crystal_metadata.json').open() as source:
         labels = json.load(source)['conformer_labels']
     if not labels:
         raise ValueError('The crystal has no conformers.')
-    suffix = 'f32' if job['execution']['precision'] == 'float32' else 'f64'
-    return [directory / 'conformers' / label / f'td_dft_results_{suffix}.h5' for label in labels]
+    return labels
 
 
 def calculation_signature(job, system, stage, directory):
@@ -87,16 +99,17 @@ def calculation_signature(job, system, stage, directory):
         for section in ['spherical', 'fourier', 'cartesian', 'crystal']:
             if section in job:
                 parameters[section] = job[section]
-        parameters['tddft_contents'] = [content_hash(path) for path in tddft_paths(job, directory)]
+        parameters['tddft_contents'] = content_hash(tddft_path(directory))
     return hashlib.sha256(json.dumps(parameters, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def validate_tddft(path, nstates, signature, precision):
+def validate_tddft(path, labels, nstates, signature, precision):
     """
     Require the requested saved states and their three-state computed buffer.
 
     # Arguments:
     - path::Path: The TD-DFT file.
+    - labels::list[str]: The conformer groups to check, or empty for a molecule at the file's root.
     - nstates::int: The number of saved states.
     - signature::str: The expected calculation signature.
     - precision::str: The saved precision.
@@ -106,36 +119,42 @@ def validate_tddft(path, nstates, signature, precision):
         if text_attribute(results, 'stage_signature') != signature:
             raise ValueError(f'{path}: TD-DFT settings or input do not match; set tddft to run.')
 
-        # The energies and oscillator strengths, one of each per saved state.
-        if results['Delta_E_eV'].shape != (nstates,) or results['f_osc'].shape != (nstates,):
-            raise ValueError(f'{path}: expected {nstates} saved states.')
-
         # Three states beyond the saved ones are computed, so a degenerate pair is never split.
-        if results['Delta_E_eV'].dtype.name != precision or results.attrs.get('nstates_td_dft', 0) < nstates + 3:
-            raise ValueError(f'{path}: precision or computed state count does not match.')
+        if results.attrs.get('nstates_td_dft', 0) < nstates + 3:
+            raise ValueError(f'{path}: the computed state count does not match.')
 
-        # The X and Y amplitudes, which the densities are built from.
-        expected = {f'{amplitude}_state_{s}' for amplitude in ('X', 'Y') for s in range(1, nstates + 1)}
-        saved = {name for name in results if name.startswith(('X_state_', 'Y_state_'))}
-        if saved != expected:
-            raise ValueError(f'{path}: saved X and Y amplitudes do not match nstates.')
+        # A molecule sits at the root, while a crystal's conformers each have their own group.
+        for label in labels or ['']:
+            if label and label not in results.get('conformers', {}):
+                raise ValueError(f'{path}: conformer {label} is missing.')
+            molecule = results[f'conformers/{label}'] if label else results
+            name = f'{path}/conformers/{label}' if label else str(path)
+
+            # The energies and oscillator strengths, one of each per saved state.
+            if molecule['Delta_E_eV'].shape != (nstates,) or molecule['f_osc'].shape != (nstates,):
+                raise ValueError(f'{name}: expected {nstates} saved states.')
+            if molecule['Delta_E_eV'].dtype.name != precision:
+                raise ValueError(f'{name}: the saved precision does not match.')
+
+            # The X and Y amplitudes, which the densities are built from.
+            expected = {f'{amplitude}_state_{s}' for amplitude in ('X', 'Y') for s in range(1, nstates + 1)}
+            saved = {entry for entry in molecule if entry.startswith(('X_state_', 'Y_state_'))}
+            if saved != expected:
+                raise ValueError(f'{name}: saved X and Y amplitudes do not match nstates.')
 
 
 def form_factor_path(job, directory):
     """
-    Locate the aggregate molecular or existing crystal result file.
+    Locate one system's result file, which for a crystal is its structure function.
 
     # Arguments:
     - job::dict: The resolved job.
     - directory::Path: The numbered result directory.
 
     # Returns:
-    - Path: The form factor file.
+    - Path: The result file.
     """
-    if job['mode'] != 'crystal':
-        return directory / 'form_factors.h5'
-    suffix = 'f32' if job['execution']['precision'] == 'float32' else 'f64'
-    return directory / 'crystal' / f'crystal_form_factors_{suffix}.h5'
+    return directory / ('structure_function.h5' if job['mode'] == 'crystal' else 'form_factors.h5')
 
 
 def validate_form_factors(job, path, signature):
@@ -152,25 +171,30 @@ def validate_form_factors(job, path, signature):
         if text_attribute(results, 'stage_signature') != signature or not results.attrs.get('completed', False):
             raise ValueError(f'{path}: form factors do not match; set form_factors to run.')
 
-        # Crystals keep their own layout, with a file per conformer alongside the crystal result.
         if job['mode'] == 'crystal':
             # The incoherent reference is only written for a coherent crystal, because an unmixed
             # one already is the reference.
-            required = ['f_sq_lm']
+            required = ['S_lm_integrated', 'grid/q', 'grid/lm_keys']
             if job['crystal']['structure_function']:
-                required.append('S_lm')
+                required += ['S_lm', 'grid/E']
             if job['crystal']['incoherent_reference'] and job['crystal']['order'] == 'coherent':
-                required.append('f_sq_lm_incoherent')
+                required.append('S_lm_integrated_incoherent')
             if any(name not in results for name in required):
                 raise ValueError(f'{path}: requested crystal quantities are missing.')
-            indices = range(1, job['nstates'] + 1) if job['transitions'] == 'all' else job['transitions']
-            suffix = 'f32' if job['execution']['precision'] == 'float32' else 'f64'
-            for td_path in tddft_paths(job, path.parent.parent):
-                for s in indices:
-                    conformer_path = td_path.parent / str(s) / f'fs_grid_{suffix}.h5'
-                    with h5py.File(conformer_path) as conformer:
-                        if any(name not in conformer for name in job['spherical']['save']):
-                            raise ValueError(f'{conformer_path}: requested conformer quantities are missing.')
+            if not job['spherical']['save']:
+                return
+            monomer_path = path.parent / 'form_factors.h5'
+            indices = list(range(1, job['nstates'] + 1)) if job['transitions'] == 'all' else job['transitions']
+            with h5py.File(monomer_path) as monomer:
+                for label in conformer_labels(job, path.parent):
+                    transitions = monomer.get(f'conformers/{label}/transitions')
+                    if transitions is None or set(transitions) != set(map(str, indices)):
+                        raise ValueError(f'{monomer_path}: conformer {label} is missing transitions.')
+                    for s in indices:
+                        state = transitions[str(s)]
+                        if any(name not in state for name in job['spherical']['save']):
+                            raise ValueError(
+                                f'{monomer_path}: conformer {label}, transition {s} is missing quantities.')
             return
         # The saved transitions must be the ones asked for, by the method asked for.
         indices = list(range(1, job['nstates'] + 1)) if job['transitions'] == 'all' else job['transitions']
@@ -247,15 +271,14 @@ def compute_tddft(job, system, directory):
     from .crystal import get_crystal_data, build_crystal_metadata, build_coordinate_list
     data = get_crystal_data(system['input'])
     (directory / 'crystal_metadata.json').write_text(json.dumps(build_crystal_metadata(data), indent=2))
-    suffix = 'f32' if job['execution']['precision'] == 'float32' else 'f64'
+    # Every conformer goes into one file, so start from nothing rather than adding to an old run's.
+    tddft_path(directory).unlink(missing_ok=True)
     for label in data['conformer_labels']:
         conformer = data['conformers'][label]
         coordinates = build_coordinate_list(conformer['atom_symbols'], conformer['atom_coordinates'])
-        output = directory / 'conformers' / label
-        output.mkdir(parents=True, exist_ok=True)
         run_td_dft_analysis_from_coordinates(coordinates, species=f'{system["label"]}_{label}',
-                                             output_directory=str(output),
-                                             filename=f'td_dft_results_{suffix}.h5', **common)
+                                             output_directory=str(directory),
+                                             conformer=label, **common)
 
 
 def run_job(job):
@@ -293,13 +316,12 @@ def run_job(job):
             signature = calculation_signature(job, system, 'tddft', directory)
             if stage == 'run':
                 compute_tddft(job, system, directory)
-                for path in tddft_paths(job, directory):
-                    with h5py.File(path, 'r+') as results:
-                        results.attrs['stage_signature'] = signature
+                with h5py.File(tddft_path(directory), 'r+') as results:
+                    results.attrs['stage_signature'] = signature
                 (directory / '.tddft_failed').unlink(missing_ok=True)
             if stage != 'skip':
-                for path in tddft_paths(job, directory):
-                    validate_tddft(path, job['nstates'], signature, job['execution']['precision'])
+                validate_tddft(tddft_path(directory), conformer_labels(job, directory),
+                               job['nstates'], signature, job['execution']['precision'])
                 (directory / '.tddft_failed').unlink(missing_ok=True)
             tddft_complete = True
 

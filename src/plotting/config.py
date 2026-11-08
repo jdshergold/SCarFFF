@@ -24,7 +24,7 @@ FIGURE_MODES = {
 }
 # What a figure needs in the file on top of the right calculation mode. The sum rule weighs the
 # mixed crystal states against the same molecules unmixed, so it needs both of those saved.
-FIGURE_DATASETS = {'structure_sum_rule': ('S_lm', 'f_sq_lm_incoherent')}
+FIGURE_DATASETS = {'structure_sum_rule': ('S_lm_integrated', 'S_lm_integrated_incoherent')}
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / 'config/plotting.yaml'
 
 

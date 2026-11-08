@@ -134,6 +134,7 @@ function _compute_spherical_form_factor(
         phi_grid::Vector{T},
         l_max::Int,
         td_dft_path::String;
+        td_dft_group::String = "/",
         transition_indices::Vector{Int} = [1],
         force_recomputation::Bool = false,
         threshold::T = zero(T),
@@ -154,6 +155,8 @@ function _compute_spherical_form_factor(
     - phi_grid::Vector{T}: The ϕ values at which to evaluate the form factor, in radians.
     - l_max::Int: The maximum angular momentum quantum number ℓ to evaluate the form factor for.
     - td_dft_path::String: The path to the TD-DFT results JSON file.
+    - td_dft_group::String: The group in that file holding the molecule, which is "conformers/A" and
+      so on for a crystal. Defaults to the file's root.
     - transition_indices::Vector{Int}: The transition indices to compute (default: [1]).
     - force_recomputation::Bool: Whether to force the recomputation of Gaunt coefficients and the A tensor even if they exist (default: false).
     - threshold::T: A threshold value below which W tensor entries satisfying (|W/W_max| < threshold) will be discarded (default: 0.0, so no discarding).
@@ -180,7 +183,7 @@ function _compute_spherical_form_factor(
 
     # Construct MoleculeData structure.
     mol = time_stage!(stage_times, "read molecular data") do
-        get_molecular_data(td_dft_path; precision = T)
+        get_molecular_data(td_dft_path; group = td_dft_group, precision = T)
     end
 
     # Determine lambda_max from the molecular data.

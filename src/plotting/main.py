@@ -21,7 +21,7 @@ def result_directories(path, selection):
     - list[Path]: The selected result directories.
     """
     # A single numbered directory can be given directly, rather than the whole run.
-    if (path / 'form_factors.h5').exists() or (path / 'crystal').is_dir():
+    if (path / 'form_factors.h5').exists() or (path / 'structure_function.h5').exists():
         return [path]
     if selection == 'all':
         directories = sorted([child for child in path.iterdir() if child.is_dir() and child.name.isdigit()],
@@ -74,18 +74,13 @@ def plot_system(directory, config):
         data = MolecularData(molecule, config['grouping']['energy_tolerance_eV'], config['angular_sampling'])
         requests = figures_for_mode(config['figures'], data.mode)
     else:
-        # A crystal directory can hold both precisions, so the job picks the one that belongs.
-        candidates = list((directory / 'crystal').glob('crystal_form_factors_*.h5'))
-        if len(candidates) > 1 and job:
-            precision = job['execution']['precision']
-            suffix = 'f32' if precision == 'float32' else 'f64'
-            candidates = [candidate for candidate in candidates if candidate.name.endswith(f'_{suffix}.h5')]
-        if len(candidates) != 1:
-            raise ValueError(f'{directory}: expected one current crystal file or form_factors.h5.')
+        structure_function = directory / 'structure_function.h5'
+        if not structure_function.exists():
+            raise ValueError(f'{directory}: expected structure_function.h5 or form_factors.h5.')
         requests = figures_for_mode(config['figures'], 'crystal')
         if not requests:
             return
-        data = CrystalData(candidates[0])
+        data = CrystalData(structure_function)
         requests = figures_for_data(requests, data.saved)
     if not requests:
         return

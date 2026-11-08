@@ -131,6 +131,9 @@ def load_job(path):
         supplied = job.get(section, {})
         check_fields(supplied, DEFAULTS[section], section)
         job[section] = {**DEFAULTS[section], **supplied}
+        # A crystal saves no monomer form factors unless they are asked for by name.
+        if section == 'spherical' and mode == 'crystal' and 'save' not in supplied:
+            job[section]['save'] = []
         for name, default in DEFAULTS[section].items():
             if isinstance(default, bool) and not isinstance(job[section][name], bool):
                 raise ValueError(f'{section}.{name} must be true or false.')
@@ -166,8 +169,11 @@ def load_job(path):
                 raise ValueError(f'spherical.{name} must be zero (automatic) or at least two.')
         for name in ('q_max', 'threshold'):
             settings[name] = number(settings[name], 'spherical.' + name, strict=name == 'q_max')
-        if not isinstance(settings['save'], list) or not settings['save'] or set(settings['save']) - {'f_s', 'R_tensor', 'f_sq_lm'}:
+        # Only save monomer form factors if asked for.
+        if not isinstance(settings['save'], list) or set(settings['save']) - {'f_s', 'R_tensor', 'f_sq_lm'}:
             raise ValueError('spherical.save selects f_s, R_tensor and/or f_sq_lm.')
+        if not settings['save'] and mode != 'crystal':
+            raise ValueError('spherical.save must name at least one quantity.')
     # The Fourier grid, given as a limit and a spacing per axis.
     if mode == 'fourier':
         for name in ('q_max', 'dq'):

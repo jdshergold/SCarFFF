@@ -694,6 +694,7 @@ def run_td_dft_analysis_from_coordinates(
     precision="float64",
     plot_molecule_3d=False,
     filename="td_dft.h5",
+    conformer=None,
 ):
     """Perform the TD-DFT analysis for a specified geometry and save the results to an HDF5 file.
 
@@ -708,6 +709,8 @@ def run_td_dft_analysis_from_coordinates(
         precision::str: Floating point precision to use when saving results ('float32' or 'float64').
         plot_molecule_3d::bool: Whether to generate the interactive 3D molecule plot (default: False).
         filename::str: The TD-DFT output filename.
+        conformer::str or None: The conformer label to save under, for a crystal whose conformers
+            share one file. None saves a single molecule at the file's root.
 
     Returns:
         tuple: Contains coordinates, molecule object, mean-field object, TD-DFT object, and the (X, Y) pairs.
@@ -773,12 +776,24 @@ def run_td_dft_analysis_from_coordinates(
     float_dtype = np.float32 if precision == "float32" else np.float64
     complex_dtype = np.complex64 if precision == "float32" else np.complex128
 
-    # Replace the saved calculation only after the whole file has been written.
+    # A single molecule is written to a temporary file and moved into place once it is whole. A
+    # crystal's conformers share one file, so each is added to the file that is already there.
     output_file = os.path.join(output_directory, filename)
     temporary_file = output_file + ".tmp"
-    with h5py.File(temporary_file, "w") as f:
+    target, mode = (temporary_file, "w") if conformer is None else (output_file, "a")
+    with h5py.File(target, mode) as f:
+        # The molecule's own datasets sit at the root for a single molecule, and in its own group
+        # for one conformer of a crystal.
+        if conformer is None:
+            molecule = f
+        else:
+            # Start from nothing if this conformer was saved by an earlier run.
+            if f"conformers/{conformer}" in f:
+                del f[f"conformers/{conformer}"]
+            molecule = f.create_group(f"conformers/{conformer}")
+
         # Store the molecule metadata as attributes.
-        f.attrs["species"] = species
+        molecule.attrs["species"] = species
         f.attrs["basis"] = basis
         f.attrs["xc"] = xc
         f.attrs["nstates_td_dft"] = len(td.e)
@@ -789,26 +804,27 @@ def run_td_dft_analysis_from_coordinates(
 
         # Save the atom symbols and coordinates.
         dt = h5py.string_dtype(encoding="utf-8")
-        f.create_dataset("atom_symbols", data=atom_symbols, dtype=dt)
-        f.create_dataset("atom_coordinates", data=atom_coords).attrs["units"] = "bohr"
+        molecule.create_dataset("atom_symbols", data=atom_symbols, dtype=dt)
+        molecule.create_dataset("atom_coordinates", data=atom_coords).attrs["units"] = "bohr"
 
         # Store the AO labels.
-        f.create_dataset("ao_labels", data=ao_labels, dtype=dt)
+        molecule.create_dataset("ao_labels", data=ao_labels, dtype=dt)
 
         # Store the transition energies in eV, and the oscillator strengths.
-        f.create_dataset("Delta_E_eV", data=np.array(energies, dtype=float_dtype)).attrs["units"] = "eV"
-        f.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
+        molecule.create_dataset("Delta_E_eV", data=np.array(energies, dtype=float_dtype)).attrs["units"] = "eV"
+        molecule.create_dataset("f_osc", data=np.asarray(oscillator_strengths, dtype=float_dtype))
 
         # Store the occupied and virtual MO coefficients, shared across all transitions.
-        f.create_dataset("C_o", data=np.asarray(orbo, dtype=complex_dtype))
-        f.create_dataset("C_v", data=np.asarray(orbv, dtype=complex_dtype))
+        molecule.create_dataset("C_o", data=np.asarray(orbo, dtype=complex_dtype))
+        molecule.create_dataset("C_v", data=np.asarray(orbv, dtype=complex_dtype))
 
         # Store the per-transition X and Y amplitudes.
         for i, (X, Y) in enumerate(mxXY):
-            f.create_dataset(f"X_state_{i+1}", data=np.asarray(X, dtype=complex_dtype))
-            f.create_dataset(f"Y_state_{i+1}", data=np.asarray(Y, dtype=complex_dtype))
+            molecule.create_dataset(f"X_state_{i+1}", data=np.asarray(X, dtype=complex_dtype))
+            molecule.create_dataset(f"Y_state_{i+1}", data=np.asarray(Y, dtype=complex_dtype))
 
-    os.replace(temporary_file, output_file)
+    if conformer is None:
+        os.replace(temporary_file, output_file)
     stage_times.append(('Extract amplitudes and save', perf_counter() - save_started))
     print_stage_timings('TD-DFT', stage_times, perf_counter() - started)
     print(f"  Saved-state energies: {min(energies):.4f}–{max(energies):.4f} eV")

@@ -469,6 +469,7 @@ end
 
 function get_molecular_data(
         td_dft_file::String;
+        group::String = "/",
         precision::Type{T} = Float64,
     )::MoleculeData{T} where {T<:AbstractFloat}
     """
@@ -476,6 +477,8 @@ function get_molecular_data(
 
     # Arguments:
     - td_dft_file::String: Path to the TD-DFT HDF5 file containing atom coordinates and orbital ordering.
+    - group::String: The group holding the molecule, which is "conformers/A" and so on for a
+      crystal, whose conformers share one file. Defaults to the file's root.
     - precision::Type{T}: The floating point precision to use. Defaults to Float64.
 
     # Returns:
@@ -486,25 +489,29 @@ function get_molecular_data(
         # Read the metadata (basis set and SMILES) from attributes.
         basis_set_name = read_attribute(io, "basis")
 
+        # The molecule itself, which is at the root for a single molecule and in a group for one
+        # conformer of a crystal.
+        molecule = group == "/" ? io : io[group]
+
         # Read the datasets.
-        atom_symbols = read(io, "atom_symbols")
-        atom_coordinates = restore_python_hdf5_order(read(io, "atom_coordinates")) # Bohr.
-        ao_labels = read(io, "ao_labels")
-        Delta_E_eV = read(io, "Delta_E_eV")
+        atom_symbols = read(molecule, "atom_symbols")
+        atom_coordinates = restore_python_hdf5_order(read(molecule, "atom_coordinates")) # Bohr.
+        ao_labels = read(molecule, "ao_labels")
+        Delta_E_eV = read(molecule, "Delta_E_eV")
 
         # Read the MO coefficients, which are shared across all transitions. The density matrices are
         # assembled from these and the X and Y amplitudes rather than being read ready-made, so that
         # the transition, ground state and difference densities can all be built from one file.
-        C_o = restore_python_hdf5_order(read(io, "C_o"))
-        C_v = restore_python_hdf5_order(read(io, "C_v"))
+        C_o = restore_python_hdf5_order(read(molecule, "C_o"))
+        C_v = restore_python_hdf5_order(read(molecule, "C_v"))
 
         # Read the per-transition X and Y amplitudes, which are stored under different keys.
         X_states = []
         Y_states = []
         state_idx = 1
-        while haskey(io, "X_state_$state_idx")
-            push!(X_states, restore_python_hdf5_order(read(io, "X_state_$state_idx")))
-            push!(Y_states, restore_python_hdf5_order(read(io, "Y_state_$state_idx")))
+        while haskey(molecule, "X_state_$state_idx")
+            push!(X_states, restore_python_hdf5_order(read(molecule, "X_state_$state_idx")))
+            push!(Y_states, restore_python_hdf5_order(read(molecule, "Y_state_$state_idx")))
             state_idx += 1
         end
 

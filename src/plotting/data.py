@@ -350,11 +350,11 @@ class CrystalData:
         """
         self.path = Path(path)
         with h5py.File(path) as results:
-            if 'S_lm' not in results and 'f_sq_lm' not in results:
-                raise ValueError(f'{path}: no structure function or crystal intensity coefficients were saved.')
-            self.q = np.asarray(results['q_grid'], dtype=float)
-            self.energy = np.asarray(results['E_grid_eV'], dtype=float) if 'E_grid_eV' in results else None
-            self.n_modes = results['S_lm' if 'S_lm' in results else 'f_sq_lm'].shape[0]
+            if 'S_lm_integrated' not in results:
+                raise ValueError(f'{path}: no structure function was saved.')
+            self.q = np.asarray(results['grid/q'], dtype=float)
+            self.energy = np.asarray(results['grid/E'], dtype=float) if 'grid/E' in results else None
+            self.n_modes = results['S_lm_integrated'].shape[0]
             # Which quantities the run was asked to save, so a figure needing one can be skipped.
             self.saved = set(results)
 
@@ -378,52 +378,43 @@ class CrystalData:
                 raise ValueError(f'{self.path}: no structure function was saved.')
             return np.asarray(results['S_lm'][key], dtype=float).T
 
-    def summed_coefficients(self, name):
+    def energy_integral(self, name):
         """
-        Sum one saved set of intensity coefficients over states, including 2 pi / V_cell.
+        Read one saved energy integral of the structure function, in Angstrom^-3.
 
         # Arguments:
-        - name::str: The saved dataset, either f_sq_lm or f_sq_lm_incoherent.
+        - name::str: The saved dataset, either S_lm_integrated or S_lm_integrated_incoherent.
 
         # Returns:
-        - np.ndarray: The summed coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order.
         """
         with h5py.File(self.path) as results:
-            if name not in results or 'V_cell_A3' not in results:
-                raise ValueError(f'{self.path}: {name} or the cell volume were not saved.')
-            coefficients = results[name]
-            if coefficients.ndim != 3 or coefficients.shape[:2] != (self.n_modes, len(self.q)):
+            if name not in results:
+                raise ValueError(f'{self.path}: {name} was not saved.')
+            integral = results[name]
+            if integral.shape != (self.n_modes, len(self.q)):
                 raise ValueError(f'{self.path}: {name} does not match the saved grid.')
-            volume = float(results['V_cell_A3'][()])
-            if not np.isfinite(volume) or volume <= 0:
-                raise ValueError(f'{self.path}: the unit cell volume must be positive.')
-            # Sum over the states, one spherical harmonic at a time to keep the read small.
-            summed = np.empty((len(self.q), self.n_modes))
-            for key in range(self.n_modes):
-                summed[:, key] = np.sum(coefficients[key], axis=1, dtype=float)
-
-        # The 2π/V_cell is what makes this the structure function rather than the bare sum.
-        return summed * (2*np.pi/volume)
+            return np.asarray(integral, dtype=float).T
 
     @cached_property
     def state_sums(self):
         """
-        Sum the saved crystal intensity coefficients over states, including 2 pi / V_cell.
+        Read the energy integral of the structure function, summed over the crystal's states.
 
         # Returns:
-        - np.ndarray: The summed coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
         """
-        return self.summed_coefficients('f_sq_lm')
+        return self.energy_integral('S_lm_integrated')
 
     @cached_property
     def incoherent_sums(self):
         """
-        Sum the saved incoherent reference over the monomer transitions, including 2 pi / V_cell.
+        Read the same integral with the mixing switched off, summed over the monomer transitions.
 
         # Returns:
-        - np.ndarray: The summed coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
         """
-        return self.summed_coefficients('f_sq_lm_incoherent')
+        return self.energy_integral('S_lm_integrated_incoherent')
 
     @cached_property
     def angular_mean(self):
@@ -448,23 +439,12 @@ class CrystalData:
     @cached_property
     def integrals(self):
         """
-        Integrate each coefficient over the saved uniform energy grid.
+        Get each coefficient's energy integral, which is saved rather than taken from the axis.
 
         # Returns:
         - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
         """
-        if self.energy is None or len(self.energy) < 2:
-            raise ValueError(f'{self.path}: no structure function energy grid was saved.')
-        # Average over the full grid because Float32 rounds neighbouring energy bins.
-        step = (self.energy[-1] - self.energy[0]) / (len(self.energy) - 1)
-        if not np.allclose(np.diff(self.energy), step, rtol=1e-3):
-            raise ValueError('The saved structure function energy grid must be uniform.')
-        # A uniform grid makes the integral a sum times the step, one harmonic at a time.
-        integrated = np.empty((len(self.q), self.n_modes))
-        with h5py.File(self.path) as results:
-            for key in range(self.n_modes):
-                integrated[:, key] = np.sum(results['S_lm'][key], axis=1, dtype=float) * step
-        return integrated
+        return self.state_sums
 
     def ranked_modes(self, count, coefficients=None):
         """
