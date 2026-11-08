@@ -95,8 +95,26 @@ function construct_f_sq_lm_tensor(
       keyed identically to the R tensor.
     """
 
-    # Load the Gaunt array.
-    gaunt_array = load_gaunt_array(gaunt_f_sq_lm_path, T)
+    return construct_f_sq_lm_tensor(R_tensor, load_gaunt_array(gaunt_f_sq_lm_path, T))
+end
+
+function construct_f_sq_lm_tensor(
+        R_tensor::Array{Complex{T}, 3},
+        gaunt_array::SparseGauntArray{T},
+    )::Array{T, 3} where {T<:AbstractFloat}
+    """
+    Construct the f_{ℓm}^2(q) tensor from an already-loaded Gaunt array, so the file is read once
+    even when the tensor is built several times. The method above gives the expansion itself.
+
+    # Arguments:
+    - R_tensor::Array{Complex{T}, 3}: The R tensor with shape (n_transitions, n_q, n_keys), keyed by key(ℓ, m) = ℓ^2 + (ℓ + m) + 1.
+    - gaunt_array::SparseGauntArray{T}: The precomputed Gaunt coefficients.
+
+    # Returns:
+    - f_sq_lm::Array{T, 3}: The f_{ℓm}^2 tensor with shape (n_transitions, n_q, n_keys),
+      keyed identically to the R tensor.
+    """
+
     gaunt_coeffs = gaunt_array.Gaunt_values
 
     # Get dimensions.
@@ -117,8 +135,8 @@ function construct_f_sq_lm_tensor(
             fill!(f_sq_lm_local_pool[chunk], zero(Complex{T}))
         end
 
-        # Extract the R tensor slice for this transition. Use a view to avoid allocations.
-        R = @view R_tensor[transition_idx, :, :]
+        # Copy this transition's slice of the R tensor. Faster than a view here due to memory access patterns.
+        R = R_tensor[transition_idx, :, :]
 
         @sync for chunk in 1:n_chunks
             Threads.@spawn begin
