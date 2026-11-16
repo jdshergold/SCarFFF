@@ -15,7 +15,6 @@ using SCarFFF.SphericalFormFactor: CrystalImage, build_excitation_basis, build_c
                                   compute_incoherent_unit_cell_f_sq_lm, project_f_sq_lm,
                                   band_energy_range, build_energy_grid, describe_energy_grid,
                                   incoherent_intensity_lm_E, integrate_energy, trim_energy_axis,
-                                  apply_structure_function_prefactor!,
                                   enumerate_neighbour_cells, compute_couplings,
                                   compute_crystal_corrections, default_angular_grid,
                                   choose_ewald_parameters, build_ewald_long_range,
@@ -158,24 +157,23 @@ function lm_key_table(l_max::Int)::Matrix{Int}
     return lm_keys
 end
 
-function sum_over_states(state_f_sq_lm::Array{T, 3}, V_cell::Real) where {T<:AbstractFloat}
+function sum_over_states(state_f_sq_lm::Array{T, 3}) where {T<:AbstractFloat}
     """
-    Sum f_{ℓm}^2 over the states and apply the 2π/V_cell, giving the energy integral of S_{ℓm}:
+    Sum f_{ℓm}^2 over the states, giving the energy integral of S_{ℓm}:
 
-        ∫dE S_{ℓm}(q, E) = (2π/V_cell) ∑_n f²_{n,uc;ℓm}(q).
+        ∫dE S_{ℓm}(q, E) = ∑_n f²_{n,uc;ℓm}(q).
 
     The states are the bands n for a coherent crystal and the monomer transitions for an
     incoherent one.
 
     # Arguments:
     - state_f_sq_lm::Array{T,3}: The per-state coefficients, with the state index first.
-    - V_cell::Real: The unit cell volume, in Å^3.
 
     # Returns:
-    - S_lm_integrated::Array{T,2}: The summed coefficients, in Å^-3.
+    - S_lm_integrated::Array{T,2}: The summed coefficients.
     """
 
-    return dropdims(sum(state_f_sq_lm, dims = 1), dims = 1) .* (T(2 * π) / T(V_cell))
+    return dropdims(sum(state_f_sq_lm, dims = 1), dims = 1)
 end
 
 function build_symmetry_inputs(crystal_metadata, conformer_labels::Vector{String}, ::Type{T}) where {T<:AbstractFloat}
@@ -662,8 +660,6 @@ function run_crystals(job)
                     structure_timing = @timed incoherent_intensity_lm_E(
                         crystal_state_f_sq_lm, transition_energies, crystal_energy_grid)
                     crystal_S_lm = structure_timing.value
-                    # The 2π/V_cell that makes this the structure function rather than the bare sum.
-                    apply_structure_function_prefactor!(crystal_S_lm, lattice.V_cell)
                     push!(stage_times, "structure function f_sq_lm(q, E)" => structure_timing.time)
                     push!(crystal_times, "Structure function" => (time_ns() - energy_grid_started) / 1e9)
                 end
@@ -676,7 +672,7 @@ function run_crystals(job)
                     lattice = lattice,
                     dominant_group = dominant_group,
                     dominant_occupancy = dominant_occupancy,
-                    S_lm_integrated = sum_over_states(crystal_state_f_sq_lm, lattice.V_cell),
+                    S_lm_integrated = sum_over_states(crystal_state_f_sq_lm),
                     # An unmixed crystal already is the incoherent reference, so saving a copy
                     # of it under a second name would tell a reader nothing.
                     S_lm_integrated_incoherent = nothing,
@@ -874,8 +870,6 @@ function run_crystals(job)
 
                 # The axis was built wider than the bands need, so trim the empty ends if necessary.
                 if crystal_S_lm !== nothing
-                    # The 2π/V_cell that makes this the structure function rather than the bare sum.
-                    apply_structure_function_prefactor!(crystal_S_lm, lattice.V_cell)
                     built_points = length(crystal_energy_grid.E)
                     crystal_S_lm, crystal_energy_grid =
                         trim_energy_axis(crystal_S_lm, crystal_energy_grid)
@@ -903,9 +897,9 @@ function run_crystals(job)
                     basis, lattice, crystal_couplings, crystal_long_range, T)
 
                 # The energy integral of S_lm, done exactly as the sum over bands.
-                band_sum = sum_over_states(crystal_state_f_sq_lm, lattice.V_cell)
+                band_sum = sum_over_states(crystal_state_f_sq_lm)
 
-                # Check that ∫dE S_lm = (2π/V_cell) Σ_n f²_{n,uc;lm}, with no averaging.
+                # Check that ∫dE S_lm = Σ_n f²_{n,uc;lm}, with no averaging.
                 if crystal_energy_grid !== nothing
 
                     # Make sure that no point fell outside the energy axis.
@@ -928,7 +922,7 @@ function run_crystals(job)
                     band_summary = crystal_band_summary,
                     S_lm_integrated = band_sum,
                     S_lm_integrated_incoherent = crystal_incoherent_f_sq_lm === nothing ?
-                        nothing : sum_over_states(crystal_incoherent_f_sq_lm, lattice.V_cell),
+                        nothing : sum_over_states(crystal_incoherent_f_sq_lm),
                     S_lm = crystal_S_lm,
                     energy_grid = crystal_energy_grid,
                     couplings = crystal_couplings,
@@ -965,19 +959,18 @@ function run_crystals(job)
 
                     # The structure function itself, summed over states.
                     if crystal_results.S_lm !== nothing
-                        write_quantity(io, "S_lm", crystal_results.S_lm, "angstrom^-3 eV^-1")
+                        write_quantity(io, "S_lm", crystal_results.S_lm, "eV^-1")
                     end
 
                     # Its energy integral, taken as the exact sum over states rather than
                     # numerically over the axis above.
-                    write_quantity(io, "S_lm_integrated", crystal_results.S_lm_integrated,
-                                   "angstrom^-3")
+                    write(io, "S_lm_integrated", crystal_results.S_lm_integrated)
 
                     # The same molecules with the mixing switched off. The two integrals must
                     # agree, since mixing just moves intensity between states.
                     if crystal_results.S_lm_integrated_incoherent !== nothing
-                        write_quantity(io, "S_lm_integrated_incoherent",
-                                       crystal_results.S_lm_integrated_incoherent, "angstrom^-3")
+                        write(io, "S_lm_integrated_incoherent",
+                              crystal_results.S_lm_integrated_incoherent)
                     end
 
                     # Where the bands ended up, against the monomer energies they started from.

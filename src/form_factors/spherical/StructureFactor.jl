@@ -14,8 +14,7 @@ using ..CrystalSymmetry: Stars
 using ...ThreadChunks: chunk_count, chunk_range
 
 export EnergyGrid, build_energy_grid, accumulate_delta!, incoherent_intensity_lm_E,
-       integrate_energy, trim_energy_axis, describe_energy_grid, kernel_shape,
-       apply_structure_function_prefactor!
+       integrate_energy, trim_energy_axis, describe_energy_grid, kernel_shape
 
 # We use a mollifier in place of the delta function, with width either side of the band σ_E = 3 dE.
 const MOLLIFIER_SUPPORT_BINS = 3
@@ -285,7 +284,7 @@ function incoherent_intensity_lm_E(
         grid::EnergyGrid{T},
     ) where {T<:AbstractFloat}
     """
-    Spread the incoherent intensity coefficients onto the energy axis before 2π/V_cell.
+    Spread the incoherent intensity coefficients onto the energy axis.
 
     Without the Bloch problem each transition keeps one energy for every q, so there is no angular
     integral left to do and the structure function is just the existing coefficients times one fixed
@@ -336,31 +335,6 @@ function incoherent_intensity_lm_E(
 end
 
 
-function apply_structure_function_prefactor!(
-        intensity_lm_E::Array{T, 3},
-        V_cell::T,
-    )::Array{T, 3} where {T<:AbstractFloat}
-    """
-    Scale the bare summed intensity coefficients up to the dynamic structure function,
-
-        S(q, E) = (2π/V_cell) Σ_n |f_{n,uc}(q)|² δ(E - ΔE_n(q)),
-
-    so what comes out is S_{ℓm} rather than the bare sum over states.
-
-    # Arguments:
-    - intensity_lm_E::Array{T, 3}: Σ_n f²_{n,uc;ℓm}(q) δ(E - ΔE_n), in eV^-1, dimensions (n_energy, n_q, n_keys).
-    - V_cell::T: The unit cell volume, in Å³.
-
-    # Returns:
-    - Array{T, 3}: S_{ℓm}(q, E), in Å^{-3} eV^{-1}. Modified in place.
-    """
-
-    V_cell > 0 || error("The unit cell volume must be positive, got $(V_cell).")
-    intensity_lm_E .*= T(2 * π) / V_cell
-
-    return intensity_lm_E
-end
-
 function trim_energy_axis(
         S_lm::Array{T, 3},
         grid::EnergyGrid{T},
@@ -405,7 +379,7 @@ function integrate_energy(
         grid::EnergyGrid{T},
     ) where {T<:AbstractFloat}
     """
-    Integrate the structure function over E, giving (2π/V_cell) Σ_n f²_{n,uc;ℓm}(q).
+    Integrate the structure function over E, giving Σ_n f²_{n,uc;ℓm}(q).
 
     The kernel is normalised, so this is the sum rule that says every state deposited its magnitude
     once and only once.

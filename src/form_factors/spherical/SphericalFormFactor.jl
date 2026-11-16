@@ -55,7 +55,7 @@ using .CrystalSymmetry: SymmetryOperation, Stars, MoleculeMatching, derive_symme
                         build_stars, star_reduction_factor, choose_compatible_phi_count
 using .StructureFactor: EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
                         incoherent_intensity_lm_E, integrate_energy, trim_energy_axis,
-                        describe_energy_grid, kernel_shape, apply_structure_function_prefactor!
+                        describe_energy_grid, kernel_shape
 using .CoherentCrystalFormFactor: rotate_R_tensors, rotate_crystal_R_tensors,
                                   compute_coherent_unit_cell_form_factor, compute_coherent_unit_cell_f_sq_lm,
                                   compute_incoherent_unit_cell_f_sq_lm
@@ -70,7 +70,7 @@ export compute_spherical_form_factor, compute_spherical_form_factor_with_densiti
        compute_incoherent_unit_cell_f_sq_lm, project_f_sq_lm,
        EnergyGrid, band_energy_range, build_energy_grid, accumulate_delta!,
        incoherent_intensity_lm_E, integrate_energy, trim_energy_axis, describe_energy_grid,
-       kernel_shape, apply_structure_function_prefactor!,
+       kernel_shape,
        default_angular_grid, choose_ewald_parameters, build_ewald_long_range,
        EwaldTruncation, D_TRUNCATION, J_TRUNCATION,
        EwaldCost, D_COST, J_COST,

@@ -571,8 +571,7 @@ class StructureFunctionQuantities(unittest.TestCase):
                 data.mode((3, 0))
 
     def test_saved_integral_is_read_without_the_energy_axis(self):
-        # The energy integral is saved in the structure function's own normalisation, so a reader
-        # applies no volume factor of its own and needs no energy axis to get it.
+        # The energy integral is saved ready to use, so a reader needs no energy axis to get it.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'structure_function.h5'
             integral = np.arange(9*3, dtype=np.float32).reshape(9, 3)

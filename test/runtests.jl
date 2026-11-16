@@ -1185,13 +1185,6 @@ end
 
     @test size(structure_factor) == (length(grid.E), 2, 3)
     @test integral ≈ dropdims(sum(f_sq_lm, dims = 1), dims = 1)
-
-    # The saved structure function includes 2π/V_cell, with no state or molecule average.
-    V_cell = 125.0
-    SF.apply_structure_function_prefactor!(structure_factor, V_cell)
-    @test SF.integrate_energy(structure_factor, grid) ≈
-          (2π / V_cell) .* dropdims(sum(f_sq_lm, dims = 1), dims = 1)
-    @test_throws ErrorException SF.apply_structure_function_prefactor!(copy(structure_factor), 0.0)
 end
 
 @testset "Energy axis trimming" begin

@@ -360,7 +360,7 @@ class CrystalData:
 
     def mode(self, mode):
         """
-        Read one saved spherical harmonic in (E, q) order, in Angstrom^-3 eV^-1.
+        Read one saved spherical harmonic in (E, q) order, in eV^-1.
 
         # Arguments:
         - mode::tuple: The indices (l, m).
@@ -380,7 +380,7 @@ class CrystalData:
 
     def energy_integral(self, name):
         """
-        Read one saved energy integral of the structure function, in Angstrom^-3.
+        Read one saved energy integral of the structure function.
 
         # Arguments:
         - name::str: The saved dataset, either S_lm_integrated or S_lm_integrated_incoherent.
@@ -402,7 +402,7 @@ class CrystalData:
         Read the energy integral of the structure function, summed over the crystal's states.
 
         # Returns:
-        - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order.
         """
         return self.energy_integral('S_lm_integrated')
 
@@ -412,14 +412,14 @@ class CrystalData:
         Read the same integral with the mixing switched off, summed over the monomer transitions.
 
         # Returns:
-        - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order.
         """
         return self.energy_integral('S_lm_integrated_incoherent')
 
     @cached_property
     def angular_mean(self):
         """
-        Get the angular average structure function, in Angstrom^-3 eV^-1.
+        Get the angular average structure function, in eV^-1.
 
         # Returns:
         - np.ndarray: S_00 divided by sqrt(4 pi), in (E, q) order.
@@ -429,7 +429,7 @@ class CrystalData:
     @cached_property
     def integrated_mean(self):
         """
-        Get the energy-integrated angular average structure function, in Angstrom^-3.
+        Get the energy-integrated angular average structure function.
 
         # Returns:
         - np.ndarray: The angular average energy integral on the q grid.
@@ -442,7 +442,7 @@ class CrystalData:
         Get each coefficient's energy integral, which is saved rather than taken from the axis.
 
         # Returns:
-        - np.ndarray: The coefficients in (q, spherical harmonic key) order, in Angstrom^-3.
+        - np.ndarray: The coefficients in (q, spherical harmonic key) order.
         """
         return self.state_sums
 

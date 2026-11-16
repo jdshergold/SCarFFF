@@ -227,7 +227,7 @@ def structure_plot(data, request, settings):
         ax.set_xlim(data.q[0], data.q[-1])
         ax.set_ylim(bottom=0)
         ax.set_xlabel(r'$q\ [\mathrm{keV}]$')
-        ax.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
+        ax.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega$')
         style.save_plot(fig, settings, kind)
         return
     modes = data.ranked_modes(request['count']) if request['modes'] == 'dominant' else request['modes']
@@ -238,10 +238,10 @@ def structure_plot(data, request, settings):
     if kind in ('structure_mode_integrals', 'structure_sum_rule'):
         if kind == 'structure_sum_rule':
             coefficients = data.integrals - data.incoherent_sums
-            label = r'$\int dE\,(S_{\ell m}-S_{\ell m}^{(0)})\ [\mathrm{\AA}^{-3}]$'
+            label = r'$\int dE\,(S_{\ell m}-S_{\ell m}^{(0)})$'
         else:
             coefficients = data.integrals
-            label = r'$\int dE\,S_{\ell m}(q,E)\ [\mathrm{\AA}^{-3}]$'
+            label = r'$\int dE\,S_{\ell m}(q,E)$'
         fig, ax = style.make_frame(settings)
         for i, mode in enumerate(modes):
             key = mode_key(mode, data.n_modes)
@@ -302,7 +302,7 @@ def structure_plot(data, request, settings):
         # A negative m uses a comma, since S_{2-1} reads as a subtraction.
         l, m = modes[0]
         symbol = r'S_{\ell m}' if len(modes) > 1 else rf'S_{{{l},{m}}}' if m < 0 else rf'S_{{{l}{m}}}'
-        label = '$' + symbol + r'(q,E)\ [\mathrm{\AA}^{-3}\,\mathrm{eV}^{-1}]$'
+        label = '$' + symbol + r'(q,E)\ [\mathrm{eV}^{-1}]$'
         style.place_frames(fig, (position.x0*fig.get_figwidth(), position.y0*fig.get_figheight(),
                                  position.width*fig.get_figwidth(), position.height*fig.get_figheight()))
         style.add_colourbar(fig, axes[0], norm, cmap, label, settings, signed=not monopole)

@@ -380,7 +380,7 @@ function compute_coherent_unit_cell_form_factor(
       the same dimensions as f_sq, otherwise nothing.
     - block::Union{AbstractArray{T, 4}, Nothing}: The structure factor Σ_n |f_{n,uc}(q)|² δ(E - ΔE_n(q))
       over this block of q, with the delta broadened. Dimensions (n_energy, length(q_indices),
-      n_theta, n_phi). This is the intensity before 2π/V_cell, held in structure_factor_buffer, not a copy of it.
+      n_theta, n_phi). This is the intensity, held in structure_factor_buffer, not a copy of it.
     - occupancy::Matrix{Bool}: Which (energy bin, q) of that array hold anything at all, so the
       projection can skip the rest.
     - outside::Int: How many states landed off the ends of the energy axis. Should be zero, otherwise

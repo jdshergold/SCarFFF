@@ -157,7 +157,7 @@ def structure_overview(data, config):
     style.style_axes(ax_mean, heatmap=True, tick_size=font)
     overview_colourbar(fig, ax_mean, mean_norm, 'magma',
         r'$\langle S(\mathbf{q},E)\rangle_\Omega=S_{00}(q,E)/\sqrt{4\pi}$' + '\n' +
-        r'$[\mathrm{\AA}^{-3}\,\mathrm{eV}^{-1}]$')
+        r'$[\mathrm{eV}^{-1}]$')
     # Top right: the three strongest harmonics, stacked in the space of one panel.
     left, bottom, frame_width, frame_height = rects[1]
     gap = .012
@@ -181,15 +181,15 @@ def structure_overview(data, config):
         l, m = mode
         ax_integrals.plot(data.q, data.integrals[:, l*l+l+m], label=rf'$({l},{m})$', **line_style(i))
     overview_colourbar(fig, map_axes[0], mode_norm, 'RdBu_r',
-                       r'$S_{\ell m}(q,E)\ [\mathrm{\AA}^{-3}\,\mathrm{eV}^{-1}]$')
+                       r'$S_{\ell m}(q,E)\ [\mathrm{eV}^{-1}]$')
     # Bottom left: the same angular mean, integrated over energy.
     ax_total.plot(data.q, integrated_mean, **line_style(0))
     ax_total.set_ylim(bottom=0)
-    ax_total.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega\ [\mathrm{\AA}^{-3}]$')
+    ax_total.set_ylabel(r'$\int dE\,\langle S(\mathbf{q},E)\rangle_\Omega$')
 
     # Bottom right: the energy integrals of the same three harmonics, which do change sign.
     ax_integrals.axhline(0, color='.45', lw=.5)
-    ax_integrals.set_ylabel(r'$\int dE\,S_{\ell m}(q,E)\ [\mathrm{\AA}^{-3}]$')
+    ax_integrals.set_ylabel(r'$\int dE\,S_{\ell m}(q,E)$')
     ax_integrals.legend(loc='best', ncol=1, borderpad=.35)
     for ax in (ax_total, ax_integrals):
         style.style_axes(ax, tick_size=font)
