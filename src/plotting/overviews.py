@@ -156,8 +156,7 @@ def structure_overview(data, config):
     ax_mean.set_ylabel(r'$E\ [\mathrm{eV}]$')
     style.style_axes(ax_mean, heatmap=True, tick_size=font)
     overview_colourbar(fig, ax_mean, mean_norm, 'magma',
-        r'$\langle S(\mathbf{q},E)\rangle_\Omega=S_{00}(q,E)/\sqrt{4\pi}$' + '\n' +
-        r'$[\mathrm{eV}^{-1}]$')
+        r'$\langle S(\mathbf{q},E)\rangle_\Omega=S_{00}(q,E)/\sqrt{4\pi}\ [\mathrm{eV}^{-1}]$')
     # Top right: the three strongest harmonics, stacked in the space of one panel.
     left, bottom, frame_width, frame_height = rects[1]
     gap = .012
