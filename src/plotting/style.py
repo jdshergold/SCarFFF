@@ -115,7 +115,8 @@ def make_frame(args, square=False):
     else:
         bins = 10 if args.width == 'full' else 5
         ax.xaxis.set_major_locator(MaxNLocator(nbins=bins, steps=[1, 2, 2.5, 5, 10]))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=bins, steps=[1, 2, 2.5, 5, 10]))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=bins, steps=[1, 2, 2.5, 5, 10],
+                                              min_n_ticks=4))
     return fig, ax
 
 
